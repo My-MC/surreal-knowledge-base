@@ -26,8 +26,8 @@ Use each tool for its own job, in this order when finishing a change:
 1. `cargo check --workspace` — fast compile feedback while editing (no codegen).
 2. `cargo clippy --workspace` — lint pass before considering work done; keep warning-free.
 3. `cargo fix` / `cargo clippy --fix` — apply machine-fixable suggestions instead of hand-editing.
-   - Repo is **not a git repository** → always pass `--allow-no-vcs` (fix/clippy --fix refuse otherwise).
-   - Lib-target fixes may need explicit selection: `cargo fix --lib -p skb-core --allow-no-vcs` (plain `--workspace` can skip them).
+   - Requires a clean git tree; with uncommitted changes pass `--allow-dirty`.
+   - Lib-target fixes may need explicit selection: `cargo fix --lib -p skb-core` (plain `--workspace` can skip them).
 4. `cargo fmt --all` — normalize formatting last; verify with `cargo fmt --all -- --check`.
 5. `cargo test --workspace -- --test-threads=1` — final verification.
 
