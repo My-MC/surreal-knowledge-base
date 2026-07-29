@@ -1,0 +1,15 @@
+/target/
+**/*.rs.bk
+Cargo.lock
+.npm/
+*.tar.gz
+.venv/
+__pycache__/
+*.py[cod]
+# Test database directories
+target/skb-test-*
+skb.toml
+# Experiments (6GB of build artifacts, excluded from workspace)
+spike/
+# npm platform binaries (injected by CI, never committed)
+npm/packages/*/bin/

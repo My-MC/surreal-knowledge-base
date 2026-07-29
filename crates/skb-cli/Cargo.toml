@@ -1,0 +1,23 @@
+[package]
+name = "skb"
+version = "0.1.0"
+edition = "2021"
+description = "Surreal Knowledge Base - CLI"
+
+[[bin]]
+name = "skb"
+path = "src/main.rs"
+
+[features]
+default = []
+ort = ["skb-core/ort"]
+
+[dependencies]
+skb-core = { path = "../skb-core" }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+serde = "1"
+serde_json = "1"
+anyhow = "1"
+toml = "0.8"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

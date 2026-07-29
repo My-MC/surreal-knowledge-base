@@ -1,0 +1,12 @@
+{
+  "name": "@surreal-knowledge-base/win32-x64",
+  "version": "0.1.0",
+  "description": "Surreal Knowledge Base MCP server - Windows x64 binary",
+  "license": "MIT",
+  "os": ["win32"],
+  "cpu": ["x64"],
+  "files": [
+    "bin/",
+    "THIRD_PARTY_LICENSES.md"
+  ]
+}

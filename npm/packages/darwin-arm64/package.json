@@ -1,0 +1,12 @@
+{
+  "name": "@surreal-knowledge-base/darwin-arm64",
+  "version": "0.1.0",
+  "description": "Surreal Knowledge Base MCP server - macOS ARM64 (Apple Silicon) binary",
+  "license": "MIT",
+  "os": ["darwin"],
+  "cpu": ["arm64"],
+  "files": [
+    "bin/",
+    "THIRD_PARTY_LICENSES.md"
+  ]
+}

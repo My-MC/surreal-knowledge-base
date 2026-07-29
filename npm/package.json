@@ -1,0 +1,23 @@
+{
+  "name": "surreal-knowledge-base",
+  "version": "0.1.0",
+  "description": "MCP server for SurrealDB-based knowledge base (Vector/Graph/Document DB)",
+  "license": "MIT",
+  "bin": {
+    "skb-mcp": "./bin/skb-mcp.js"
+  },
+  "files": [
+    "bin/skb-mcp.js",
+    "THIRD_PARTY_LICENSES.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "optionalDependencies": {
+    "@surreal-knowledge-base/linux-x64": "0.1.0",
+    "@surreal-knowledge-base/linux-arm64": "0.1.0",
+    "@surreal-knowledge-base/darwin-x64": "0.1.0",
+    "@surreal-knowledge-base/darwin-arm64": "0.1.0",
+    "@surreal-knowledge-base/win32-x64": "0.1.0"
+  }
+}

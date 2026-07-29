@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = ["crates/skb-core", "crates/skb-cli", "crates/skb-mcp"]
+exclude = ["spike"]
+
+[profile.release]
+strip = "symbols"
