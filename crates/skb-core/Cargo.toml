@@ -28,3 +28,10 @@ ureq = "3"
 base64 = "0.22"
 regex = "1"
 pdf-extract = "0.9"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "skb"
+harness = false
