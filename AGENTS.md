@@ -18,6 +18,8 @@ Local-first knowledge base: SurrealDB (embedded SurrealKV) + BAAI/bge-m3 embeddi
 - Real-embedding build: `cargo build --release -p skb-mcp --features ort` — first build takes ~15 min; ort-sys downloads ONNX Runtime to `~/.cache/ort.pyke.io`.
 - `ort` feature only exists on `skb-core`; `skb-cli`/`skb-mcp` forward it (`--features ort` on those packages).
 - Contract tests (`crates/skb-cli/tests/contract.rs`) spawn the real `target/debug/skb` binary; run via `cargo test`, not standalone.
+- Benchmarks (mock): `cargo bench` — 4 groups (tokenize, embed, search, mcp_startup).
+- Benchmarks (real bge-m3): `cargo bench --features ort` — requires `pkg-config` + `libssl-dev` (ort-sys build dep, not linked into runtime). First run downloads bge-m3 ONNX model (~2.2 GB).
 
 ## Toolchain workflow (cargo fmt / check / clippy / fix)
 

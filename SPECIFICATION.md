@@ -662,12 +662,15 @@ bunx surreal-knowledge-base --http --port 8787   # HTTP モード
 
 ### 16.1 性能目標（初版目標・要検証）
 
-| 指標 | 目標 |
-|---|---|
-| チャンク化 | 10MB テキストを 5 秒以内（gigatoken の SentencePiece 系は最適化限定的のため要実測） |
-| Embedding | 512 トークン × バッチ 32、モダン 8 コア CPU で 5 chunks/s 以上 |
-| 検索 | 10 万チャンク規模で hybrid 検索 p95 < 500ms（モデル推論込み） |
-| MCP 起動 | コールドスタート 3 秒以内（モデルは初回検索時に遅延ロード） |
+| 指標 | 目標 | 実測（20 コア, x86_64） |
+|---|---|---|
+| チャンク化 | 10MB テキストを 5 秒以内 | encode 10MB: 5.35 s / chunk(512,64) 10MB: 5.27 s（tokenizers v0.23, bge-m3 トークナイザ） |
+| Embedding | 512 トークン × バッチ 32、8 コア CPU で 5 chunks/s 以上 | —（ort feature 未実測; 要 `pkg-config` + `libssl-dev`） |
+| 検索 | 10 万チャンク規模で hybrid 検索 p95 < 500ms | 1,000 チャンク: hybrid 11.3 ms, vector 1.5 ms, keyword 9.2 ms（mock 埋め込み, 10 万チャンクは未実測） |
+| MCP 起動 | コールドスタート 3 秒以内 | **4.54 s**（mock 設定, tokenizer キャッシュ済み。実装が eager ロードのため目標超過） |
+
+> 計測環境: Linux x86_64, 20 コア CPU, 31 GB RAM, Rust 1.97.1, criterion 0.5。
+> ort 実埋め込みベンチマークは `pkg-config` + `libssl-dev` のインストール後に `cargo bench --features ort` で実行可能。
 
 ---
 
