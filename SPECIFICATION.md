@@ -664,13 +664,14 @@ bunx surreal-knowledge-base --http --port 8787   # HTTP モード
 
 | 指標 | 目標 | 実測（20 コア, x86_64） |
 |---|---|---|
-| チャンク化 | 10MB テキストを 5 秒以内 | encode 10MB: 5.35 s / chunk(512,64) 10MB: 5.27 s（tokenizers v0.23, bge-m3 トークナイザ） |
-| Embedding | 512 トークン × バッチ 32、8 コア CPU で 5 chunks/s 以上 | —（ort feature 未実測; 要 `pkg-config` + `libssl-dev`） |
-| 検索 | 10 万チャンク規模で hybrid 検索 p95 < 500ms | 1,000 チャンク: hybrid 11.3 ms, vector 1.5 ms, keyword 9.2 ms（mock 埋め込み, 10 万チャンクは未実測） |
-| MCP 起動 | コールドスタート 3 秒以内 | **4.54 s**（mock 設定, tokenizer キャッシュ済み。実装が eager ロードのため目標超過） |
+| チャンク化 | 10MB テキストを 5 秒以内 | encode 10MB: 4.73 s / chunk(512,64) 10MB: 4.69 s（tokenizers v0.23, bge-m3 トークナイザ） |
+| Embedding | 512 トークン × バッチ 32、8 コア CPU で 5 chunks/s 以上 | ort_bge_m3_batch32: 15.2 s（batch 32, ~500 tokens each, CPU）— 2.1 chunks/s, 目標 5 chunks/s 未達 |
+| 検索 | 10 万チャンク規模で hybrid 検索 p95 < 500ms | 1,000 チャンク: hybrid 10.6 ms, vector 1.07 ms, keyword 8.78 ms（mock 埋め込み, 10 万チャンクは未実測） |
+| MCP 起動 | コールドスタート 3 秒以内 | **4.76 s**（mock 設定, tokenizer キャッシュ済み。実装が eager ロードのため目標超過） |
 
-> 計測環境: Linux x86_64, 20 コア CPU, 31 GB RAM, Rust 1.97.1, criterion 0.5。
-> ort 実埋め込みベンチマークは `pkg-config` + `libssl-dev` のインストール後に `cargo bench --features ort` で実行可能。
+> 計測環境: Linux x86_64, 20 コア CPU (AVX2), 31 GB RAM, Rust 1.97.1, criterion 0.5。
+> ort 実埋め込みベンチマーク: `cargo bench --features ort -p skb-core --bench skb`（rustls-only, `pkg-config`/`libssl-dev` 不要）。
+> ONNX Runtime (ort 2.0.0-rc.13, tls-rustls build-dep) + bge-m3 ONNX model (HF auto download, ~2.2 GB).
 
 ---
 

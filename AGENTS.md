@@ -19,7 +19,7 @@ Local-first knowledge base: SurrealDB (embedded SurrealKV) + BAAI/bge-m3 embeddi
 - `ort` feature only exists on `skb-core`; `skb-cli`/`skb-mcp` forward it (`--features ort` on those packages).
 - Contract tests (`crates/skb-cli/tests/contract.rs`) spawn the real `target/debug/skb` binary; run via `cargo test`, not standalone.
 - Benchmarks (mock): `cargo bench` — 4 groups (tokenize, embed, search, mcp_startup).
-- Benchmarks (real bge-m3): `cargo bench --features ort` — requires `pkg-config` + `libssl-dev` (ort-sys build dep, not linked into runtime). First run downloads bge-m3 ONNX model (~2.2 GB).
+- Benchmarks (real bge-m3): `cargo bench --features ort -p skb-core --bench skb` — first run downloads bge-m3 ONNX model (~2.2 GB). No external deps needed (rustls-only).
 
 ## Toolchain workflow (cargo fmt / check / clippy / fix)
 
@@ -36,7 +36,7 @@ Use each tool for its own job, in this order when finishing a change:
 ## Hard constraints
 
 - **Never write to `/tmp`.** Test DBs go under `./target/` (e.g. `target/skb-test-*`); runtime DB default is `~/.local/share/skb/db`.
-- **TLS is rustls-only.** OpenSSL is not a build or runtime dep; `libssl-dev`/`pkg-config` are not needed. CI fails if `cargo tree -i openssl-sys` or `-i native-tls` matches (ort-sys may pull them as *build* deps for its downloader — that's fine, they're never linked).
+- **TLS is rustls-only.** OpenSSL is not a build or runtime dep; `libssl-dev`/`pkg-config` are not needed. CI fails if `cargo tree -i openssl-sys` or `-i native-tls` matches. ort-sys downloader uses `tls-rustls` (opt-in via `default-features = false`).
 - SurrealDB is embedded-only: `default-features = false, features = ["kv-surrealkv"]`. Remote mode is unimplemented (surrealdb 3.x lacks `From<Surreal<Db>> for Surreal<Any>`) — don't add protocol features back without discussion.
 - Tokenizer crate is `tokenizers` (HF official). Do not switch to gigatoken — it doesn't build (unpublished, nightly-only).
 

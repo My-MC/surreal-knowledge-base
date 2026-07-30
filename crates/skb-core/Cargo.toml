@@ -12,7 +12,10 @@ ort = ["dep:ort", "dep:ndarray"]
 surrealdb = { version = "3", default-features = false, features = ["kv-surrealkv"] }
 tokenizers = "0.23"
 hf-hub = { version = "1", features = ["blocking"] }
-ort = { version = "2.0.0-rc.13", features = ["download-binaries"], optional = true }
+ort = { version = "2.0.0-rc.13", default-features = false, features = [
+  "std", "ndarray", "tracing", "download-binaries", "tls-rustls",
+  "copy-dylibs", "api-27",
+], optional = true }
 ndarray = { version = "0.17", optional = true }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
