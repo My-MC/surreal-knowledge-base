@@ -53,6 +53,6 @@ Use each tool for its own job, in this order when finishing a change:
 
 ## CI / packaging
 
-- Linux build runners are pinned to `ubuntu-22.04` (glibc 2.35 floor); RUSTFLAGS static-link libstdc++/libgcc on Linux, `+crt-static` on Windows. Verify with `ldd`: no libonnxruntime, libssl, libcrypto, libstdc++.
+- Linux build runners: x86_64 on `ubuntu-22.04` (glibc 2.35 floor); aarch64 on `ubuntu-24.04-arm` (glibc 2.39 floor; pyke ONNX Runtime aarch64 prebuilt requires glibc >= 2.38). RUSTFLAGS static-link libstdc++/libgcc on Linux, `+crt-static` on Windows. Verify with `ldd`: no libonnxruntime, libssl, libcrypto, libstdc++.
 - Release binaries are fully static-linked ONNX Runtime (ort `download-binaries`); no `.so` bundling. Ship `THIRD_PARTY_LICENSES.md` (ONNX Runtime MIT) in every npm package.
 - npm publish flow not yet automated; registry publish resolves scoped platform packages (local `npm install <dir>` breaks symlinks — install tarballs instead).

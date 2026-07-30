@@ -38,13 +38,13 @@ jobs:
             rustflags: "-C link-arg=-static-libstdc++ -C link-arg=-static-libgcc"
             cc: cc
             cxx: c++
-          - os: ubuntu-22.04-arm
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             pkg: linux-arm64
             ext: ""
             rustflags: "-C link-arg=-static-libstdc++ -C link-arg=-static-libgcc"
-            cc: gcc-13
-            cxx: g++-13
+            cc: cc
+            cxx: c++
           - os: macos-13
             target: x86_64-apple-darwin
             pkg: darwin-x64
@@ -74,12 +74,6 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - name: Install GCC 13 (aarch64)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
-          sudo apt-get update
-          sudo apt-get install -y gcc-13 g++-13
       - name: Cache ONNX Runtime binaries
         uses: actions/cache@v4
         with:
