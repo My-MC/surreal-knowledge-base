@@ -53,6 +53,7 @@ Use each tool for its own job, in this order when finishing a change:
 
 ## CI / packaging
 
-- Linux build runners: ubuntu-24.04 (glibc 2.39 floor; pyke ONNX Runtime prebuilts require glibc >= 2.38). RUSTFLAGS static-link libstdc++/libgcc on Linux, `+crt-static` on Windows. Verify with `ldd`: no libonnxruntime, libssl, libcrypto, libstdc++.
+- Linux build runners: ubuntu-24.04 (glibc 2.39 floor; pyke ONNX Runtime prebuilts require glibc >= 2.38). RUSTFLAGS static-link libstdc++/libgcc on Linux; Windows uses dynamic CRT (ORT prebuilt is `/MD`; binary depends on VC++ runtime DLLs, matching ORT's own runtime requirements). Verify with `ldd`: no libonnxruntime, libssl, libcrypto, libstdc++.
+- macOS runners: `macos-15-intel` (x86_64), `macos-latest` (arm64).
 - Release binaries are fully static-linked ONNX Runtime (ort `download-binaries`); no `.so` bundling. Ship `THIRD_PARTY_LICENSES.md` (ONNX Runtime MIT) in every npm package.
 - npm publish flow not yet automated; registry publish resolves scoped platform packages (local `npm install <dir>` breaks symlinks — install tarballs instead).
