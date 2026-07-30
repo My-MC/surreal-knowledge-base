@@ -22,6 +22,8 @@ jobs:
         run: |
           cargo tree -i openssl-sys 2>&1 | grep -q "did not match"
           cargo tree -i native-tls 2>&1 | grep -q "did not match"
+          cargo tree --features ort -p skb-core -i openssl-sys 2>&1 | grep -q "did not match"
+          cargo tree --features ort -p skb-core -i native-tls 2>&1 | grep -q "did not match"
 
   build:
     name: Build (${{ matrix.target }})
@@ -34,26 +36,36 @@ jobs:
             pkg: linux-x64
             ext: ""
             rustflags: "-C link-arg=-static-libstdc++ -C link-arg=-static-libgcc"
+            cc: cc
+            cxx: c++
           - os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             pkg: linux-arm64
             ext: ""
             rustflags: "-C link-arg=-static-libstdc++ -C link-arg=-static-libgcc"
+            cc: gcc-13
+            cxx: g++-13
           - os: macos-13
             target: x86_64-apple-darwin
             pkg: darwin-x64
             ext: ""
             rustflags: ""
+            cc: cc
+            cxx: c++
           - os: macos-latest
             target: aarch64-apple-darwin
             pkg: darwin-arm64
             ext: ""
             rustflags: ""
+            cc: cc
+            cxx: c++
           - os: windows-2022
             target: x86_64-pc-windows-msvc
             pkg: win32-x64
             ext: ".exe"
             rustflags: "-C target-feature=+crt-static"
+            cc: cc
+            cxx: c++
     env:
       RUSTFLAGS: ${{ matrix.rustflags }}
     steps:
@@ -62,12 +74,21 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+      - name: Install GCC 13 (aarch64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+          sudo apt-get update
+          sudo apt-get install -y gcc-13 g++-13
       - name: Cache ONNX Runtime binaries
         uses: actions/cache@v4
         with:
           path: ~/.cache/ort.pyke.io
           key: ort-pyke-${{ matrix.target }}-${{ hashFiles('crates/skb-core/Cargo.toml') }}
       - name: Build release (with ort)
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
         run: cargo build --release -p skb-mcp --features ort --target ${{ matrix.target }}
       - name: Prepare npm package
         shell: bash
