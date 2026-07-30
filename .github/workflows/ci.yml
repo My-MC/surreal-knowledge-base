@@ -31,7 +31,7 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: ubuntu-22.04
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             pkg: linux-x64
             ext: ""
@@ -99,7 +99,7 @@ jobs:
 
   smoke:
     name: Smoke test (linux-x64)
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     needs: build
     steps:
       - uses: actions/checkout@v4
