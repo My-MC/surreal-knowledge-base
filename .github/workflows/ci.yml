@@ -54,7 +54,6 @@ jobs:
             rustflags: ""
     env:
       RUSTFLAGS: ${{ matrix.rustflags }}
-      ORT_CACHE_DIR: ${{ runner.home }}/.cache/ort.pyke.io
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -66,12 +65,14 @@ jobs:
       - name: Cache ONNX Runtime binaries
         uses: actions/cache@v6
         with:
-          path: ~/.cache/ort.pyke.io
+          path: ${{ runner.temp }}/ort-cache
           key: ort-pyke-${{ matrix.target }}-${{ hashFiles('crates/skb-core/Cargo.toml') }}
       - name: Suppress dynamic C++ stdlib (Linux)
         if: contains(matrix.target, 'linux')
         run: echo "CXXSTDLIB=" >> $GITHUB_ENV
       - name: Build release (with ort)
+        env:
+          ORT_CACHE_DIR: ${{ runner.temp }}/ort-cache
         run: cargo build --release -p skb-mcp --features ort --target ${{ matrix.target }}
       - name: Prepare npm package
         shell: bash
