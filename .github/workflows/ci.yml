@@ -132,7 +132,8 @@ jobs:
           dimension = 8
           EOF
 
+          SKB_BIN="$(dirname "$(node -p "require.resolve('@surreal-knowledge-base/linux-x64/package.json')")")/bin/skb-mcp"
           echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"smoke-test","version":"1.0"}}}' \
-            | node node_modules/surreal-knowledge-base/bin/skb-mcp.js 2>/dev/null \
+            | "$SKB_BIN" 2>/dev/null \
             | head -1 \
             | grep -q "protocolVersion"
