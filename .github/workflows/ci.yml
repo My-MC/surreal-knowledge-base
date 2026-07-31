@@ -36,12 +36,12 @@ jobs:
             target: x86_64-unknown-linux-gnu
             pkg: linux-x64
             ext: ""
-            rustflags: "-C link-arg=-static-libstdc++ -C link-arg=-static-libgcc"
+            rustflags: "-C link-arg=-l:libstdc++.a"
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             pkg: linux-arm64
             ext: ""
-            rustflags: "-C link-arg=-static-libstdc++ -C link-arg=-static-libgcc"
+            rustflags: "-C link-arg=-l:libstdc++.a"
           - os: macos-latest
             target: aarch64-apple-darwin
             pkg: darwin-arm64
@@ -65,6 +65,9 @@ jobs:
         with:
           path: ~/.cache/ort.pyke.io
           key: ort-pyke-${{ matrix.target }}-${{ hashFiles('crates/skb-core/Cargo.toml') }}
+      - name: Suppress dynamic C++ stdlib (Linux)
+        if: contains(matrix.target, 'linux')
+        run: echo "CXXSTDLIB=" >> $GITHUB_ENV
       - name: Build release (with ort)
         run: cargo build --release -p skb-mcp --features ort --target ${{ matrix.target }}
       - name: Prepare npm package
