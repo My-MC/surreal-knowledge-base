@@ -123,17 +123,19 @@ jobs:
           npm install "$GITHUB_WORKSPACE/npm/surreal-knowledge-base-0.1.0.tgz"
           npm install "$GITHUB_WORKSPACE/npm/packages/linux-x64/surreal-knowledge-base-linux-x64-0.1.0.tgz"
 
-          cat > skb.toml << 'EOF'
+          cat > skb.toml << EOF
           [storage]
           path = "../skb-smoke-db"
 
           [embedding]
           onnx_path = "mock"
           dimension = 8
+          tokenizer = "$GITHUB_WORKSPACE/npm/smoke-tokenizer.json"
           EOF
 
           SKB_BIN="$(dirname "$(node -p "require.resolve('@surreal-knowledge-base/linux-x64/package.json')")")/bin/skb-mcp"
           echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"smoke-test","version":"1.0"}}}' \
-            | "$SKB_BIN" 2>/dev/null \
+            | "$SKB_BIN" 2>mcp.log \
             | head -1 \
-            | grep -q "protocolVersion"
+            | grep -q "protocolVersion" \
+            || { echo "MCP handshake failed; stderr:"; cat mcp.log; exit 1; }
