@@ -54,12 +54,15 @@ jobs:
             rustflags: ""
     env:
       RUSTFLAGS: ${{ matrix.rustflags }}
+      ORT_CACHE_DIR: ${{ runner.home }}/.cache/ort.pyke.io
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target == 'aarch64-apple-darwin' && 'r2' || '' }}
       - name: Cache ONNX Runtime binaries
         uses: actions/cache@v6
         with:
@@ -100,6 +103,7 @@ jobs:
         run: |
           mkdir -p npm/packages/linux-x64/bin
           cp npm-out/packages/linux-x64/bin/skb-mcp npm/packages/linux-x64/bin/
+          chmod +x npm/packages/linux-x64/bin/skb-mcp
       - name: Check shared library dependencies
         run: |
           ldd npm/packages/linux-x64/bin/skb-mcp
