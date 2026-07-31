@@ -18,9 +18,16 @@ const ARCH_MAP = {
 const os = PLATFORM_MAP[platform];
 const cpu = ARCH_MAP[arch];
 
+if (os === 'darwin' && cpu === 'x64') {
+  console.error('skb-mcp: Intel Mac (darwin-x64) is no longer supported.');
+  console.error('Reason: ONNX Runtime prebuilt binaries are not available for x86_64-apple-darwin.');
+  console.error('Please use an Apple Silicon (arm64) Mac, or install the linux/win32 package in a VM.');
+  process.exit(1);
+}
+
 if (!os || !cpu) {
   console.error(`skb-mcp: unsupported platform ${platform}-${arch}`);
-  console.error('Supported: linux-x64, linux-arm64, darwin-x64, darwin-arm64, win32-x64');
+  console.error('Supported: linux-x64, linux-arm64, darwin-arm64, win32-x64');
   process.exit(1);
 }
 

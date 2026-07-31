@@ -556,7 +556,7 @@ esbuild / Biome と同様の **プラットフォーム別バイナリ + optiona
 | `surreal-knowledge-base` | メタパッケージ。`bin/skb-mcp.js`（起動ラッパ）のみ含む |
 | `@surreal-knowledge-base/darwin-arm64` 等 | 各 OS/アーチ向け `skb-mcp` 自己完結バイナリ |
 
-対象ターゲット: `linux-x64-gnu`, `linux-arm64-gnu`, `darwin-x64`, `darwin-arm64`, `win32-x64`。
+対象ターゲット: `linux-x64-gnu`, `linux-arm64-gnu`, `darwin-arm64`, `win32-x64`。
 
 ### 13.2 メタパッケージ `package.json`（骨子）
 
@@ -569,7 +569,6 @@ esbuild / Biome と同様の **プラットフォーム別バイナリ + optiona
   "optionalDependencies": {
     "@surreal-knowledge-base/linux-x64": "0.1.0",
     "@surreal-knowledge-base/linux-arm64": "0.1.0",
-    "@surreal-knowledge-base/darwin-x64": "0.1.0",
     "@surreal-knowledge-base/darwin-arm64": "0.1.0",
     "@surreal-knowledge-base/win32-x64": "0.1.0"
   }

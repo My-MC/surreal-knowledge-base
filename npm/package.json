@@ -16,7 +16,6 @@
   "optionalDependencies": {
     "@surreal-knowledge-base/linux-x64": "0.1.0",
     "@surreal-knowledge-base/linux-arm64": "0.1.0",
-    "@surreal-knowledge-base/darwin-x64": "0.1.0",
     "@surreal-knowledge-base/darwin-arm64": "0.1.0",
     "@surreal-knowledge-base/win32-x64": "0.1.0"
   }

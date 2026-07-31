@@ -42,11 +42,6 @@ jobs:
             pkg: linux-arm64
             ext: ""
             rustflags: "-C link-arg=-static-libstdc++ -C link-arg=-static-libgcc"
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-            pkg: darwin-x64
-            ext: ""
-            rustflags: ""
           - os: macos-latest
             target: aarch64-apple-darwin
             pkg: darwin-arm64

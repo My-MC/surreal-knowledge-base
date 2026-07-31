@@ -97,11 +97,11 @@
 | # | タスク | 内容 |
 |---|---|---|
 | 5-1 | **契約テスト** | MCP ハンドラ経由・CLI 経由の同一 JSON リクエストでレスポンス一致を検証するゴールデンテスト。CI 必須化 |
-| 5-2 | クロスビルド | GitHub Actions で 5 ターゲット（linux-x64/arm64, darwin-x64/arm64, win32-x64） |
+| 5-2 | クロスビルド | GitHub Actions で 4 ターゲット（linux-x64/arm64, darwin-arm64, win32-x64） |
 | 5-3 | npm パッケージ | メタパッケージ + プラットフォーム別 optionalDependencies、`bin/skb-mcp.js` ラッパ（依存ゼロ・spawn）、`libonnxruntime` 同梱 |
-| 5-4 | E2E（全 5 ターゲット） | `npm pack` → 各実機ランナーで `npx`/`bunx` スモークテスト |
+| 5-4 | E2E（全 4 ターゲット） | `npm pack` → 各実機ランナーで `npx`/`bunx` スモークテスト |
 
-**Exit Criteria**: 契約テスト全緑。全 5 ターゲットの CI 実機 E2E が通ること。
+**Exit Criteria**: 契約テスト全緑。全 4 ターゲットの CI 実機 E2E が通ること。
 
 ---
 
@@ -137,7 +137,7 @@ Phase 3 (CLI) ──► Phase 4 (MCP) ──► Phase 5 (契約テスト+npm) �
 ## Phase 8: npm 配布用 ort 有効バイナリ + 依存最小化
 
 ### 目標
-- ort feature を有効にした self-contained バイナリを全 5 プラットフォームでビルドし npm 配布可能にする
+- ort feature を有効にした self-contained バイナリを全 4 プラットフォームでビルドし npm 配布可能にする
 - 外部動的依存（OpenSSL, libstdc++）を排除し、Linux ランタイム要件を glibc + libz + libzstd のみに
 
 ### 実施内容
@@ -156,10 +156,10 @@ Phase 3 (CLI) ──► Phase 4 (MCP) ──► Phase 5 (契約テスト+npm) �
    - `npm/THIRD_PARTY_LICENSES.md`: ONNX Runtime MIT ライセンス全文（静的リンクで法的要件）
    - `LICENSE`: プロジェクト MIT
 
-4. **プラットフォーム別 package.json テンプレート**（5 種すべてコミット済み）
+4. **プラットフォーム別 package.json テンプレート**（4 種すべてコミット済み）
 
 5. **CI 更新**
-   - ランナー: ubuntu-22.04 (x64), ubuntu-22.04-arm (arm64), macos-13 (x64), macos-latest (arm64), windows-2022 (x64)
+   - ランナー: ubuntu-22.04 (x64), ubuntu-22.04-arm (arm64), macos-latest (arm64), windows-2022 (x64)
    - RUSTFLAGS: linux `-static-libstdc++ -static-libgcc`, windows `-C target-feature=+crt-static`
    - ビルド: `cargo build --release -p skb-mcp --features ort --target ...`
    - ~/.cache/ort.pyke.io の actions/cache キャッシュ
@@ -174,5 +174,5 @@ Phase 3 (CLI) ──► Phase 4 (MCP) ──► Phase 5 (契約テスト+npm) �
 - `cargo test --workspace` 全 9 テスト通過（surrealdb スリム化後も影響なし）
 - `cargo build --release -p skb-mcp --features ort` 成功
 - `ldd target/release/skb-mcp`: libonnxruntime / libssl / libstdc++ 非含有
-- CI 全 5 ターゲットビルド + smoke test 通過
+- CI 全 4 ターゲットビルド + smoke test 通過
 - `cargo tree -i openssl-sys | grep "did not match"` 成功
