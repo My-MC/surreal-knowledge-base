@@ -15,19 +15,6 @@ updates:
     labels:
       - "dependencies"
 
-  - package-ecosystem: "npm"
-    directory: "/npm"
-    schedule:
-      interval: "weekly"
-      day: "monday"
-      time: "09:00"
-      timezone: "Asia/Tokyo"
-    open-pull-requests-limit: 10
-    commit-message:
-      prefix: "chore(deps)"
-    labels:
-      - "dependencies"
-
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
