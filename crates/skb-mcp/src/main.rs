@@ -1,9 +1,10 @@
 use anyhow::Result;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
-    CallToolRequestParam, CallToolResult, Content, Implementation, ListToolsResult,
-    ServerCapabilities, ServerInfo, Tool as ToolDef, ToolsCapability,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
+    ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool as ToolDef,
 };
+use rmcp::service::serve_server;
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::transport::io::stdio;
 use serde_json::{json, Value};
@@ -27,33 +28,27 @@ impl SkbServer {
     }
 }
 
-fn text_content(val: &impl serde::Serialize) -> Content {
-    Content::text(serde_json::to_string_pretty(val).unwrap_or_else(|e| format!("{e}")))
+fn text_content(val: &impl serde::Serialize) -> ContentBlock {
+    ContentBlock::text(serde_json::to_string_pretty(val).unwrap_or_else(|e| format!("{e}")))
 }
 
 impl ServerHandler for SkbServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: Default::default(),
-            capabilities: ServerCapabilities {
-                tools: Some(ToolsCapability {
-                    list_changed: Some(false),
-                }),
-                ..Default::default()
-            },
-            server_info: Implementation {
-                name: "surreal-knowledge-base".into(),
-                title: Some("Surreal Knowledge Base".into()),
-                version: "0.1.0".into(),
-                ..Default::default()
-            },
-            instructions: None,
-        }
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_tool_list_changed()
+                .build(),
+        )
+        .with_server_info(
+            Implementation::new("surreal-knowledge-base", "0.1.0")
+                .with_title("Surreal Knowledge Base"),
+        )
     }
 
     async fn list_tools(
         &self,
-        _request: Option<rmcp::model::PaginatedRequestParam>,
+        _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, rmcp::ErrorData> {
         let tools = vec![
@@ -127,21 +122,18 @@ impl ServerHandler for SkbServer {
             ),
             tool("skb_reindex", "Reindex all documents", &[]),
         ];
-        Ok(ListToolsResult {
-            tools,
-            next_cursor: None,
-        })
+        Ok(ListToolsResult::with_all_items(tools))
     }
 
     async fn call_tool(
         &self,
-        request: CallToolRequestParam,
+        request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, rmcp::ErrorData> {
+    ) -> Result<CallToolResponse, rmcp::ErrorData> {
         let result = self.handle_tool(request).await;
         match result {
-            Ok(val) => Ok(CallToolResult::success(vec![text_content(&val)])),
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(e)])),
+            Ok(val) => Ok(CallToolResult::success(vec![text_content(&val)]).into()),
+            Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(e)]).into()),
         }
     }
 }
@@ -165,20 +157,13 @@ fn tool(
         "properties": props,
         "required": required,
     });
-    ToolDef {
-        name: name.into(),
-        description: Some(desc.into()),
-        input_schema: Arc::new(serde_json::from_value(input_schema).unwrap_or_default()),
-        title: None,
-        output_schema: None,
-        annotations: None,
-        icons: None,
-        meta: None,
-    }
+    let input_schema =
+        serde_json::from_value::<rmcp::model::JsonObject>(input_schema).unwrap_or_default();
+    ToolDef::new(name, desc, input_schema)
 }
 
 impl SkbServer {
-    async fn handle_tool(&self, req: CallToolRequestParam) -> Result<Value, String> {
+    async fn handle_tool(&self, req: CallToolRequestParams) -> Result<Value, String> {
         let args = req.arguments.unwrap_or_default();
         let kb = self.kb.lock().await;
 
@@ -277,7 +262,7 @@ async fn main() -> Result<()> {
 
     tracing::info!("MCP server starting (stdio)");
 
-    let running = rmcp::service::serve_server(server, stdio()).await?;
+    let running = serve_server(server, stdio()).await?;
     running.waiting().await?;
 
     Ok(())
