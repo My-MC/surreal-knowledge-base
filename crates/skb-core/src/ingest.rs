@@ -137,7 +137,11 @@ fn extract_document_data(req: UploadRequest, config: &Config) -> Result<Document
     let extracted = extract_text(&content, &source);
     let mut hasher = Sha256::new();
     hasher.update(extracted.as_bytes());
-    let sha256 = format!("{:x}", hasher.finalize());
+    let sha256 = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
 
     Ok(DocumentData {
         title: req.title.unwrap_or(file_title),
