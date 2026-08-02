@@ -79,11 +79,6 @@ enum Commands {
     },
     /// Run diagnostics
     Doctor,
-    /// Start MCP server
-    Mcp {
-        #[command(subcommand)]
-        cmd: McpCmd,
-    },
 }
 
 #[derive(Subcommand)]
@@ -123,17 +118,6 @@ enum ConfigCmd {
     Init,
     /// Show current config
     Show,
-}
-
-#[derive(Subcommand)]
-enum McpCmd {
-    /// Start MCP server (stdio)
-    Serve {
-        #[arg(long)]
-        http: bool,
-        #[arg(long, default_value = "8787")]
-        port: u16,
-    },
 }
 
 fn output(val: &impl serde::Serialize, format: &str) -> Result<()> {
@@ -305,15 +289,6 @@ async fn main() -> Result<()> {
             ConfigCmd::Show => {
                 let c = cfg()?;
                 output(&c, &fmt)?;
-            }
-        },
-        Commands::Mcp { cmd } => match cmd {
-            McpCmd::Serve { http, port } => {
-                if *http {
-                    println!("MCP HTTP server starting on port {port}... (not yet implemented)");
-                } else {
-                    println!("MCP stdio server starting... (not yet implemented)");
-                }
             }
         },
     }

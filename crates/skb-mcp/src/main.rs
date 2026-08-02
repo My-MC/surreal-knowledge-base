@@ -1,8 +1,12 @@
 use anyhow::Result;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
-    ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool as ToolDef,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, GetPromptRequestParams,
+    GetPromptResponse, GetPromptResult, Implementation, ListPromptsResult,
+    ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
+    Prompt, PromptArgument, PromptMessage, ReadResourceRequestParams, ReadResourceResponse,
+    ReadResourceResult, Resource, ResourceContents, ResourceTemplate, Role, ServerCapabilities,
+    ServerInfo, Tool as ToolDef,
 };
 use rmcp::service::serve_server;
 use rmcp::service::{RequestContext, RoleServer};
@@ -38,6 +42,8 @@ impl ServerHandler for SkbServer {
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_tool_list_changed()
+                .enable_resources()
+                .enable_prompts()
                 .build(),
         )
         .with_server_info(
@@ -125,6 +131,108 @@ impl ServerHandler for SkbServer {
         Ok(ListToolsResult::with_all_items(tools))
     }
 
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<ListResourcesResult, rmcp::ErrorData> {
+        let items = vec![
+            Resource::new("skb://documents", "documents")
+                .with_description("List of documents in the knowledge base"),
+            Resource::new("skb://stats", "stats").with_description("Knowledge base statistics"),
+        ];
+        Ok(ListResourcesResult::with_all_items(items))
+    }
+
+    async fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<ListResourceTemplatesResult, rmcp::ErrorData> {
+        let templates = vec![ResourceTemplate::new("skb://documents/{id}", "document")
+            .with_description("A single document body and its chunks, by id")];
+        Ok(ListResourceTemplatesResult::with_all_items(templates))
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<ReadResourceResponse, rmcp::ErrorData> {
+        let kb = self.kb.lock().await;
+        let uri = request.uri.clone();
+        let contents: Vec<ResourceContents> = if uri == "skb://documents" {
+            let docs = kb.list_documents(100, 0).await.map_err(err_data)?;
+            vec![ResourceContents::text(
+                serde_json::to_string_pretty(&docs).unwrap_or_default(),
+                uri,
+            )]
+        } else if uri == "skb://stats" {
+            let stats = kb.stats().await.map_err(err_data)?;
+            vec![ResourceContents::text(
+                serde_json::to_string_pretty(&stats).unwrap_or_default(),
+                uri,
+            )]
+        } else if let Some(id) = uri.strip_prefix("skb://documents/") {
+            let doc = kb
+                .get_document(id, true)
+                .await
+                .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+            vec![ResourceContents::text(
+                serde_json::to_string_pretty(&doc).unwrap_or_default(),
+                uri,
+            )]
+        } else {
+            return Err(rmcp::ErrorData::resource_not_found(uri, None));
+        };
+        Ok(ReadResourceResponse::from(ReadResourceResult::new(
+            contents,
+        )))
+    }
+
+    async fn list_prompts(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<ListPromptsResult, rmcp::ErrorData> {
+        let prompts = vec![Prompt::new(
+            "skb-answer",
+            Some("Answer a question grounded in the knowledge base via skb_search."),
+            Some(vec![PromptArgument::new("question")
+                .with_description("The question to answer")
+                .with_required(true)]),
+        )];
+        Ok(ListPromptsResult::with_all_items(prompts))
+    }
+
+    async fn get_prompt(
+        &self,
+        request: GetPromptRequestParams,
+        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<GetPromptResponse, rmcp::ErrorData> {
+        let question = request
+            .arguments
+            .as_ref()
+            .and_then(|a| a.get("question"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let user = if question.is_empty() {
+            "Answer using the local knowledge base.".to_string()
+        } else {
+            question
+        };
+        let messages = vec![PromptMessage::new_text(
+            Role::User,
+            format!(
+                "You are an assistant that answers questions strictly using the user's local \
+                knowledge base. Call the skb_search tool, then cite its source field.\n\nQuestion: {user}"
+            ),
+        )];
+        Ok(GetPromptResponse::from(GetPromptResult::new(messages)))
+    }
+
+    // ── Tools ──
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
@@ -136,6 +244,10 @@ impl ServerHandler for SkbServer {
             Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(e)]).into()),
         }
     }
+}
+
+fn err_data(e: skb_core::error::SkbError) -> rmcp::ErrorData {
+    rmcp::ErrorData::internal_error(e.to_string(), None)
 }
 
 fn tool(
