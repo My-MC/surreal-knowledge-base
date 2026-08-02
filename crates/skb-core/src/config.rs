@@ -148,6 +148,12 @@ impl Config {
         ];
         candidates.into_iter().find(|p| p.exists())
     }
+
+    /// Path to the config file that `set` should write to: the first existing
+    /// config (project then user), else the project `./skb.toml`.
+    pub fn writable_config_path() -> PathBuf {
+        Self::find_config_path().unwrap_or_else(|| PathBuf::from("./skb.toml"))
+    }
 }
 
 fn home_dir() -> PathBuf {
