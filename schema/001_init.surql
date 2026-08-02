@@ -20,6 +20,12 @@ DEFINE FIELD IF NOT EXISTS content     ON chunk TYPE string;
 DEFINE FIELD IF NOT EXISTS token_count ON chunk TYPE int;
 DEFINE FIELD IF NOT EXISTS heading     ON chunk TYPE option<string>;
 
+-- ── 全文検索層 ──────────────────────────────────
+-- class トークナイザ + lowercase フィルタ
+DEFINE ANALYZER IF NOT EXISTS skb_text TOKENIZERS class FILTERS lowercase;
+DEFINE INDEX IF NOT EXISTS chunk_content_fts ON chunk
+    FIELDS content FULLTEXT ANALYZER skb_text BM25;
+
 -- ── Vector DB 層 ({DIM} = embedding dimension) ──
 DEFINE FIELD IF NOT EXISTS embedding ON chunk TYPE array<float>
     ASSERT array::len($value) = {DIM};
