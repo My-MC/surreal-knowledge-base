@@ -68,6 +68,7 @@ impl ServerHandler for SkbServer {
                     ("content_base64", "string"),
                     ("title", "string"),
                     ("tags", "string"),
+                    ("metadata", "object"),
                     ("force", "boolean"),
                 ],
             ),
@@ -79,12 +80,17 @@ impl ServerHandler for SkbServer {
                     ("mode", "string"),
                     ("top_k", "integer"),
                     ("graph_expand", "integer"),
+                    ("filter", "object"),
                 ],
             ),
             tool(
                 "skb_list_documents",
                 "List all documents",
-                &[("limit", "integer"), ("offset", "integer")],
+                &[
+                    ("limit", "integer"),
+                    ("offset", "integer"),
+                    ("order", "string"),
+                ],
             ),
             tool(
                 "skb_get_document",
@@ -126,7 +132,11 @@ impl ServerHandler for SkbServer {
                     ("weight", "number"),
                 ],
             ),
-            tool("skb_reindex", "Reindex all documents", &[]),
+            tool(
+                "skb_reindex",
+                "Reindex all documents",
+                &[("dry_run", "boolean")],
+            ),
         ];
         Ok(ListToolsResult::with_all_items(tools))
     }
@@ -162,7 +172,7 @@ impl ServerHandler for SkbServer {
         let kb = self.kb.lock().await;
         let uri = request.uri.clone();
         let contents: Vec<ResourceContents> = if uri == "skb://documents" {
-            let docs = kb.list_documents(100, 0).await.map_err(err_data)?;
+            let docs = kb.list_documents(100, 0, None).await.map_err(err_data)?;
             vec![ResourceContents::text(
                 serde_json::to_string_pretty(&docs).unwrap_or_default(),
                 uri,
@@ -299,7 +309,11 @@ impl SkbServer {
             "skb_list_documents" => {
                 let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
                 let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                kb.list_documents(limit, offset)
+                let order = args
+                    .get("order")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                kb.list_documents(limit, offset, order)
                     .await
                     .map(|r| serde_json::to_value(r).unwrap_or_default())
                     .map_err(|e| format!("{e}"))
@@ -351,11 +365,17 @@ impl SkbServer {
                     .map(|_| json!({"status": "ok"}))
                     .map_err(|e| format!("{e}"))
             }
-            "skb_reindex" => kb
-                .reindex()
-                .await
-                .map(|r| serde_json::to_value(r).unwrap_or_default())
-                .map_err(|e| format!("{e}")),
+            "skb_reindex" => {
+                let dry_run = args
+                    .get("dry_run")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let req = skb_core::reindex::ReindexRequest { dry_run };
+                kb.reindex(&req)
+                    .await
+                    .map(|r| serde_json::to_value(r).unwrap_or_default())
+                    .map_err(|e| format!("{e}"))
+            }
             name => Err(format!("unknown tool: {name}")),
         }
     }

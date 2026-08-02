@@ -52,11 +52,24 @@ pub async fn list_documents(
     db: &Db,
     limit: usize,
     offset: usize,
+    order: Option<String>,
 ) -> Result<Vec<DocumentSummary>, SkbError> {
+    let order_by = match order.as_deref() {
+        Some("created_asc") => "created_at ASC",
+        Some("title_asc") => "title ASC",
+        Some("title_desc") => "title DESC",
+        Some("created_desc") | None => "created_at DESC",
+        _ => {
+            return Err(SkbError::new(
+                ErrorCode::Validation,
+                "order must be created_desc, created_asc, title_asc, or title_desc",
+            ))
+        }
+    };
     let query = format!(
         "SELECT string::concat('document:', meta::id(id)) AS id, \
          title, source, sha256, created_at \
-         FROM document ORDER BY created_at DESC LIMIT {limit} START {offset}"
+         FROM document ORDER BY {order_by} LIMIT {limit} START {offset}"
     );
     let mut r = db
         .db

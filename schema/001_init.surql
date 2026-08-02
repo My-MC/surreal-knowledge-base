@@ -8,7 +8,7 @@ DEFINE FIELD IF NOT EXISTS mime        ON document TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS sha256      ON document TYPE string;
 DEFINE FIELD IF NOT EXISTS content     ON document TYPE string;
 DEFINE FIELD IF NOT EXISTS tags        ON document TYPE array<string> DEFAULT [];
-DEFINE FIELD IF NOT EXISTS metadata    ON document TYPE object DEFAULT {};
+DEFINE FIELD IF NOT EXISTS metadata    ON document TYPE object FLEXIBLE DEFAULT {};
 DEFINE FIELD IF NOT EXISTS created_at  ON document TYPE datetime DEFAULT time::now();
 DEFINE FIELD IF NOT EXISTS updated_at  ON document TYPE datetime VALUE time::now();
 DEFINE INDEX IF NOT EXISTS document_sha256 ON document FIELDS sha256 UNIQUE;
@@ -19,6 +19,13 @@ DEFINE FIELD IF NOT EXISTS idx         ON chunk TYPE int;
 DEFINE FIELD IF NOT EXISTS content     ON chunk TYPE string;
 DEFINE FIELD IF NOT EXISTS token_count ON chunk TYPE int;
 DEFINE FIELD IF NOT EXISTS heading     ON chunk TYPE option<string>;
+
+-- ── Full-text index (keyword / hybrid) ──────────────
+-- 3.x dropped the `SEARCH INDEX` keyword; fulltext uses `FULLTEXT ANALYZER`.
+-- `class` tokenizer + lowercase only (ngram broke single-word BM25).
+DEFINE ANALYZER IF NOT EXISTS skb_text TOKENIZERS class FILTERS lowercase;
+DEFINE INDEX IF NOT EXISTS chunk_content_fts ON chunk FIELDS content
+    FULLTEXT ANALYZER skb_text BM25;
 
 -- ── Vector DB 層 ({DIM} = embedding dimension) ──
 DEFINE FIELD IF NOT EXISTS embedding ON chunk TYPE array<float>

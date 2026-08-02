@@ -104,7 +104,7 @@ fn core_list() -> Value {
     config.storage.path = dir.join("db");
     rt.block_on(async {
         let kb = skb_core::KnowledgeBase::open(config).await.unwrap();
-        let docs = kb.list_documents(10, 0).await.unwrap();
+        let docs = kb.list_documents(10, 0, None).await.unwrap();
         serde_json::to_value(docs).unwrap()
     })
 }

@@ -127,8 +127,9 @@ impl KnowledgeBase {
         &self,
         limit: usize,
         offset: usize,
+        order: Option<String>,
     ) -> Result<Vec<DocumentSummary>, SkbError> {
-        crud::list_documents(&self.db, limit, offset).await
+        crud::list_documents(&self.db, limit, offset, order).await
     }
 
     pub async fn get_document(
@@ -179,12 +180,16 @@ impl KnowledgeBase {
     }
 
     // ── Reindex ──
-    pub async fn reindex(&self) -> Result<reindex::ReindexResult, SkbError> {
+    pub async fn reindex(
+        &self,
+        req: &reindex::ReindexRequest,
+    ) -> Result<reindex::ReindexResult, SkbError> {
         reindex::reindex(
             &self.db,
             self.embedder.as_ref(),
             self.tokenizer.as_ref(),
             &self.config,
+            req,
         )
         .await
     }
@@ -281,7 +286,7 @@ mod tests {
             .unwrap();
         assert!(!sres.hits.is_empty());
 
-        let docs = kb.list_documents(10, 0).await.unwrap();
+        let docs = kb.list_documents(10, 0, None).await.unwrap();
         assert!(!docs.is_empty());
 
         let stats = kb.stats().await.unwrap();
@@ -360,7 +365,7 @@ mod tests {
         .unwrap();
 
         // Verify document was created
-        let docs = kb.list_documents(10, 0).await.unwrap();
+        let docs = kb.list_documents(10, 0, None).await.unwrap();
         assert!(!docs.is_empty());
 
         // Verify content is stored

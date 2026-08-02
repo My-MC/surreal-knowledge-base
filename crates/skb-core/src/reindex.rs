@@ -4,7 +4,7 @@ use crate::embed::Embed;
 use crate::error::{ErrorCode, SkbError};
 use crate::tokenize::Tokenize;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ReindexResult {
@@ -14,12 +14,21 @@ pub struct ReindexResult {
     pub entities_extracted: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ReindexRequest {
+    /// Only report what a reindex would do, without mutating the database.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
 pub async fn reindex(
     db: &Db,
     embedder: &dyn Embed,
     tokenizer: &dyn Tokenize,
     config: &Config,
+    req: &ReindexRequest,
 ) -> Result<ReindexResult, SkbError> {
+    let dry_run = req.dry_run;
     // Get all documents
     let find =
         "SELECT meta::id(id) AS did, title, source, source_type, content, sha256 FROM document";
@@ -46,15 +55,17 @@ pub async fn reindex(
             continue;
         }
 
-        // Delete old chunks + mentions
-        let del_sql = format!(
-            "DELETE FROM mentions WHERE in = {did} OR out = {did}; \
-             DELETE FROM chunk WHERE document = {did};"
-        );
-        db.db
-            .query(&del_sql)
-            .await
-            .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex del: {e}")))?;
+        // Delete old chunks + mentions (no-op in dry-run)
+        if !dry_run {
+            let del_sql = format!(
+                "DELETE FROM mentions WHERE in = {did} OR out = {did}; \
+                 DELETE FROM chunk WHERE document = {did};"
+            );
+            db.db
+                .query(&del_sql)
+                .await
+                .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex del: {e}")))?;
+        }
 
         // Re-chunk
         let chunks = tokenizer.chunk(
@@ -64,6 +75,15 @@ pub async fn reindex(
         )?;
 
         if chunks.is_empty() {
+            continue;
+        }
+
+        if dry_run {
+            let entities = crate::graph::extract_entities(content);
+            result.entities_extracted += entities.len();
+            result.documents_processed += 1;
+            result.chunks_created += chunks.len();
+            result.tokens_total += chunks.iter().map(|c| c.token_count).sum::<usize>();
             continue;
         }
 

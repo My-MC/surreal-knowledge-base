@@ -49,6 +49,12 @@ pub async fn search(
         }
     };
 
+    let hits = if let Some(filter) = &req.filter {
+        apply_filter(db, hits, filter).await?
+    } else {
+        hits
+    };
+
     Ok(SearchResponse {
         hits,
         mode: mode.to_string(),
@@ -212,4 +218,64 @@ fn rows_to_hits(rows: &[serde_json::Value]) -> Result<Vec<SearchHit>, SkbError> 
         });
     }
     Ok(hits)
+}
+
+/// Post-filter hits by matching document fields (title/source/source_type/...).
+/// The vector/hybrid paths use a KNN operator that cannot be combined with an
+/// arbitrary field condition, so filtering happens after retrieval.
+async fn apply_filter(
+    db: &Db,
+    hits: Vec<SearchHit>,
+    filter: &HashMap<String, String>,
+) -> Result<Vec<SearchHit>, SkbError> {
+    if hits.is_empty() {
+        return Ok(hits);
+    }
+
+    let mut ids: Vec<String> = hits.iter().map(|h| h.document_id.clone()).collect();
+    ids.sort();
+    ids.dedup();
+    let in_list = ids
+        .iter()
+        .map(|id| format!("'{id}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let fields: Vec<String> = filter.keys().map(|k| k.to_string()).collect();
+    let select_fields = fields.join(",");
+
+    let sql = format!(
+        "SELECT meta::id(id) AS id, {select_fields} \
+         FROM document WHERE meta::id(id) IN [{ids}]",
+        select_fields = select_fields,
+        ids = in_list,
+    );
+    let mut r = db
+        .db
+        .query(&sql)
+        .await
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("filter: {e}")))?;
+    let rows: Vec<serde_json::Value> = r
+        .take(0)
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("filter take: {e}")))?;
+
+    let mut keep: Vec<SearchHit> = Vec::new();
+    for hit in &hits {
+        let Some(row) = rows
+            .iter()
+            .find(|r| r["id"].as_str() == Some(&hit.document_id))
+        else {
+            continue;
+        };
+        let mut ok = true;
+        for (k, v) in filter {
+            if row.get(k).and_then(|fv| fv.as_str()) != Some(v.as_str()) {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            keep.push(hit.clone());
+        }
+    }
+    Ok(keep)
 }
