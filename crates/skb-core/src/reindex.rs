@@ -46,10 +46,11 @@ pub async fn reindex(
             continue;
         }
 
-        // Delete old chunks + mentions
+        // Delete old mentions + chunks for this document
         let del_sql = format!(
-            "DELETE FROM mentions WHERE in = {did} OR out = {did}; \
-             DELETE FROM chunk WHERE document = {did};"
+            "LET $chunks = (SELECT value id FROM chunk WHERE meta::id(document) = '{did}'); \
+             DELETE FROM mentions WHERE ->in IN $chunks; \
+             DELETE FROM chunk WHERE meta::id(document) = '{did}';"
         );
         db.db
             .query(&del_sql)
@@ -72,39 +73,35 @@ pub async fn reindex(
         let embeddings = embed_in_batches(embedder, &texts, config.embedding.batch_size)?;
 
         // Re-create chunks
+        let mut chunk_ids: Vec<String> = Vec::with_capacity(chunks.len());
         for (i, (chunk, emb)) in chunks.iter().zip(embeddings.iter()).enumerate() {
             let emb_str = serde_json::to_string(emb).unwrap_or_else(|_| "[]".into());
             let c = chunk.content.replace('\'', "\\'").replace('\n', "\\n");
             let chunk_sql = format!(
-                "CREATE chunk SET document = {did}, idx = {i}, content = '{c}', \
-                 token_count = {tc}, embedding = {emb}",
+                "CREATE chunk SET document = document:⟨{did}⟩, idx = {i}, content = '{c}', \
+                 token_count = {tc}, embedding = {emb} \
+                 RETURN string::concat('chunk:', meta::id(id)) AS cid",
                 tc = chunk.token_count,
                 emb = emb_str,
             );
-            db.db
+            let mut cr = db
+                .db
                 .query(&chunk_sql)
                 .await
                 .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex chunk: {e}")))?;
+            let rows: Vec<serde_json::Value> = cr
+                .take(0)
+                .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex chunk take: {e}")))?;
+            if let Some(cid) = rows.first().and_then(|v| v["cid"].as_str()) {
+                chunk_ids.push(cid.to_string());
+            }
         }
 
-        // Re-extract entities
-        let entities = crate::graph::extract_entities(content);
-        let _escaped_did = did.replace('\'', "\\'");
-        for entity in entities.iter() {
-            let name = entity.name.replace('\'', "\\'");
-            let kind = entity.kind.replace('\'', "\\'");
-            let desc = entity
-                .description
-                .as_deref()
-                .unwrap_or("")
-                .replace('\'', "\\'");
-            let esql = format!(
-                "INSERT INTO entity (name, kind, description) \
-                 VALUES ('{name}', '{kind}', '{desc}') \
-                 ON DUPLICATE KEY UPDATE description = '{desc}'"
-            );
-            let _ = db.db.query(&esql).await;
-            result.entities_extracted += 1;
+        // Re-extract entities and rebuild mentions per chunk
+        for (cid, chunk) in chunk_ids.iter().zip(chunks.iter()) {
+            if let Ok(n) = crate::graph::index_chunk_entities(db, cid, &chunk.content).await {
+                result.entities_extracted += n;
+            }
         }
 
         result.documents_processed += 1;
