@@ -118,6 +118,8 @@ enum ConfigCmd {
     Init,
     /// Show current config
     Show,
+    /// Set a config value by dotted key (e.g. storage.path, search.top_k)
+    Set { key: String, value: String },
 }
 
 fn output(val: &impl serde::Serialize, format: &str) -> Result<()> {
@@ -290,10 +292,69 @@ async fn main() -> Result<()> {
                 let c = cfg()?;
                 output(&c, &fmt)?;
             }
+            ConfigCmd::Set { key, value } => set_config(key, value)?,
         },
     }
 
     Ok(())
+}
+
+/// `skb config set storage.path './db'`: write a dotted key into the writable
+/// config file (./skb.toml or ~/.config/skb/config.toml), preserving other keys.
+fn set_config(key: &str, value: &str) -> Result<()> {
+    let path = Config::writable_config_path();
+    let content = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut root: toml::Value = if content.trim().is_empty() {
+        toml::Value::Table(toml::map::Map::new())
+    } else {
+        toml::from_str(&content).map_err(|e| anyhow::anyhow!("parse config: {e}"))?
+    };
+
+    let parts: Vec<&str> = key.trim().split('.').filter(|s| !s.is_empty()).collect();
+    if parts.is_empty() {
+        anyhow::bail!("invalid key: {key}");
+    }
+
+    // Walk (or create) nested tables for all but the last segment.
+    let mut cur = &mut root;
+    for seg in &parts[..parts.len() - 1] {
+        let entry = cur
+            .as_table_mut()
+            .ok_or_else(|| anyhow::anyhow!("path segment '{seg}' is not a table"))?;
+        cur = entry
+            .entry((*seg).to_string())
+            .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    }
+    let last = *parts.last().unwrap();
+    let entry = cur
+        .as_table_mut()
+        .ok_or_else(|| anyhow::anyhow!("path '{key}' parent is not a table"))?;
+    entry.insert(last.to_string(), parse_scalar(value));
+
+    if let Some(parent) = std::path::Path::new(&path).parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    std::fs::write(&path, toml::to_string(&root)?)?;
+    println!(
+        "Set {key} = {value} in {} (restart to retload; reindex if it changes embedding/chunking).",
+        path.display()
+    );
+    Ok(())
+}
+
+fn parse_scalar(raw: &str) -> toml::Value {
+    if let Ok(b) = raw.parse::<bool>() {
+        return toml::Value::Boolean(b);
+    }
+    if let Ok(i) = raw.parse::<i64>() {
+        return toml::Value::Integer(i);
+    }
+    if let Ok(f) = raw.parse::<f64>() {
+        return toml::Value::Float(f);
+    }
+    toml::Value::String(raw.to_string())
 }
 
 fn cfg() -> Result<Config> {
