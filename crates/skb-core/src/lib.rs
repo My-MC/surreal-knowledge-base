@@ -93,20 +93,14 @@ impl KnowledgeBase {
 
     // ── Upload ──
     pub async fn upload(&self, req: UploadRequest) -> Result<UploadResult, SkbError> {
-        let result = ingest::upload(
+        ingest::upload(
             &self.db,
             self.embedder.as_ref(),
             self.tokenizer.as_ref(),
             &self.config,
             req,
         )
-        .await?;
-
-        if let Some(ref doc_id) = result.document_id {
-            let _ = self.extract_and_save_entities(doc_id).await;
-        }
-
-        Ok(result)
+        .await
     }
 
     // ── Search ──

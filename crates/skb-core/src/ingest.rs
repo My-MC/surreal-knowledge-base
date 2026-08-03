@@ -2,6 +2,7 @@ use crate::config::Config;
 use crate::db::Db;
 use crate::embed::Embed;
 use crate::error::{ErrorCode, SkbError};
+use crate::graph;
 use crate::tokenize::{Chunk, Tokenize};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -88,11 +89,18 @@ pub async fn upload(
     let texts: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
     let embeddings = embed_batch(embedder, &texts, config.embedding.batch_size)?;
     let total_tokens: usize = chunks.iter().map(|c| c.token_count).sum();
-    let doc_id = store_document(db, &doc, &chunks, &embeddings).await?;
-    let entities = crate::graph::extract_entities(&doc.content)
-        .into_iter()
-        .map(|e| e.name)
-        .collect::<Vec<_>>();
+    let (doc_id, chunk_ids) = store_document(db, &doc, &chunks, &embeddings).await?;
+    let mut entities = Vec::new();
+    for (chunk_id, chunk) in chunk_ids.iter().zip(chunks.iter()) {
+        let _ = graph::index_chunk_entities(db, chunk_id, &chunk.content).await;
+        entities.extend(
+            graph::extract_entities(&chunk.content)
+                .into_iter()
+                .map(|entity| entity.name),
+        );
+    }
+    entities.sort();
+    entities.dedup();
 
     Ok(UploadResult {
         document_id: Some(doc_id),
@@ -326,7 +334,7 @@ async fn store_document(
     doc: &DocumentData,
     chunks: &[Chunk],
     embeddings: &[Vec<f32>],
-) -> Result<String, SkbError> {
+) -> Result<(String, Vec<String>), SkbError> {
     let title = doc.title.replace('\'', "\\'");
     let source = doc.source.replace('\'', "\\'");
     let content = doc.content.replace('\'', "\\'").replace('\n', "\\n");
@@ -364,21 +372,36 @@ async fn store_document(
         return Err(SkbError::new(ErrorCode::Db, "failed to get document id"));
     }
 
-    // Create chunks
+    // Create chunks, capturing each generated id
+    let mut chunk_ids = Vec::with_capacity(chunks.len());
     for (i, (chunk, emb)) in chunks.iter().zip(embeddings.iter()).enumerate() {
         let emb_str = serde_json::to_string(emb).unwrap_or_else(|_| "[]".into());
         let c = chunk.content.replace('\'', "\\'").replace('\n', "\\n");
         let chunk_sql = format!(
             "CREATE chunk SET document = {doc_id}, idx = {i}, content = '{c}', \
-             token_count = {tc}, embedding = {emb}",
+             token_count = {tc}, embedding = {emb} \
+             RETURN string::concat('chunk:', meta::id(id)) AS cid",
             tc = chunk.token_count,
             emb = emb_str,
         );
-        db.db
+        let mut cr = db
+            .db
             .query(&chunk_sql)
             .await
             .map_err(|e| SkbError::new(ErrorCode::Db, format!("chunk {i}: {e}")))?;
+        let rows: Vec<serde_json::Value> = cr
+            .take(0)
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("chunk {i} take: {e}")))?;
+        let cid = rows
+            .first()
+            .and_then(|v| v["cid"].as_str())
+            .unwrap_or("")
+            .to_string();
+        if cid.is_empty() {
+            return Err(SkbError::new(ErrorCode::Db, "failed to get chunk id"));
+        }
+        chunk_ids.push(cid);
     }
 
-    Ok(doc_id)
+    Ok((doc_id, chunk_ids))
 }
