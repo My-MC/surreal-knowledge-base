@@ -242,12 +242,12 @@ pub async fn graph_query(db: &Db, req: &GraphQueryRequest) -> Result<GraphQueryR
             SkbError::new(ErrorCode::Db, format!("graph document chunks take: {e}"))
         })?;
         let relation = req.relation.as_deref().unwrap_or("mentions").to_string();
-        for row in chunk_rows {
+        'chunks: for row in chunk_rows {
             let names = to_string_vec(&row["next_name"]);
             let kinds = to_string_vec(&row["next_kind"]);
             for (i, name) in names.into_iter().enumerate() {
                 if emitted.len() >= limit {
-                    break;
+                    break 'chunks;
                 }
                 let id = entity_rid(&name);
                 if !emitted.insert(id.clone()) {
