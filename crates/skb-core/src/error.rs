@@ -65,4 +65,16 @@ impl ErrorCode {
             ErrorCode::Tokenize => 10,
         }
     }
+
+    /// Walk an error chain looking for a `SkbError` (works through `anyhow`
+    /// context wrappers). Returns `None` for non-`SkbError` failures.
+    pub fn from_std(e: &(dyn std::error::Error + 'static)) -> Option<ErrorCode> {
+        let mut cur: &(dyn std::error::Error + 'static) = e;
+        loop {
+            if let Some(sk) = cur.downcast_ref::<SkbError>() {
+                return Some(sk.code);
+            }
+            cur = cur.source()?;
+        }
+    }
 }

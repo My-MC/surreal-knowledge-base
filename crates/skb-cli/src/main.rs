@@ -168,8 +168,15 @@ fn collect_files(dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>> {
     Ok(out)
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> std::process::ExitCode {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to start tokio runtime");
+    rt.block_on(async_main())
+}
+
+async fn async_main() -> std::process::ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "skb=info,warn".into()))
         .with_writer(std::io::stderr)
@@ -178,6 +185,42 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let fmt = cli.format.clone();
 
+    match run(&cli).await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            emit_error(&fmt, &e);
+            std::process::ExitCode::from(exit_code_of(&e))
+        }
+    }
+}
+
+/// Print a machine-parseable error (JSON when --format json), then pick the exit
+/// code: a `SkbError` declares one via `ErrorCode::exit_code`, anything else is 1.
+fn emit_error(fmt: &str, e: &anyhow::Error) {
+    if fmt == "json" {
+        let code =
+            skb_core::error::ErrorCode::from_std(e.as_ref()).map(|c| c.code_str().to_string());
+        let msg = format!("{e:#}");
+        println!(
+            "{}",
+            serde_json::json!({
+                "error": code.unwrap_or_else(|| "E_INTERNAL".to_string()),
+                "message": msg,
+            })
+        );
+    } else {
+        eprintln!("Error: {e:#}");
+    }
+}
+
+fn exit_code_of(e: &anyhow::Error) -> u8 {
+    skb_core::error::ErrorCode::from_std(e.as_ref())
+        .map(|c| c.exit_code() as u8)
+        .unwrap_or(1)
+}
+
+async fn run(cli: &Cli) -> Result<()> {
+    let fmt = cli.format.clone();
     match &cli.command {
         Commands::List {
             limit,
