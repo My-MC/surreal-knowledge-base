@@ -46,16 +46,32 @@ pub struct GraphEdge {
     pub relation: String,
 }
 
+/// Deterministic record id for an entity, derived from its name.
+/// Using the name as the id keeps `RELATE`.=references and graph traversal
+/// unambiguous (entity identity is the name). Characters that would break the
+/// `⟨…⟩` quoted id literal are stripped.
+pub(crate) fn entity_rid(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .filter(|c| !matches!(c, '⟨' | '⟩' | '\\' | '\''))
+        .collect();
+    format!("entity:⟨{cleaned}⟩")
+}
+
+/// Insert-or-update an entity, addressed by its deterministic id (`entity:⟨name⟩`).
 pub async fn upsert_entity(db: &Db, entity: &EntityInfo) -> Result<(), SkbError> {
-    let desc = entity.description.as_deref().unwrap_or("");
+    let name = entity.name.replace('\'', "\\'");
+    let kind = entity.kind.replace('\'', "\\'");
+    let desc = entity
+        .description
+        .as_deref()
+        .unwrap_or("")
+        .replace('\'', "\\'");
+    let rid = entity_rid(&entity.name);
     let sql = format!(
-        "INSERT INTO entity (name, kind, description) \
-         VALUES ('{}', '{}', '{}') \
-         ON DUPLICATE KEY UPDATE description = '{}'",
-        entity.name.replace('\'', "\\'"),
-        entity.kind.replace('\'', "\\'"),
-        desc.replace('\'', "\\'"),
-        desc.replace('\'', "\\'"),
+        "INSERT INTO entity (id, name, kind, description) \
+         VALUES ({rid}, '{name}', '{kind}', '{desc}') \
+         ON DUPLICATE KEY UPDATE description = '{desc}'",
     );
     db.db
         .query(&sql)
@@ -66,11 +82,11 @@ pub async fn upsert_entity(db: &Db, entity: &EntityInfo) -> Result<(), SkbError>
 
 pub async fn link(db: &Db, link: &LinkInfo) -> Result<(), SkbError> {
     let weight = link.weight.unwrap_or(1.0);
+    let from = entity_rid(&link.from);
+    let to = entity_rid(&link.to);
     let sql = format!(
-        "RELATE entity:{}->related_to->entity:{} \
+        "RELATE {from}->related_to->{to} \
          SET relation = '{}', weight = {}",
-        link.from.replace('\'', "\\'"),
-        link.to.replace('\'', "\\'"),
         link.relation.replace('\'', "\\'"),
         weight,
     );
@@ -86,15 +102,31 @@ pub async fn link_chunk_to_entity(
     chunk_id: &str,
     entity_name: &str,
 ) -> Result<(), SkbError> {
-    let sql = format!(
-        "RELATE {chunk_id}->mentions->entity:{}",
-        entity_name.replace('\'', "\\'"),
-    );
+    let to = entity_rid(entity_name);
+    let sql = format!("RELATE {chunk_id}->mentions->{to}");
     db.db
         .query(&sql)
         .await
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("link chunk: {e}")))?;
     Ok(())
+}
+
+/// Extract entities from a chunk, upsert each into the `entity` table, and relay
+/// a `chunk ->mentions-> entity` edge so graph expansion can find related chunks.
+/// Returns the number of entities linked.
+pub async fn index_chunk_entities(
+    db: &Db,
+    chunk_id: &str,
+    chunk_content: &str,
+) -> Result<usize, SkbError> {
+    let entities = extract_entities(chunk_content);
+    let mut linked = 0;
+    for entity in entities.iter() {
+        upsert_entity(db, entity).await?;
+        link_chunk_to_entity(db, chunk_id, &entity.name).await?;
+        linked += 1;
+    }
+    Ok(linked)
 }
 
 pub async fn graph_query(db: &Db, req: &GraphQueryRequest) -> Result<GraphQueryResult, SkbError> {
@@ -105,23 +137,22 @@ pub async fn graph_query(db: &Db, req: &GraphQueryRequest) -> Result<GraphQueryR
     let mut nodes = Vec::new();
     let mut edges = Vec::new();
 
+    // Resolve the starting node: a full record id (`entity:…` / `document:…`)
+    // is used as-is; otherwise it is treated as an entity name.
+    let mut current = if from.starts_with("entity:") || from.starts_with("document:") {
+        from.clone()
+    } else {
+        entity_rid(&from)
+    };
+
     // Start from the specified node
-    let rel_match = req.relation.as_deref().map(|r| r.replace('\'', "\\'"));
-
     // Get the chain: from -> related_to -> ... -> N hops
-    let mut current = from.clone();
     for d in 0..depth {
-        let filter = if let Some(ref rel) = rel_match {
-            format!("WHERE relation = '{}'", rel)
-        } else {
-            String::new()
-        };
-
         let sql = format!(
             "SELECT meta::id(id) AS id, name, kind, \
-             ->related_to->entity.{filter} AS next \
-             FROM entity:{} LIMIT 1",
-            current
+             ->related_to->entity.name AS next_name, \
+             ->related_to->entity.kind AS next_kind \
+             FROM {current} LIMIT 1",
         );
         let mut r = db
             .db
@@ -142,29 +173,29 @@ pub async fn graph_query(db: &Db, req: &GraphQueryRequest) -> Result<GraphQueryR
                 });
             }
 
-            if let Some(next_arr) = row["next"].as_array() {
-                for next in next_arr.iter().take(limit) {
-                    let nid = next["id"].as_str().unwrap_or("").to_string();
-                    let nname = next["name"].as_str().unwrap_or("").to_string();
-                    let nkind = next["kind"].as_str().unwrap_or("").to_string();
-                    let rel = &req.relation.as_deref().unwrap_or("related").to_string();
+            // Normalize `next_name`/`next_kind` to Vec<String> (single or array).
+            let next_names: Vec<String> = to_string_vec(&row["next_name"]);
+            let next_kinds: Vec<String> = to_string_vec(&row["next_kind"]);
 
-                    nodes.push(GraphNode {
-                        id: nid.clone(),
-                        name: nname.clone(),
-                        kind: nkind.clone(),
-                        depth: d + 1,
-                    });
-                    edges.push(GraphEdge {
-                        from: current.clone(),
-                        to: nid.clone(),
-                        relation: rel.clone(),
-                    });
+            for (i, nname) in next_names.into_iter().take(limit).enumerate() {
+                let nkind = next_kinds.get(i).cloned().unwrap_or_default();
+                let rel = &req.relation.as_deref().unwrap_or("related").to_string();
 
-                    if d + 1 < depth {
-                        // Only follow the first result for simplicity
-                        current = nid;
-                    }
+                nodes.push(GraphNode {
+                    id: nname.clone(),
+                    name: nname.clone(),
+                    kind: nkind,
+                    depth: d + 1,
+                });
+                edges.push(GraphEdge {
+                    from: current.clone(),
+                    to: nname.clone(),
+                    relation: rel.clone(),
+                });
+
+                // Only follow the first result for simplicity
+                if d + 1 < depth && i == 0 {
+                    current = entity_rid(&nname);
                 }
             }
         } else {
@@ -199,7 +230,7 @@ pub async fn expand_search_hits(
         // Since chunk IDs are auto-generated, we need to find actual chunks
         let sql = format!(
             "SELECT ->mentions->entity.name AS e, ->mentions->entity.kind AS k \
-             FROM chunk WHERE idx = {} AND document = '{}'",
+             FROM chunk WHERE idx = {} AND meta::id(document) = '{}'",
             hit.chunk_idx,
             hit.document_id.replace('\'', "\\'")
         );
@@ -213,11 +244,11 @@ pub async fn expand_search_hits(
             .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand take: {e}")))?;
 
         for row in rows.iter() {
-            if let Some(ename) = row["e"].as_str() {
+            for ename in to_string_vec(&row["e"]) {
                 // Find other chunks mentioning this entity
                 let esql = format!(
                     "SELECT content, idx, meta::id(document) AS document, 1.0 AS score \
-                     FROM chunk WHERE ->mentions->entity.name = '{}' \
+                     FROM chunk WHERE '{}' IN ->mentions->entity.name \
                      LIMIT {max_expand}",
                     ename.replace('\'', "\\'")
                 );
@@ -231,9 +262,18 @@ pub async fn expand_search_hits(
                     .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand2 take: {e}")))?;
 
                 for erow in erows.iter() {
+                    let document_id = erow["document"].as_str().unwrap_or("").to_string();
+                    let chunk_idx = erow["idx"].as_u64().unwrap_or(0) as usize;
+                    // Skip chunks already present in the original hits.
+                    if hits
+                        .iter()
+                        .any(|h| h.document_id == document_id && h.chunk_idx == chunk_idx)
+                    {
+                        continue;
+                    }
                     expanded.push(crate::search::SearchHit {
-                        document_id: erow["document"].as_str().unwrap_or("").to_string(),
-                        chunk_idx: erow["idx"].as_u64().unwrap_or(0) as usize,
+                        document_id,
+                        chunk_idx,
                         content: erow["content"].as_str().unwrap_or("").to_string(),
                         score: erow["score"].as_f64().unwrap_or(0.1),
                     });
@@ -250,6 +290,19 @@ pub async fn expand_search_hits(
     expanded.truncate(max_expand);
 
     Ok(expanded)
+}
+
+/// Normalize a SurrealQL value into a list of strings (a single value, a string
+/// array, or an empty value all become `Vec<String>`).
+fn to_string_vec(v: &serde_json::Value) -> Vec<String> {
+    match v {
+        serde_json::Value::String(s) => vec![s.clone()],
+        serde_json::Value::Array(a) => a
+            .iter()
+            .filter_map(|x| x.as_str().map(|s| s.to_string()))
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// Extract entities from document text using rule-based extraction:
