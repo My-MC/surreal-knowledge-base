@@ -413,7 +413,8 @@ allowed_dirs = []                    # MCP経由の path アップロード許�
 ### 8.3 リソース・プロンプト
 
 - **Resources**: `skb://documents`（一覧）, `skb://documents/{id}`（本文）, `skb://stats` — 読み取り専用。
-- **Prompts**: `skb-answer`（`question` を受け取り `skb_search` の結果を根拠に回答する RAG 用テンプレート）。
+  一覧・本文・統計の JSON シリアライズに失敗した場合は MCP の内部エラーを返す。存在しない URI は resource-not-found エラーとする。
+- **Prompts**: `skb-answer` — `question` は任意。未指定または空の場合はローカル知識ベースを使って回答する既定の指示を生成する。指定時はその質問を使い、`skb_search` の結果を根拠に回答し、各引用に `document_id` と `chunk_idx` を含める。
 
 ### 8.4 MCP クライアント設定例
 
