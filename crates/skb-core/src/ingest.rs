@@ -40,6 +40,7 @@ struct DocumentData {
     sha256: String,
     tags: Vec<String>,
     metadata: HashMap<String, String>,
+    mime: Option<String>,
 }
 
 pub async fn upload(
@@ -164,6 +165,7 @@ fn extract_document_data(req: UploadRequest, config: &Config) -> Result<Document
         .map(|b| format!("{b:02x}"))
         .collect::<String>();
 
+    let mime = mime_for(&file_title);
     Ok(DocumentData {
         title: req.title.unwrap_or(file_title),
         source,
@@ -172,7 +174,28 @@ fn extract_document_data(req: UploadRequest, config: &Config) -> Result<Document
         sha256,
         tags: req.tags.unwrap_or_default(),
         metadata: req.metadata.unwrap_or_default(),
+        mime,
     })
+}
+
+fn mime_for(name: &str) -> Option<String> {
+    let ext = std::path::Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())
+        .unwrap_or_default();
+    let mime = match ext.as_str() {
+        "md" | "markdown" => "text/markdown",
+        "txt" => "text/plain",
+        "html" | "htm" => "text/html",
+        "json" => "application/json",
+        "yaml" | "yml" => "application/x-yaml",
+        "pdf" => "application/pdf",
+        "csv" => "text/csv",
+        "rs" => "text/x-rust",
+        _ => "",
+    };
+    (!mime.is_empty()).then(|| mime.to_string())
 }
 
 fn extract_text(content: &str, source: &str) -> String {
@@ -338,6 +361,11 @@ async fn store_document(
     let title = doc.title.replace('\'', "\\'");
     let source = doc.source.replace('\'', "\\'");
     let content = doc.content.replace('\'', "\\'").replace('\n', "\\n");
+    let mime = doc
+        .mime
+        .as_deref()
+        .map(|value| format!("'{}'", value.replace('\'', "\\'")))
+        .unwrap_or_else(|| "NONE".to_string());
     let tags_str = serde_json::to_string(&doc.tags).unwrap_or_else(|_| "[]".into());
     let meta_str = serde_json::to_string(&doc.metadata).unwrap_or_else(|_| "{}".into());
 
@@ -345,13 +373,15 @@ async fn store_document(
     let sql = format!(
         "CREATE document SET \
          title = '{title}', source = '{source}', source_type = '{stype}', \
-         sha256 = '{sha}', content = '{content}', tags = {tags}, metadata = {meta} \
+         sha256 = '{sha}', content = '{content}', mime = {mime}, \
+         tags = {tags}, metadata = {meta} \
          RETURN string::concat('document:', meta::id(id)) AS did",
         title = title,
         source = source,
         stype = doc.source_type,
         sha = doc.sha256,
         content = content,
+        mime = mime,
         tags = tags_str,
         meta = meta_str,
     );
