@@ -28,6 +28,7 @@ pub struct UploadResult {
     pub chunks: usize,
     pub tokens: usize,
     pub sha256: String,
+    pub entities: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -50,7 +51,8 @@ pub async fn upload(
 ) -> Result<UploadResult, SkbError> {
     let force = req.force.unwrap_or(false);
     let doc = extract_document_data(req, config)?;
-    if !force && doc_exists(db, &doc.sha256).await? {
+    let existed = doc_exists(db, &doc.sha256).await?;
+    if !force && existed {
         return Ok(UploadResult {
             document_id: None,
             title: doc.title,
@@ -58,10 +60,11 @@ pub async fn upload(
             chunks: 0,
             tokens: 0,
             sha256: doc.sha256,
+            entities: vec![],
         });
     }
 
-    if force {
+    if force && existed {
         delete_existing(db, &doc.sha256).await?;
     }
 
@@ -79,6 +82,7 @@ pub async fn upload(
             chunks: 0,
             tokens: 0,
             sha256: doc.sha256,
+            entities: vec![],
         });
     }
 
@@ -86,18 +90,30 @@ pub async fn upload(
     let embeddings = embed_batch(embedder, &texts, config.embedding.batch_size)?;
     let total_tokens: usize = chunks.iter().map(|c| c.token_count).sum();
     let (doc_id, chunk_ids) = store_document(db, &doc, &chunks, &embeddings).await?;
-
+    let mut entities = Vec::new();
     for (chunk_id, chunk) in chunk_ids.iter().zip(chunks.iter()) {
         let _ = graph::index_chunk_entities(db, chunk_id, &chunk.content).await;
+        entities.extend(
+            graph::extract_entities(&chunk.content)
+                .into_iter()
+                .map(|entity| entity.name),
+        );
     }
+    entities.sort();
+    entities.dedup();
 
     Ok(UploadResult {
         document_id: Some(doc_id),
         title: doc.title,
-        status: "created".into(),
+        status: if existed {
+            "updated".into()
+        } else {
+            "created".into()
+        },
         chunks: chunks.len(),
         tokens: total_tokens,
         sha256: doc.sha256,
+        entities,
     })
 }
 
@@ -247,8 +263,9 @@ fn fetch_url(url_str: &str, config: &Config) -> Result<String, SkbError> {
 
 fn base64_decode(b64: &str) -> Result<Vec<u8>, SkbError> {
     use base64::Engine;
+    let compact: String = b64.chars().filter(|c| !c.is_whitespace()).collect();
     base64::engine::general_purpose::STANDARD
-        .decode(b64)
+        .decode(compact)
         .map_err(|e| SkbError::new(ErrorCode::Validation, format!("base64: {e}")))
 }
 
@@ -301,23 +318,14 @@ async fn doc_exists(db: &Db, sha256: &str) -> Result<bool, SkbError> {
 }
 
 async fn delete_existing(db: &Db, sha256: &str) -> Result<(), SkbError> {
-    let find =
-        format!("SELECT meta::id(id) AS did FROM document WHERE sha256 = '{sha256}' LIMIT 1");
-    let mut r = db
-        .db
-        .query(&find)
+    let del = format!(
+        "DELETE FROM chunk WHERE document.sha256 = '{sha256}'; \
+         DELETE FROM document WHERE sha256 = '{sha256}';"
+    );
+    db.db
+        .query(&del)
         .await
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete find: {e}")))?;
-    let rows: Vec<serde_json::Value> = r
-        .take(0)
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete find take: {e}")))?;
-    if let Some(did) = rows.first().and_then(|v| v["did"].as_str()) {
-        let del = format!("DELETE FROM chunk WHERE document = {did}; DELETE FROM {did};");
-        db.db
-            .query(&del)
-            .await
-            .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete: {e}")))?;
-    }
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete: {e}")))?;
     Ok(())
 }
 
