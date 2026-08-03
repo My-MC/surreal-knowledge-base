@@ -59,7 +59,7 @@ pub async fn reindex(
         if !dry_run {
             let del_sql = format!(
                 "LET $chunks = (SELECT value id FROM chunk WHERE meta::id(document) = '{did}'); \
-                 DELETE FROM mentions WHERE ->in IN $chunks; \
+                  DELETE FROM mentions WHERE in IN $chunks; \
                  DELETE FROM chunk WHERE meta::id(document) = '{did}';"
             );
             db.db
@@ -112,9 +112,16 @@ pub async fn reindex(
             let rows: Vec<serde_json::Value> = cr
                 .take(0)
                 .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex chunk take: {e}")))?;
-            if let Some(cid) = rows.first().and_then(|v| v["cid"].as_str()) {
-                chunk_ids.push(cid.to_string());
-            }
+            let cid = rows
+                .first()
+                .and_then(|v| v["cid"].as_str())
+                .ok_or_else(|| {
+                    SkbError::new(
+                        ErrorCode::Db,
+                        format!("reindex chunk {i} did not return a chunk id"),
+                    )
+                })?;
+            chunk_ids.push(cid.to_string());
         }
 
         // Re-extract entities and rebuild mentions per chunk

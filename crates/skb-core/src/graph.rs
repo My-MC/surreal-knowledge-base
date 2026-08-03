@@ -111,7 +111,7 @@ pub async fn link_chunk_to_entity(
     Ok(())
 }
 
-/// Extract entities from a chunk, upsert each into the `entity` table, and relay
+/// Extract entities from a chunk, upsert each into the `entity` table, and relate
 /// a `chunk ->mentions-> entity` edge so graph expansion can find related chunks.
 /// Returns the number of entities linked.
 pub async fn index_chunk_entities(
@@ -137,7 +137,7 @@ pub async fn graph_query(db: &Db, req: &GraphQueryRequest) -> Result<GraphQueryR
     let mut nodes = Vec::new();
     let mut edges = Vec::new();
 
-    // Resolve the starting node: a full record id (`entity:…` / `document:…`)
+    // Resolve the starting node: a full record id (`entity:...` / `document:...`)
     // is used as-is; otherwise it is treated as an entity name.
     let mut current = if from.starts_with("entity:") || from.starts_with("document:") {
         from.clone()
@@ -145,14 +145,80 @@ pub async fn graph_query(db: &Db, req: &GraphQueryRequest) -> Result<GraphQueryR
         entity_rid(&from)
     };
 
-    // Start from the specified node
-    // Get the chain: from -> related_to -> ... -> N hops
-    for d in 0..depth {
+    let mut start_depth = 0;
+    if current.starts_with("document:") {
+        let mut doc_query = db
+            .db
+            .query(&format!(
+                "SELECT meta::id(id) AS id, title AS name FROM {current}"
+            ))
+            .await
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("graph document: {e}")))?;
+        let doc_rows: Vec<serde_json::Value> = doc_query
+            .take(0)
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("graph document take: {e}")))?;
+        let Some(doc) = doc_rows.first() else {
+            return Err(SkbError::new(ErrorCode::DocumentNotFound, from));
+        };
+        nodes.push(GraphNode {
+            id: current.clone(),
+            name: doc["name"].as_str().unwrap_or("").to_string(),
+            kind: "document".into(),
+            depth: 0,
+        });
+
+        let mut chunk_query = db
+            .db
+            .query(&format!(
+                "SELECT ->mentions->entity.name AS next_name, \
+                 ->mentions->entity.kind AS next_kind FROM chunk WHERE document = {current}"
+            ))
+            .await
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("graph document chunks: {e}")))?;
+        let chunk_rows: Vec<serde_json::Value> = chunk_query.take(0).map_err(|e| {
+            SkbError::new(ErrorCode::Db, format!("graph document chunks take: {e}"))
+        })?;
+        let relation = req.relation.as_deref().unwrap_or("mentions").to_string();
+        for row in chunk_rows {
+            let names = to_string_vec(&row["next_name"]);
+            let kinds = to_string_vec(&row["next_kind"]);
+            for (i, name) in names.into_iter().take(limit).enumerate() {
+                let id = entity_rid(&name);
+                nodes.push(GraphNode {
+                    id: id.clone(),
+                    name,
+                    kind: kinds.get(i).cloned().unwrap_or_default(),
+                    depth: 1,
+                });
+                edges.push(GraphEdge {
+                    from: current.clone(),
+                    to: id.clone(),
+                    relation: relation.clone(),
+                });
+                if start_depth == 0 {
+                    current = id;
+                }
+                start_depth = 1;
+            }
+        }
+        if start_depth == 0 || depth <= 1 {
+            return Ok(GraphQueryResult { nodes, edges });
+        }
+    }
+
+    // Start from the specified node and follow related_to edges.
+    for d in start_depth..depth {
+        let relation_filter = req
+            .relation
+            .as_deref()
+            .map(|r| format!("[WHERE relation = '{}']", r.replace('\'', "\\'")))
+            .unwrap_or_default();
         let sql = format!(
             "SELECT meta::id(id) AS id, name, kind, \
-             ->related_to->entity.name AS next_name, \
-             ->related_to->entity.kind AS next_kind \
+             ->related_to{relation_filter}->entity.name AS next_name, \
+             ->related_to{relation_filter}->entity.kind AS next_kind \
              FROM {current} LIMIT 1",
+            relation_filter = relation_filter,
         );
         let mut r = db
             .db
@@ -179,23 +245,24 @@ pub async fn graph_query(db: &Db, req: &GraphQueryRequest) -> Result<GraphQueryR
 
             for (i, nname) in next_names.into_iter().take(limit).enumerate() {
                 let nkind = next_kinds.get(i).cloned().unwrap_or_default();
-                let rel = &req.relation.as_deref().unwrap_or("related").to_string();
+                let rel = req.relation.as_deref().unwrap_or("related").to_string();
+                let id = entity_rid(&nname);
 
                 nodes.push(GraphNode {
-                    id: nname.clone(),
+                    id: id.clone(),
                     name: nname.clone(),
                     kind: nkind,
                     depth: d + 1,
                 });
                 edges.push(GraphEdge {
                     from: current.clone(),
-                    to: nname.clone(),
-                    relation: rel.clone(),
+                    to: id.clone(),
+                    relation: rel,
                 });
 
                 // Only follow the first result for simplicity
                 if d + 1 < depth && i == 0 {
-                    current = entity_rid(&nname);
+                    current = id;
                 }
             }
         } else {
