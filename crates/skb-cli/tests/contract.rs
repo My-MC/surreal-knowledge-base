@@ -189,6 +189,22 @@ fn contract_stats() {
 }
 
 #[test]
+fn contract_config_set_updates_existing_config() {
+    setup_config();
+    let output = Command::new(skb_binary())
+        .args(["config", "set", "search.rrf_k", "42"])
+        .current_dir(test_dir())
+        .output()
+        .expect("failed to run skb config set");
+    assert!(output.status.success());
+
+    let config = std::fs::read_to_string(test_dir().join("skb.toml")).unwrap();
+    assert!(config.contains("rrf_k = 42"));
+    let shown = run_skb(&["config", "show"], None);
+    assert_eq!(shown["search"]["rrf_k"], 42);
+}
+
+#[test]
 fn contract_pipeline() {
     setup_config();
 
