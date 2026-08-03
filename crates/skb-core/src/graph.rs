@@ -1,6 +1,8 @@
 use crate::db::Db;
 use crate::error::{ErrorCode, SkbError};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use surrealdb::types::RecordId;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EntityInfo {
@@ -129,29 +131,66 @@ pub async fn index_chunk_entities(
     Ok(linked)
 }
 
+pub(crate) async fn index_chunk_entities_in_transaction(
+    tx: &surrealdb::method::Transaction<surrealdb::engine::local::Db>,
+    chunk_id: &str,
+    chunk_content: &str,
+) -> Result<usize, SkbError> {
+    let entities = extract_entities(chunk_content);
+    let mut linked = 0;
+    for entity in entities.iter() {
+        let name = entity.name.replace('\'', "\\'");
+        let kind = entity.kind.replace('\'', "\\'");
+        let desc = entity
+            .description
+            .as_deref()
+            .unwrap_or("")
+            .replace('\'', "\\'");
+        let rid = entity_rid(&entity.name);
+        tx.query(format!(
+            "INSERT INTO entity (id, name, kind, description) \
+             VALUES ({rid}, '{name}', '{kind}', '{desc}') \
+             ON DUPLICATE KEY UPDATE description = '{desc}'"
+        ))
+        .await
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("upsert entity: {e}")))?
+        .check()
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("upsert entity check: {e}")))?;
+
+        let to = entity_rid(&entity.name);
+        tx.query(format!("RELATE {chunk_id}->mentions->{to}"))
+            .await
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("link chunk: {e}")))?
+            .check()
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("link chunk check: {e}")))?;
+        linked += 1;
+    }
+    Ok(linked)
+}
+
 pub async fn graph_query(db: &Db, req: &GraphQueryRequest) -> Result<GraphQueryResult, SkbError> {
     let depth = req.depth.unwrap_or(1).min(5);
     let limit = req.limit.unwrap_or(50);
-    let from = req.from.replace('\'', "\\'");
+    let from = req.from.clone();
 
     let mut nodes = Vec::new();
     let mut edges = Vec::new();
 
     // Resolve the starting node: a full record id (`entity:...` / `document:...`)
     // is used as-is; otherwise it is treated as an entity name.
-    let mut current = if from.starts_with("entity:") || from.starts_with("document:") {
+    let mut current = if from.contains(':') {
         from.clone()
     } else {
         entity_rid(&from)
     };
+    let mut emitted = HashSet::new();
 
     let mut start_depth = 0;
     if current.starts_with("document:") {
         let mut doc_query = db
             .db
-            .query(&format!(
-                "SELECT meta::id(id) AS id, title AS name FROM {current}"
-            ))
+            .query("SELECT meta::id(id) AS id, title AS name FROM $current")
+            .bind(("current", start_record_id(&current)?))
             .await
             .map_err(|e| SkbError::new(ErrorCode::Db, format!("graph document: {e}")))?;
         let doc_rows: Vec<serde_json::Value> = doc_query
@@ -166,13 +205,15 @@ pub async fn graph_query(db: &Db, req: &GraphQueryRequest) -> Result<GraphQueryR
             kind: "document".into(),
             depth: 0,
         });
+        let document_id = current.clone();
 
         let mut chunk_query = db
             .db
-            .query(&format!(
+            .query(
                 "SELECT ->mentions->entity.name AS next_name, \
-                 ->mentions->entity.kind AS next_kind FROM chunk WHERE document = {current}"
-            ))
+                 ->mentions->entity.kind AS next_kind FROM chunk WHERE document = $current",
+            )
+            .bind(("current", start_record_id(&current)?))
             .await
             .map_err(|e| SkbError::new(ErrorCode::Db, format!("graph document chunks: {e}")))?;
         let chunk_rows: Vec<serde_json::Value> = chunk_query.take(0).map_err(|e| {
@@ -182,8 +223,14 @@ pub async fn graph_query(db: &Db, req: &GraphQueryRequest) -> Result<GraphQueryR
         for row in chunk_rows {
             let names = to_string_vec(&row["next_name"]);
             let kinds = to_string_vec(&row["next_kind"]);
-            for (i, name) in names.into_iter().take(limit).enumerate() {
+            for (i, name) in names.into_iter().enumerate() {
+                if emitted.len() >= limit {
+                    break;
+                }
                 let id = entity_rid(&name);
+                if !emitted.insert(id.clone()) {
+                    continue;
+                }
                 nodes.push(GraphNode {
                     id: id.clone(),
                     name,
@@ -191,7 +238,7 @@ pub async fn graph_query(db: &Db, req: &GraphQueryRequest) -> Result<GraphQueryR
                     depth: 1,
                 });
                 edges.push(GraphEdge {
-                    from: current.clone(),
+                    from: document_id.clone(),
                     to: id.clone(),
                     relation: relation.clone(),
                 });
@@ -208,21 +255,26 @@ pub async fn graph_query(db: &Db, req: &GraphQueryRequest) -> Result<GraphQueryR
 
     // Start from the specified node and follow related_to edges.
     for d in start_depth..depth {
-        let relation_filter = req
-            .relation
-            .as_deref()
-            .map(|r| format!("[WHERE relation = '{}']", r.replace('\'', "\\'")))
-            .unwrap_or_default();
+        let relation_filter = if req.relation.is_some() {
+            "[WHERE relation = $relation]"
+        } else {
+            ""
+        };
         let sql = format!(
             "SELECT meta::id(id) AS id, name, kind, \
              ->related_to{relation_filter}->entity.name AS next_name, \
              ->related_to{relation_filter}->entity.kind AS next_kind \
-             FROM {current} LIMIT 1",
+             FROM $current LIMIT 1",
             relation_filter = relation_filter,
         );
-        let mut r = db
+        let mut query = db
             .db
             .query(&sql)
+            .bind(("current", start_record_id(&current)?));
+        if let Some(relation) = req.relation.as_deref() {
+            query = query.bind(("relation", relation));
+        }
+        let mut r = query
             .await
             .map_err(|e| SkbError::new(ErrorCode::Db, format!("graph query: {e}")))?;
         let rows: Vec<serde_json::Value> = r
@@ -243,10 +295,16 @@ pub async fn graph_query(db: &Db, req: &GraphQueryRequest) -> Result<GraphQueryR
             let next_names: Vec<String> = to_string_vec(&row["next_name"]);
             let next_kinds: Vec<String> = to_string_vec(&row["next_kind"]);
 
-            for (i, nname) in next_names.into_iter().take(limit).enumerate() {
+            for (i, nname) in next_names.into_iter().enumerate() {
+                if emitted.len() >= limit {
+                    break;
+                }
                 let nkind = next_kinds.get(i).cloned().unwrap_or_default();
                 let rel = req.relation.as_deref().unwrap_or("related").to_string();
                 let id = entity_rid(&nname);
+                if !emitted.insert(id.clone()) {
+                    continue;
+                }
 
                 nodes.push(GraphNode {
                     id: id.clone(),
@@ -275,6 +333,20 @@ pub async fn graph_query(db: &Db, req: &GraphQueryRequest) -> Result<GraphQueryR
     }
 
     Ok(GraphQueryResult { nodes, edges })
+}
+
+fn start_record_id(value: &str) -> Result<RecordId, SkbError> {
+    if let Some((table, key)) = value.split_once(':') {
+        if !matches!(table, "entity" | "document") || key.is_empty() {
+            return Err(SkbError::new(
+                ErrorCode::Validation,
+                format!("invalid graph record id: {value}"),
+            ));
+        }
+        return Ok(RecordId::new(table, key));
+    }
+
+    Ok(RecordId::new("entity", value))
 }
 
 /// Expand search results by following entity mentions.

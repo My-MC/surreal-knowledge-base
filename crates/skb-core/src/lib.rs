@@ -372,6 +372,26 @@ mod tests {
         let doc = kb.get_document(&docs[0].id, false).await.unwrap();
         assert!(doc.content.contains("SurrealDB"));
 
+        let graph = kb
+            .graph_query(&GraphQueryRequest {
+                from: docs[0].id.clone(),
+                relation: None,
+                depth: Some(1),
+                limit: Some(1),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            graph.nodes.first().map(|node| node.kind.as_str()),
+            Some("document")
+        );
+
+        let reindexed = kb
+            .reindex(&reindex::ReindexRequest::default())
+            .await
+            .unwrap();
+        assert_eq!(reindexed.documents_processed, 1);
+
         let _ = std::fs::remove_dir_all(&path);
     }
 }
