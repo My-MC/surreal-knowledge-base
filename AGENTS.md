@@ -11,6 +11,15 @@ Local-first knowledge base: SurrealDB (embedded SurrealKV) + BAAI/bge-m3 embeddi
 - `schema/001_init.surql` — DB schema. `skills/` — agent skill. `spike/` — experiments, **excluded from workspace**, do not build.
 - `SPECIFICATION.md` is the authoritative spec; update it when behavior changes. `CONTRIBUTING.md` holds dev conventions (kept current — follow it).
 
+## GitHub Workflow
+
+- Create a dedicated branch for each feature, bug fix, cleanup, or documentation task. Do not combine unrelated tasks in one branch.
+- Commit incrementally as coherent work is completed. Prefer small, focused commits over one large end-of-task commit.
+- Open exactly one pull request per task branch. The PR description must identify the task and summarize verification.
+- After opening a PR, wait for the GitHub Copilot Review to be published before merging. Inspect both the review summary and every inline comment, including suppressed comments when available.
+- Address valid Copilot findings, or document the rationale for not addressing them, then re-run the relevant checks and request/wait for a follow-up review when code changed.
+- Do not merge a PR while its Copilot Review is pending unless the user explicitly authorizes an exception.
+
 ## Commands
 
 - Build (fast, mock embeddings): `cargo build --workspace`

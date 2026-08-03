@@ -1,5 +1,14 @@
 # Development Conventions
 
+## Branches, Commits, and Pull Requests
+
+- Use one dedicated branch per feature, bug fix, cleanup, or documentation task. Keep unrelated work on separate branches.
+- Make commits incrementally at coherent checkpoints. Commits should be focused and reviewable; do not wait until the entire task is finished to create the only commit.
+- Open one GitHub pull request for each task branch. Keep the PR scope aligned with the branch scope and include verification results in the description.
+- After opening a PR, wait for GitHub Copilot Review before merging. Review the overview, review state, inline comments, and suppressed comments when available.
+- Resolve valid Copilot findings or record why a finding is not applicable. If code changes are made in response, rerun checks and wait for the updated Copilot Review before merging.
+- Do not merge while Copilot Review is pending unless the user explicitly approves an exception.
+
 ## File System Access
 
 - Do not write test data or runtime storage to `/tmp`. 
