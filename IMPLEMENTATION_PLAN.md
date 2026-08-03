@@ -87,7 +87,7 @@
 - `rmcp` で stdio サーバー。10 ツール（スキーマは schemars で自動生成）
 - Resources（`skb://documents` 等）・Prompts（`skb-answer`）
 - ログ stderr のみ、ツールエラーは `isError: true`
-- `skb mcp serve` との同一エントリポイント化、`--http` 対応
+- CLI とは分離し、npm パッケージから `npx surreal-knowledge-base` で起動
 - **Exit Criteria**: MCP Inspector / opencode から initialize → tools/list → upload → search が通る。
 
 ---

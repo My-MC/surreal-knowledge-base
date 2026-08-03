@@ -105,12 +105,12 @@ skb doctor
 
 ### MCP Server
 
-Start the server (stdio transport):
+Start the server through the npm package (stdio transport):
 
 ```bash
-skb mcp serve
-# or directly:
-skb-mcp
+npx surreal-knowledge-base
+# or:
+bunx surreal-knowledge-base
 ```
 
 #### Client configuration (opencode / Claude Desktop)
@@ -131,20 +131,20 @@ skb-mcp
 
 | Command | Description |
 |---|---|
-| `skb upload --path <FILE>` | Upload a file |
+| `skb upload --path <FILE>` | Upload a file (`--recursive`, `--metadata JSON`, `--force`) |
 | `skb upload --url <URL>` | Upload from URL |
 | `skb upload --stdin` | Upload from stdin |
-| `skb search <QUERY>` | Search documents (`--mode hybrid\|vector\|keyword --top-k N`) |
-| `skb list` | List documents (`--limit N --offset N`) |
+| `skb search <QUERY>` | Search documents (`--mode hybrid\|vector\|keyword --top-k N --filter KEY=VALUE`) |
+| `skb list` | List documents (`--limit N --offset N --order ...`) |
 | `skb get <ID>` | Get document details (`--chunks`) |
 | `skb delete <ID>` | Delete a document (`--yes`) |
 | `skb stats` | Show statistics |
 | `skb graph query --from <ENTITY>` | Query knowledge graph |
-| `skb graph entity add <NAME>` | Add/update an entity |
+| `skb graph entity <NAME>` | Add/update an entity |
 | `skb graph link <FROM> <TO>` | Link two entities |
-| `skb reindex` | Reindex all documents (model/chunk config change) |
+| `skb reindex` | Reindex all documents (`--dry-run` supported) |
 | `skb config init\|show\|set` | Manage configuration |
-| `skb mcp serve` | Start MCP server |
+| `npx surreal-knowledge-base` | Start the MCP server |
 | `skb doctor` | Run diagnostics |
 
 All commands support `--format json` for structured output.

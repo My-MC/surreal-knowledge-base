@@ -45,8 +45,12 @@ skb upload --url https://example.com/doc.html --title "Web Doc"
 # From pipe/stdin
 cat notes.txt | skb upload --stdin --title "Meeting Notes"
 
-# Re-upload and overwrite existing
+  # Re-upload and overwrite existing
 skb upload --path doc.md --force
+
+# Recursive upload, metadata, and base64 stdin
+skb upload --path docs --recursive --metadata '{"team":"research"}'
+cat payload.b64 | skb upload --stdin --base64 --title "Encoded payload"
 ```
 
 ### Search
@@ -63,12 +67,16 @@ skb search "HNSW" --mode keyword
 
 # With graph expansion (find related documents)
 skb search "SurrealDB" --graph-expand 3
+
+# Filter by document field
+skb search "SurrealDB" --filter source_type=file
 ```
 
 ### List / Get / Delete
 
 ```bash
 skb list --limit 20
+skb list --order title_asc
 skb get document:abc123 --chunks
 skb delete document:abc123 --yes
 ```
@@ -97,6 +105,7 @@ skb graph link "SurrealDB" "HNSW" --relation uses
 ```bash
 # After changing chunking/embedding config in skb.toml
 skb reindex
+skb reindex --dry-run
 ```
 
 ## Interpreting Results
@@ -113,3 +122,11 @@ skb reindex
 - `E_MODEL_MISMATCH`: Config model differs from stored model. Run `skb reindex`.
 - `E_DOCUMENT_NOT_FOUND`: The requested document does not exist.
 - `E_VALIDATION`: Invalid parameters. Verify input format.
+
+## MCP Server
+
+The MCP server is distributed separately from the CLI and starts with:
+
+```bash
+npx surreal-knowledge-base
+```

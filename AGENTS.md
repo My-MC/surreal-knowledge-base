@@ -6,7 +6,7 @@ Local-first knowledge base: SurrealDB (embedded SurrealKV) + BAAI/bge-m3 embeddi
 
 - `crates/skb-core/` — all logic (db, embed, tokenize, ingest, search, crud, graph). Public API: `KnowledgeBase` in `src/lib.rs`.
 - `crates/skb-cli/` — `skb` binary (thin wrapper over skb-core).
-- `crates/skb-mcp/` — `skb-mcp` binary (rmcp 0.9, stdio transport).
+- `crates/skb-mcp/` — `skb-mcp` binary (rmcp 3.0, stdio transport), launched via the npm package.
 - `npm/` — meta package + `packages/<platform>/` (only `package.json` templates committed; CI injects binaries). `bin/skb-mcp.js` resolves the platform package at runtime.
 - `schema/001_init.surql` — DB schema. `skills/` — agent skill. `spike/` — experiments, **excluded from workspace**, do not build.
 - `SPECIFICATION.md` is the authoritative spec; update it when behavior changes. `CONTRIBUTING.md` holds dev conventions (kept current — follow it).
@@ -50,6 +50,7 @@ Use each tool for its own job, in this order when finishing a change:
 
 - Never select `id` / `document` fields directly. Use `meta::id()` or `string::concat('table:', meta::id(id))` for string-representable IDs.
 - `value` / `val` are reserved words — field is named `meta_value`.
+- Full-text search uses `FULLTEXT ANALYZER skb_text BM25` with the `class` tokenizer and `lowercase` filter; `ngram` is intentionally omitted because it degraded BM25 results.
 
 ## CI / packaging
 
