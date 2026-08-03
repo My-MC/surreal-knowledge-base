@@ -99,14 +99,26 @@ pub async fn get_document(
     include_chunks: bool,
 ) -> Result<DocumentDetail, SkbError> {
     let query = format!("SELECT title, source, source_type, sha256, content, created_at FROM {id}");
-    let mut r = db
-        .db
-        .query(&query)
-        .await
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("get: {e}")))?;
-    let rows: Vec<serde_json::Value> = r
-        .take(0)
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("get take: {e}")))?;
+    let mut r = match db.db.query(&query).await {
+        Ok(r) => r,
+        Err(e) if e.to_string().contains("does not exist") => {
+            return Err(SkbError::new(
+                ErrorCode::DocumentNotFound,
+                format!("not found: {id}"),
+            ));
+        }
+        Err(e) => return Err(SkbError::new(ErrorCode::Db, format!("get: {e}"))),
+    };
+    let rows: Vec<serde_json::Value> = match r.take(0) {
+        Ok(v) => v,
+        Err(e) if e.to_string().contains("does not exist") => {
+            return Err(SkbError::new(
+                ErrorCode::DocumentNotFound,
+                format!("not found: {id}"),
+            ));
+        }
+        Err(e) => return Err(SkbError::new(ErrorCode::Db, format!("get take: {e}"))),
+    };
 
     if rows.is_empty() {
         return Err(SkbError::new(

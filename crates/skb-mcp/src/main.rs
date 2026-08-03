@@ -257,7 +257,20 @@ impl ServerHandler for SkbServer {
 }
 
 fn err_data(e: skb_core::error::SkbError) -> rmcp::ErrorData {
-    rmcp::ErrorData::internal_error(e.to_string(), None)
+    match e.code {
+        skb_core::error::ErrorCode::Validation => {
+            rmcp::ErrorData::invalid_params(e.to_string(), None)
+        }
+        skb_core::error::ErrorCode::DocumentNotFound => {
+            rmcp::ErrorData::resource_not_found(e.to_string(), None)
+        }
+        _ => rmcp::ErrorData::internal_error(e.to_string(), None),
+    }
+}
+
+fn valid_err(msg: &str) -> String {
+    skb_core::error::SkbError::new(skb_core::error::ErrorCode::Validation, msg.to_string())
+        .to_string()
 }
 
 fn tool(
@@ -291,6 +304,19 @@ impl SkbServer {
 
         match req.name.as_ref() {
             "skb_upload" => {
+                let has_source = [
+                    args.get("path"),
+                    args.get("url"),
+                    args.get("content"),
+                    args.get("content_base64"),
+                ]
+                .iter()
+                .any(|v| v.is_some());
+                if !has_source {
+                    return Err(valid_err(
+                        "skb_upload requires one of: path, url, content, content_base64",
+                    ));
+                }
                 let params: UploadRequest =
                     serde_json::from_value(Value::Object(args)).map_err(|e| format!("{e}"))?;
                 kb.upload(params)
@@ -299,6 +325,9 @@ impl SkbServer {
                     .map_err(|e| format!("{e}"))
             }
             "skb_search" => {
+                if !args.contains_key("query") {
+                    return Err(valid_err("skb_search requires 'query'"));
+                }
                 let params: SearchRequest =
                     serde_json::from_value(Value::Object(args)).map_err(|e| format!("{e}"))?;
                 kb.search(params)
@@ -320,6 +349,9 @@ impl SkbServer {
             }
             "skb_get_document" => {
                 let id = args.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                if id.is_empty() {
+                    return Err(valid_err("skb_get_document requires 'id'"));
+                }
                 let include_chunks = args
                     .get("include_chunks")
                     .and_then(|v| v.as_bool())
@@ -331,6 +363,9 @@ impl SkbServer {
             }
             "skb_delete_document" => {
                 let id = args.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                if id.is_empty() {
+                    return Err(valid_err("skb_delete_document requires 'id'"));
+                }
                 kb.delete_document(id)
                     .await
                     .map(|r| serde_json::to_value(r).unwrap_or_default())
