@@ -112,7 +112,13 @@ impl KnowledgeBase {
     // ── Search ──
     pub async fn search(&self, req: SearchRequest) -> Result<SearchResponse, SkbError> {
         let graph_expand = req.graph_expand.unwrap_or(0);
-        let mut resp = search::search(&self.db, self.embedder.as_ref(), req).await?;
+        let mut resp = search::search(
+            &self.db,
+            self.embedder.as_ref(),
+            self.config.search.rrf_k,
+            req,
+        )
+        .await?;
 
         if graph_expand > 0 && !resp.hits.is_empty() {
             let expanded = graph::expand_search_hits(&self.db, &resp.hits, graph_expand).await?;

@@ -31,6 +31,7 @@ pub struct SearchResponse {
 pub async fn search(
     db: &Db,
     embedder: &dyn Embed,
+    rrf_k: usize,
     req: SearchRequest,
 ) -> Result<SearchResponse, SkbError> {
     let mode = req.mode.as_deref().unwrap_or("hybrid");
@@ -40,7 +41,7 @@ pub async fn search(
     let hits = match mode {
         "vector" => vector_search(db, embedder, &req.query, top_k).await?,
         "keyword" => keyword_search(db, &req.query, top_k).await?,
-        "hybrid" => hybrid_search(db, embedder, &req.query, top_k).await?,
+        "hybrid" => hybrid_search(db, embedder, &req.query, top_k, rrf_k).await?,
         _ => {
             return Err(SkbError::new(
                 ErrorCode::Validation,
@@ -118,6 +119,7 @@ async fn hybrid_search(
     embedder: &dyn Embed,
     query: &str,
     top_k: usize,
+    rrf_k: usize,
 ) -> Result<Vec<SearchHit>, SkbError> {
     let fetch_k = top_k * 3;
 
@@ -161,7 +163,7 @@ async fn hybrid_search(
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("hybrid kw take: {e}")))?;
 
     // RRF merge
-    let rrf_k: f64 = 60.0;
+    let rrf_k = rrf_k.max(1) as f64;
     let mut scores: HashMap<String, (f64, String, usize, String)> = HashMap::new();
 
     for (rank, row) in vrows.iter().enumerate() {

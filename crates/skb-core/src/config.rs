@@ -16,12 +16,16 @@ pub struct Config {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StorageConfig {
+    /// Embedded storage is currently the only supported runtime mode.
     pub mode: StorageMode,
     pub path: PathBuf,
     pub namespace: String,
     pub database: String,
+    /// Reserved for a future remote storage backend; currently ignored.
     pub url: Option<String>,
+    /// Reserved for a future remote storage backend; currently ignored.
     pub username: Option<String>,
+    /// Reserved for a future remote storage backend; currently ignored.
     pub password: Option<String>,
 }
 
@@ -54,6 +58,7 @@ pub struct EmbeddingConfig {
     pub tokenizer: String,
     pub dimension: usize,
     pub max_input_tokens: usize,
+    /// Reserved for provider-specific execution selection; currently ignored.
     pub device: String,
     pub batch_size: usize,
 }
