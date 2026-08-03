@@ -43,6 +43,7 @@ struct DocumentData {
     mime: Option<String>,
 }
 
+/// Upload, embed, persist, and graph-index one document.
 pub async fn upload(
     db: &Db,
     embedder: &dyn Embed,
@@ -93,7 +94,7 @@ pub async fn upload(
     let (doc_id, chunk_ids) = store_document(db, &doc, &chunks, &embeddings).await?;
     let mut entities = Vec::new();
     for (chunk_id, chunk) in chunk_ids.iter().zip(chunks.iter()) {
-        let _ = graph::index_chunk_entities(db, chunk_id, &chunk.content).await;
+        graph::index_chunk_entities(db, chunk_id, &chunk.content).await?;
         entities.extend(
             graph::extract_entities(&chunk.content)
                 .into_iter()
