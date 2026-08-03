@@ -108,9 +108,9 @@ skb doctor
 stdio トランスポートで起動：
 
 ```bash
-skb mcp serve
-# または直接:
-skb-mcp
+npx surreal-knowledge-base
+# または:
+bunx surreal-knowledge-base
 ```
 
 #### クライアント設定（opencode / Claude Desktop）
@@ -131,20 +131,20 @@ skb-mcp
 
 | コマンド | 説明 |
 |---|---|
-| `skb upload --path <FILE>` | ファイルをアップロード |
+| `skb upload --path <FILE>` | ファイルをアップロード（`--recursive`、`--metadata JSON`、`--force`） |
 | `skb upload --url <URL>` | URL からアップロード |
 | `skb upload --stdin` | 標準入力からアップロード |
-| `skb search <QUERY>` | 検索（`--mode hybrid\|vector\|keyword --top-k N`） |
-| `skb list` | 文書一覧（`--limit N --offset N`） |
+| `skb search <QUERY>` | 検索（`--mode hybrid\|vector\|keyword --top-k N --filter KEY=VALUE`） |
+| `skb list` | 文書一覧（`--limit N --offset N --order ...`） |
 | `skb get <ID>` | 文書詳細（`--chunks`） |
 | `skb delete <ID>` | 文書削除（`--yes`） |
 | `skb stats` | 統計情報 |
 | `skb graph query --from <ENTITY>` | 知識グラフ検索 |
-| `skb graph entity add <NAME>` | エンティティ追加・更新 |
+| `skb graph entity <NAME>` | エンティティ追加・更新 |
 | `skb graph link <FROM> <TO>` | エンティティ間リンク |
-| `skb reindex` | 全文書を再インデックス（モデル/チャンク設定変更時） |
+| `skb reindex` | 全文書を再インデックス（`--dry-run` 対応） |
 | `skb config init\|show\|set` | 設定管理 |
-| `skb mcp serve` | MCP サーバー起動 |
+| `npx surreal-knowledge-base` | MCP サーバー起動 |
 | `skb doctor` | 診断実行 |
 
 全コマンドで `--format json` を指定すると構造化出力になります。
