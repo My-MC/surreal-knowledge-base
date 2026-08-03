@@ -132,7 +132,7 @@ impl ServerHandler for SkbServer {
                     ("weight", "number"),
                 ],
             ),
-            tool(
+            tool_optional(
                 "skb_reindex",
                 "Reindex all documents",
                 &[("dry_run", "boolean")],
@@ -278,11 +278,28 @@ fn tool(
     desc: &'static str,
     params: &[(&'static str, &'static str)],
 ) -> ToolDef {
+    tool_with_required(name, desc, params, params.len() <= 1)
+}
+
+fn tool_optional(
+    name: &'static str,
+    desc: &'static str,
+    params: &[(&'static str, &'static str)],
+) -> ToolDef {
+    tool_with_required(name, desc, params, false)
+}
+
+fn tool_with_required(
+    name: &'static str,
+    desc: &'static str,
+    params: &[(&'static str, &'static str)],
+    required_single: bool,
+) -> ToolDef {
     let mut props = serde_json::Map::new();
     for (pname, ptype) in params {
         props.insert(pname.to_string(), json!({"type": *ptype}));
     }
-    let required: Vec<Value> = if params.len() <= 1 {
+    let required: Vec<Value> = if required_single {
         params.iter().map(|(n, _)| json!(n)).collect()
     } else {
         vec![]

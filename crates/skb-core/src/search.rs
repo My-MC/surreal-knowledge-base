@@ -230,8 +230,18 @@ async fn apply_filter(
     hits: Vec<SearchHit>,
     filter: &HashMap<String, String>,
 ) -> Result<Vec<SearchHit>, SkbError> {
-    if hits.is_empty() {
+    if hits.is_empty() || filter.is_empty() {
         return Ok(hits);
+    }
+
+    const FILTER_FIELDS: &[&str] = &["title", "source", "source_type", "mime", "sha256"];
+    for field in filter.keys() {
+        if !FILTER_FIELDS.contains(&field.as_str()) {
+            return Err(SkbError::new(
+                ErrorCode::Validation,
+                format!("unsupported search filter field: {field}"),
+            ));
+        }
     }
 
     let mut ids: Vec<String> = hits.iter().map(|h| h.document_id.clone()).collect();
@@ -242,7 +252,7 @@ async fn apply_filter(
         .map(|id| format!("'{id}'"))
         .collect::<Vec<_>>()
         .join(",");
-    let fields: Vec<String> = filter.keys().map(|k| k.to_string()).collect();
+    let fields: Vec<&str> = filter.keys().map(String::as_str).collect();
     let select_fields = fields.join(",");
 
     let sql = format!(
@@ -260,12 +270,13 @@ async fn apply_filter(
         .take(0)
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("filter take: {e}")))?;
 
+    let rows_by_id: HashMap<&str, &serde_json::Value> = rows
+        .iter()
+        .filter_map(|row| row["id"].as_str().map(|id| (id, row)))
+        .collect();
     let mut keep: Vec<SearchHit> = Vec::new();
     for hit in &hits {
-        let Some(row) = rows
-            .iter()
-            .find(|r| r["id"].as_str() == Some(&hit.document_id))
-        else {
+        let Some(row) = rows_by_id.get(hit.document_id.as_str()) else {
             continue;
         };
         let mut ok = true;
