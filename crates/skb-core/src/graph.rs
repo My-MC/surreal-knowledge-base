@@ -53,30 +53,40 @@ pub struct GraphEdge {
 /// unambiguous (entity identity is the name). Characters that would break the
 /// `⟨…⟩` quoted id literal are stripped.
 pub(crate) fn entity_rid(name: &str) -> String {
-    let cleaned: String = name
-        .chars()
+    format!("entity:⟨{}⟩", clean_entity_name(name))
+}
+
+fn clean_entity_name(name: &str) -> String {
+    name.chars()
         .filter(|c| !matches!(c, '⟨' | '⟩' | '\\' | '\''))
-        .collect();
-    format!("entity:⟨{cleaned}⟩")
+        .collect()
+}
+
+fn entity_record_id(name: &str) -> Result<RecordId, SkbError> {
+    let cleaned = clean_entity_name(name);
+    if cleaned.is_empty() {
+        return Err(SkbError::new(
+            ErrorCode::Validation,
+            "entity name must not be empty",
+        ));
+    }
+    Ok(RecordId::new("entity", cleaned))
 }
 
 /// Insert-or-update an entity, addressed by its deterministic id (`entity:⟨name⟩`).
 pub async fn upsert_entity(db: &Db, entity: &EntityInfo) -> Result<(), SkbError> {
-    let name = entity.name.replace('\'', "\\'");
-    let kind = entity.kind.replace('\'', "\\'");
-    let desc = entity
-        .description
-        .as_deref()
-        .unwrap_or("")
-        .replace('\'', "\\'");
-    let rid = entity_rid(&entity.name);
-    let sql = format!(
-        "INSERT INTO entity (id, name, kind, description) \
-         VALUES ({rid}, '{name}', '{kind}', '{desc}') \
-         ON DUPLICATE KEY UPDATE description = '{desc}'",
-    );
+    let sql = "INSERT INTO entity (id, name, kind, description) \
+               VALUES ($id, $name, $kind, $description) \
+               ON DUPLICATE KEY UPDATE description = $description";
     db.db
-        .query(&sql)
+        .query(sql)
+        .bind(("id", entity_record_id(&entity.name)?))
+        .bind(("name", entity.name.clone()))
+        .bind(("kind", entity.kind.clone()))
+        .bind((
+            "description",
+            entity.description.clone().unwrap_or_default(),
+        ))
         .await
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("upsert entity: {e}")))?;
     Ok(())
@@ -85,16 +95,13 @@ pub async fn upsert_entity(db: &Db, entity: &EntityInfo) -> Result<(), SkbError>
 /// Create a typed `related_to` edge between two entities.
 pub async fn link(db: &Db, link: &LinkInfo) -> Result<(), SkbError> {
     let weight = link.weight.unwrap_or(1.0);
-    let from = entity_rid(&link.from);
-    let to = entity_rid(&link.to);
-    let sql = format!(
-        "RELATE {from}->related_to->{to} \
-         SET relation = '{}', weight = {}",
-        link.relation.replace('\'', "\\'"),
-        weight,
-    );
+    let sql = "RELATE $from->related_to->$to SET relation = $relation, weight = $weight";
     db.db
-        .query(&sql)
+        .query(sql)
+        .bind(("from", entity_record_id(&link.from)?))
+        .bind(("to", entity_record_id(&link.to)?))
+        .bind(("relation", link.relation.clone()))
+        .bind(("weight", weight))
         .await
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("link: {e}")))?;
     Ok(())
@@ -106,10 +113,16 @@ pub async fn link_chunk_to_entity(
     chunk_id: &str,
     entity_name: &str,
 ) -> Result<(), SkbError> {
-    let to = entity_rid(entity_name);
-    let sql = format!("RELATE {chunk_id}->mentions->{to}");
+    let sql = "RELATE $chunk->mentions->$entity";
     db.db
-        .query(&sql)
+        .query(sql)
+        .bind((
+            "chunk",
+            RecordId::parse_simple(chunk_id).map_err(|e| {
+                SkbError::new(ErrorCode::Validation, format!("invalid chunk id: {e}"))
+            })?,
+        ))
+        .bind(("entity", entity_record_id(entity_name)?))
         .await
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("link chunk: {e}")))?;
     Ok(())
@@ -142,26 +155,31 @@ pub(crate) async fn index_chunk_entities_in_transaction(
     let entities = extract_entities(chunk_content);
     let mut linked = 0;
     for entity in entities.iter() {
-        let name = entity.name.replace('\'', "\\'");
-        let kind = entity.kind.replace('\'', "\\'");
-        let desc = entity
-            .description
-            .as_deref()
-            .unwrap_or("")
-            .replace('\'', "\\'");
-        let rid = entity_rid(&entity.name);
-        tx.query(format!(
+        tx.query(
             "INSERT INTO entity (id, name, kind, description) \
-             VALUES ({rid}, '{name}', '{kind}', '{desc}') \
-             ON DUPLICATE KEY UPDATE description = '{desc}'"
+             VALUES ($id, $name, $kind, $description) \
+             ON DUPLICATE KEY UPDATE description = $description",
+        )
+        .bind(("id", entity_record_id(&entity.name)?))
+        .bind(("name", entity.name.clone()))
+        .bind(("kind", entity.kind.clone()))
+        .bind((
+            "description",
+            entity.description.clone().unwrap_or_default(),
         ))
         .await
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("upsert entity: {e}")))?
         .check()
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("upsert entity check: {e}")))?;
 
-        let to = entity_rid(&entity.name);
-        tx.query(format!("RELATE {chunk_id}->mentions->{to}"))
+        tx.query("RELATE $chunk->mentions->$entity")
+            .bind((
+                "chunk",
+                RecordId::parse_simple(chunk_id).map_err(|e| {
+                    SkbError::new(ErrorCode::Validation, format!("invalid chunk id: {e}"))
+                })?,
+            ))
+            .bind(("entity", entity_record_id(&entity.name)?))
             .await
             .map_err(|e| SkbError::new(ErrorCode::Db, format!("link chunk: {e}")))?
             .check()
@@ -268,13 +286,18 @@ pub async fn graph_query(db: &Db, req: &GraphQueryRequest) -> Result<GraphQueryR
             "SELECT meta::id(id) AS id, name, kind, \
              ->related_to{relation_filter}->entity.name AS next_name, \
              ->related_to{relation_filter}->entity.kind AS next_kind \
-             FROM $current LIMIT 1",
+             FROM entity WHERE id = $current OR name = $current_name LIMIT 1",
             relation_filter = relation_filter,
         );
+        let current_name = current
+            .strip_prefix("entity:")
+            .map(|name| name.trim_start_matches('⟨').trim_end_matches('⟩'))
+            .unwrap_or(&current);
         let mut query = db
             .db
             .query(&sql)
-            .bind(("current", start_record_id(&current)?));
+            .bind(("current", start_record_id(&current)?))
+            .bind(("current_name", current_name.to_string()));
         if let Some(relation) = req.relation.as_deref() {
             query = query.bind(("relation", relation));
         }
@@ -351,7 +374,11 @@ fn start_record_id(value: &str) -> Result<RecordId, SkbError> {
         return Ok(RecordId::new(table, key));
     }
 
-    Ok(RecordId::new("entity", value))
+    let key = value
+        .strip_prefix('⟨')
+        .and_then(|key| key.strip_suffix('⟩'))
+        .unwrap_or(value);
+    entity_record_id(key)
 }
 
 /// Expand search results by following entity mentions.

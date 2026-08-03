@@ -117,31 +117,29 @@ async fn rebuild_document(
     chunks: &[crate::tokenize::Chunk],
     embeddings: &[Vec<f32>],
 ) -> Result<usize, SkbError> {
-    let del_sql = format!(
-        "LET $chunks = (SELECT value id FROM chunk WHERE meta::id(document) = '{did}'); \
-         DELETE FROM mentions WHERE in IN $chunks; \
-         DELETE FROM chunk WHERE meta::id(document) = '{did}';"
-    );
-    tx.query(&del_sql)
-        .await
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex del: {e}")))?
-        .check()
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex del check: {e}")))?;
+    let document = surrealdb::types::RecordId::new("document", did);
+    tx.query(
+        "DELETE FROM mentions WHERE in.document = $document; \
+         DELETE FROM chunk WHERE document = $document;",
+    )
+    .bind(("document", document.clone()))
+    .await
+    .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex del: {e}")))?
+    .check()
+    .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex del check: {e}")))?;
 
     let mut chunk_ids = Vec::with_capacity(chunks.len());
     for (i, (chunk, emb)) in chunks.iter().zip(embeddings.iter()).enumerate() {
-        let emb_str = serde_json::to_string(emb)
-            .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex embedding: {e}")))?;
-        let c = chunk.content.replace('\'', "\\'").replace('\n', "\\n");
-        let chunk_sql = format!(
-            "CREATE chunk SET document = document:⟨{did}⟩, idx = {i}, content = '{c}', \
-             token_count = {tc}, embedding = {emb} \
-             RETURN string::concat('chunk:', meta::id(id)) AS cid",
-            tc = chunk.token_count,
-            emb = emb_str,
-        );
+        let chunk_sql = "CREATE chunk SET document = $document, idx = $idx, \
+                         content = $content, token_count = $token_count, embedding = $embedding \
+                         RETURN string::concat('chunk:', meta::id(id)) AS cid";
         let mut response = tx
-            .query(&chunk_sql)
+            .query(chunk_sql)
+            .bind(("document", document.clone()))
+            .bind(("idx", i as i64))
+            .bind(("content", chunk.content.clone()))
+            .bind(("token_count", chunk.token_count as i64))
+            .bind(("embedding", emb.clone()))
             .await
             .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex chunk: {e}")))?
             .check()

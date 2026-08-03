@@ -386,6 +386,37 @@ mod tests {
             Some("document")
         );
 
+        for name in ["A", "B", "C"] {
+            kb.upsert_entity(&EntityInfo {
+                name: name.into(),
+                kind: "test".into(),
+                description: None,
+            })
+            .await
+            .unwrap();
+        }
+        for (from, to) in [("A", "B"), ("B", "C")] {
+            kb.link_entities(&LinkInfo {
+                from: from.into(),
+                to: to.into(),
+                relation: "related".into(),
+                weight: None,
+            })
+            .await
+            .unwrap();
+        }
+        let multi_hop = kb
+            .graph_query(&GraphQueryRequest {
+                from: "A".into(),
+                relation: None,
+                depth: Some(2),
+                limit: Some(10),
+            })
+            .await
+            .unwrap();
+        assert!(multi_hop.nodes.iter().any(|node| node.name == "B"));
+        assert!(multi_hop.nodes.iter().any(|node| node.name == "C"));
+
         let reindexed = kb
             .reindex(&reindex::ReindexRequest::default())
             .await
