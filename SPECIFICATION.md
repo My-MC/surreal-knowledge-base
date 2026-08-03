@@ -99,11 +99,11 @@ SurrealDB を **Vector DB / Graph DB / Document DB** の 3 用途に用いたロ
 | レイヤ | 採用技術 | 備考 |
 |---|---|---|
 | 言語 | Rust（stable, 2021 edition） | workspace 構成 |
-| DB | SurrealDB 2.x（Rust クレート `surrealdb`） | 組込み: SurrealKV / リモート: WebSocket |
+| DB | SurrealDB 3.x（Rust クレート `surrealdb`） | 組込み: SurrealKV（リモート未実装） |
 | トークナイザ | `tokenizers` クレート（HuggingFace 公式、Rust 実装） | Embedding モデルの `tokenizer.json` をロードしてチャンク化に使用（モデルに追随、§5.4）。gigatoken は nightly-only のビルド制約により非採用（2026-07-29 スパイク判定） |
 | Embedding | BAAI/bge-m3（ONNX）+ `ort` クレート | **デフォルト。設定ファイルで変更可能（§5.4）**。dense 1024 次元・CLS プーリング・L2 正規化 |
 | モデル取得 | `hf-hub` クレート | 初回実行時に Hugging Face からキャッシュへ DL |
-| MCP | `rmcp`（Rust 公式 SDK） | stdio 標準、Streamable HTTP 任意 |
+| MCP | `rmcp` 3.0（Rust 公式 SDK） | stdio 標準、npm の `npx` 経由 |
 | CLI | `clap` 4 | JSON 出力対応 |
 | 非同期 | `tokio` | |
 | シリアライズ | `serde`, `schemars` | 入出力型の JSON Schema 生成 |
@@ -114,7 +114,7 @@ SurrealDB を **Vector DB / Graph DB / Document DB** の 3 用途に用いたロ
 
 - **トークナイザ**: gigatoken は crates.io 未公開・nightly Rust 必須（`portable_simd`, `profile-rustflags`）・pyo3 依存の重さによりビルドできず非採用（2026-07-29 検証）。`tokenizers` クレートを採用。`Tokenizer` トレイトでの抽象化により将来的な差し替えは可能。
 - **ONNX Runtime**: `ort` 2.0-rc の `download-binaries` 戦略により ONNX Runtime は**静的リンク**される（pyke.io の静的ライブラリ）。バイナリ単体で自己完結し、実行時の `libonnxruntime.so` は不要。TLS も全経路で rustls（ring / aws-lc-rs）を使用し、OpenSSL への動的依存はない。ランタイムの外部依存は libc (glibc ≥ 2.35), libz, libzstd のみ（ORT prebuilt 由来）。
-- **SurrealDB Response::take()**: surrealdb 2.x の `Response::take()` は内部 enum 型と serde_json の非互換により実用上制限がある。本番実装では `db.create()` / `db.select()` の型付き API を使用する。
+- **SurrealDB Response::take()**: surrealdb 3.x のレスポンス取得では `meta::id()` などの明示的な投影が必要。`id` / `document` の直接選択や `value` フィールドは避ける。
 
 ---
 
@@ -147,10 +147,10 @@ DEFINE FIELD mime        ON document TYPE option<string>;
 DEFINE FIELD sha256      ON document TYPE string;
 DEFINE FIELD content     ON document TYPE string;          -- 抽出済み全文（再チャンク化・再埋め込みに使用、§5.4）
 DEFINE FIELD tags        ON document TYPE array<string> DEFAULT [];
-DEFINE FIELD metadata    ON document TYPE object DEFAULT {};
+DEFINE FIELD metadata    ON document TYPE object FLEXIBLE DEFAULT {};
 DEFINE FIELD created_at  ON document TYPE datetime DEFAULT time::now();
 DEFINE FIELD updated_at  ON document TYPE datetime VALUE time::now();
-DEFINE INDEX document_sha256_unique ON document FIELDS sha256 UNIQUE;
+DEFINE INDEX document_sha256 ON document FIELDS sha256 UNIQUE;
 
 DEFINE TABLE chunk SCHEMAFULL;
 DEFINE FIELD document    ON chunk TYPE record<document>;
@@ -168,10 +168,10 @@ DEFINE INDEX chunk_embedding_hnsw ON chunk
     FIELDS embedding HNSW DIMENSION {DIM} DIST COSINE;
 
 -- ── 全文検索層 ──────────────────────────────────
--- 日本語・多言語対応のため class トークナイザ + ngram フィルタ
-DEFINE ANALYZER skb_text TOKENIZERS class FILTERS lowercase, ngram(2,3);
+-- class トークナイザ + lowercase。ngram は BM25 の精度を低下させるため不使用
+DEFINE ANALYZER skb_text TOKENIZERS class FILTERS lowercase;
 DEFINE INDEX chunk_content_fts ON chunk
-    FIELDS content SEARCH ANALYZER skb_text BM25;
+    FIELDS content FULLTEXT ANALYZER skb_text BM25;
 
 -- ── Graph DB 層 ─────────────────────────────────
 DEFINE TABLE entity SCHEMAFULL;
@@ -191,7 +191,7 @@ DEFINE FIELD weight   ON related_to TYPE float DEFAULT 1.0;
 -- ── メタ情報（稼働中モデルの記録・設定不整合の検出用、§5.4） ──
 DEFINE TABLE meta SCHEMAFULL;
 DEFINE FIELD key   ON meta TYPE string;
-DEFINE FIELD value ON meta TYPE any;
+DEFINE FIELD meta_value ON meta TYPE string;
 DEFINE INDEX meta_key_unique ON meta FIELDS key UNIQUE;
 -- 記録キー: schema_version / embedding_model / embedding_dimension /
 --          embedding_max_input_tokens / tokenizer
@@ -372,10 +372,10 @@ allowed_dirs = []                    # MCP経由の path アップロード許�
 | 項目 | 内容 |
 |---|---|
 | 実装 | Rust バイナリ `skb-mcp`（`rmcp` 使用） |
-| トランスポート | stdio（既定）/ Streamable HTTP（`--http --port 8787`） |
+| トランスポート | stdio（既定） |
 | 起動方法 | `npx surreal-knowledge-base` / `bunx surreal-knowledge-base` / バイナリ直接実行 |
 | ログ | **stderr のみ**（stdio 運用時に stdout を汚染しない） |
-| 終了コード | 0 正常 / 1 起動失敗 / 2 設定不正 |
+| 終了コード | 0 正常 / 1 起動失敗 |
 
 ### 8.2 ツール一覧
 
@@ -451,7 +451,7 @@ skb graph link <from> <to> [--relation R] [--weight F]
 skb stats
 skb reindex [--dry-run]             # モデル/チャンク設定変更の全件反映（§5.4）
 skb config init | show | set <key> <value>
-skb mcp serve [--http --port N]     # skb-mcp と同一エントリポイント
+ npx surreal-knowledge-base              # MCP server（stdio; bunx も可）
 skb doctor                          # DB・モデル・トークナイザの疎通診断
 ```
 
@@ -461,7 +461,7 @@ skb doctor                          # DB・モデル・トークナイザの疎�
 |---|---|
 | 出力形式 | `--format json`（既定）/ `--format table`（人間向け） |
 | 成功時 | stdout に結果 JSON、終了コード 0 |
-| 失敗時 | stderr に `{"error":{"code","message","details"}}`、終了コード 1 以上 |
+| 失敗時 | `--format json` は stdout に `{"error":"E_*","message":"..."}`、終了コードはエラー種別に対応（2〜10）。非JSON形式は stderr |
 | stdin | `skb upload --stdin` で本文を標準入力から読む（パイプ連携用） |
 | バイナリ受領 | `skb upload` はファイルパス指定のみ（base64 標準入力は `--stdin --base64`） |
 
@@ -621,7 +621,7 @@ bunx surreal-knowledge-base --http --port 8787   # HTTP モード
 ### 14.1 エラーモデル（共通）
 
 ```jsonc
-{ "error": { "code": "E_DOCUMENT_NOT_FOUND", "message": "…", "details": { /* 任意 */ } } }
+{ "error": "E_DOCUMENT_NOT_FOUND", "message": "…" }
 ```
 
 | コード | 意味 | CLI 終了コード |
@@ -634,6 +634,7 @@ bunx surreal-knowledge-base --http --port 8787   # HTTP モード
 | `E_EMBEDDING` | モデルロード/推論失敗 | 7 |
 | `E_VALIDATION` | 入力検証失敗 | 8 |
 | `E_MODEL_MISMATCH` | 稼働中モデルと設定の不一致（reindex 必要、§5.4） | 9 |
+| `E_TOKENIZE` | トークナイズ/チャンク化失敗 | 10 |
 
 - MCP 側はツール結果として `{ isError: true, content: [上記 JSON の text] }` を返す（プロトコルエラーにはしない。起動不能時のみプロトコルエラー）。
 - ログ: `tracing` + `RUST_LOG`。MCP は **stderr のみ**、CLI は stderr。機微情報（本文・パス）のログ出力は `debug` レベル以下に限定。
@@ -720,6 +721,6 @@ surreal-knowledge-base/
 |---|---|---|---|
 | 1 | gigatoken の SentencePiece（XLM-R）系の実測性能・互換性 | チャンク化の速度 | M1 早期にベンチ。問題時は `tokenizers` クレートへ feature flag 切替（トレイト抽象化済み） |
 | 2 | onnxruntime 同梱による npm パッケージサイズ増 | 配布 | CPU 版最小構成で同梱。超過時は postinstall ダウンロード方式へ変更 |
-| 3 | SurrealDB FTS の日本語品質 | keyword/hybrid 精度 | ngram 設定のチューニングを M4 で評価。必要なら形態素解析アナライザ追加 |
+| 3 | SurrealDB FTS の日本語品質 | keyword/hybrid 精度 | `class` + lowercase を採用。ngram は BM25 の単語・複合語精度を低下させるため不使用 |
 | 4 | bge-m3 初回 DL のサイズ（約 2GB 級） | 初回 UX | `skb doctor` で進捗表示付き事前 DL を案内。量子化版 ONNX の採用も検討 |
 | 5 | PDF 抽出クレートの選定 | v1 スコープ | M1 で `pdf-extract` を検証し不十分なら代替選定 |

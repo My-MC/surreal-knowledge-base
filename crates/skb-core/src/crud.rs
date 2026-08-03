@@ -52,11 +52,24 @@ pub async fn list_documents(
     db: &Db,
     limit: usize,
     offset: usize,
+    order: Option<String>,
 ) -> Result<Vec<DocumentSummary>, SkbError> {
+    let order_by = match order.as_deref() {
+        Some("created_asc") => "created_at ASC",
+        Some("title_asc") => "title ASC",
+        Some("title_desc") => "title DESC",
+        Some("created_desc") | None => "created_at DESC",
+        _ => {
+            return Err(SkbError::new(
+                ErrorCode::Validation,
+                "order must be created_desc, created_asc, title_asc, or title_desc",
+            ))
+        }
+    };
     let query = format!(
         "SELECT string::concat('document:', meta::id(id)) AS id, \
          title, source, sha256, created_at \
-         FROM document ORDER BY created_at DESC LIMIT {limit} START {offset}"
+         FROM document ORDER BY {order_by} LIMIT {limit} START {offset}"
     );
     let mut r = db
         .db
@@ -86,14 +99,26 @@ pub async fn get_document(
     include_chunks: bool,
 ) -> Result<DocumentDetail, SkbError> {
     let query = format!("SELECT title, source, source_type, sha256, content, created_at FROM {id}");
-    let mut r = db
-        .db
-        .query(&query)
-        .await
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("get: {e}")))?;
-    let rows: Vec<serde_json::Value> = r
-        .take(0)
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("get take: {e}")))?;
+    let mut r = match db.db.query(&query).await {
+        Ok(r) => r,
+        Err(e) if e.to_string().contains("does not exist") => {
+            return Err(SkbError::new(
+                ErrorCode::DocumentNotFound,
+                format!("not found: {id}"),
+            ));
+        }
+        Err(e) => return Err(SkbError::new(ErrorCode::Db, format!("get: {e}"))),
+    };
+    let rows: Vec<serde_json::Value> = match r.take(0) {
+        Ok(v) => v,
+        Err(e) if e.to_string().contains("does not exist") => {
+            return Err(SkbError::new(
+                ErrorCode::DocumentNotFound,
+                format!("not found: {id}"),
+            ));
+        }
+        Err(e) => return Err(SkbError::new(ErrorCode::Db, format!("get take: {e}"))),
+    };
 
     if rows.is_empty() {
         return Err(SkbError::new(

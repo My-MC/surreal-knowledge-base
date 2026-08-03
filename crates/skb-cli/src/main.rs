@@ -5,6 +5,7 @@ use skb_core::graph::{EntityInfo, GraphQueryRequest, LinkInfo};
 use skb_core::ingest::UploadRequest;
 use skb_core::search::SearchRequest;
 use skb_core::KnowledgeBase;
+use std::collections::HashMap;
 use std::io::Read;
 
 #[derive(Parser)]
@@ -33,6 +34,12 @@ enum Commands {
         tags: Option<Vec<String>>,
         #[arg(long)]
         force: bool,
+        #[arg(long, help = "JSON object of metadata")]
+        metadata: Option<String>,
+        #[arg(long, help = "upload all files under a directory path")]
+        recursive: bool,
+        #[arg(long, help = "read base64-encoded content from stdin")]
+        base64: bool,
     },
     /// Search documents
     Search {
@@ -43,6 +50,8 @@ enum Commands {
         top_k: usize,
         #[arg(long)]
         graph_expand: Option<usize>,
+        #[arg(long, value_delimiter = ',', help = "filter KEY=VALUE (repeatable)")]
+        filter: Vec<String>,
     },
     /// List documents
     List {
@@ -50,6 +59,8 @@ enum Commands {
         limit: usize,
         #[arg(long, default_value = "0")]
         offset: usize,
+        #[arg(long, help = "created_desc|created_asc|title_asc|title_desc")]
+        order: Option<String>,
     },
     /// Get a document by ID
     Get {
@@ -71,7 +82,10 @@ enum Commands {
         cmd: GraphCmd,
     },
     /// Reindex all documents
-    Reindex,
+    Reindex {
+        #[arg(long, help = "report what a reindex would do without mutating")]
+        dry_run: bool,
+    },
     /// Configuration management
     Config {
         #[command(subcommand)]
@@ -79,11 +93,6 @@ enum Commands {
     },
     /// Run diagnostics
     Doctor,
-    /// Start MCP server
-    Mcp {
-        #[command(subcommand)]
-        cmd: McpCmd,
-    },
 }
 
 #[derive(Subcommand)]
@@ -123,17 +132,8 @@ enum ConfigCmd {
     Init,
     /// Show current config
     Show,
-}
-
-#[derive(Subcommand)]
-enum McpCmd {
-    /// Start MCP server (stdio)
-    Serve {
-        #[arg(long)]
-        http: bool,
-        #[arg(long, default_value = "8787")]
-        port: u16,
-    },
+    /// Set a config value by dotted key (e.g. storage.path, search.top_k)
+    Set { key: String, value: String },
 }
 
 fn output(val: &impl serde::Serialize, format: &str) -> Result<()> {
@@ -149,8 +149,34 @@ fn output(val: &impl serde::Serialize, format: &str) -> Result<()> {
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Recursively collect files under `dir` (std-only, no new deps).
+fn collect_files(dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(cur) = stack.pop() {
+        for entry in std::fs::read_dir(&cur)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.is_file() {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+fn main() -> std::process::ExitCode {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to start tokio runtime");
+    rt.block_on(async_main())
+}
+
+async fn async_main() -> std::process::ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "skb=info,warn".into()))
         .with_writer(std::io::stderr)
@@ -159,10 +185,50 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let fmt = cli.format.clone();
 
+    match run(&cli).await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            emit_error(&fmt, &e);
+            std::process::ExitCode::from(exit_code_of(&e))
+        }
+    }
+}
+
+/// Print a machine-parseable error (JSON when --format json), then pick the exit
+/// code: a `SkbError` declares one via `ErrorCode::exit_code`, anything else is 1.
+fn emit_error(fmt: &str, e: &anyhow::Error) {
+    if fmt == "json" {
+        let code =
+            skb_core::error::ErrorCode::from_std(e.as_ref()).map(|c| c.code_str().to_string());
+        let msg = format!("{e:#}");
+        println!(
+            "{}",
+            serde_json::json!({
+                "error": code.unwrap_or_else(|| "E_INTERNAL".to_string()),
+                "message": msg,
+            })
+        );
+    } else {
+        eprintln!("Error: {e:#}");
+    }
+}
+
+fn exit_code_of(e: &anyhow::Error) -> u8 {
+    skb_core::error::ErrorCode::from_std(e.as_ref())
+        .map(|c| c.exit_code() as u8)
+        .unwrap_or(1)
+}
+
+async fn run(cli: &Cli) -> Result<()> {
+    let fmt = cli.format.clone();
     match &cli.command {
-        Commands::List { limit, offset } => {
+        Commands::List {
+            limit,
+            offset,
+            order,
+        } => {
             let kb = KnowledgeBase::open(cfg()?).await?;
-            let docs = kb.list_documents(*limit, *offset).await?;
+            let docs = kb.list_documents(*limit, *offset, order.clone()).await?;
             output(&docs, &fmt)?;
         }
         Commands::Get { id, chunks } => {
@@ -195,49 +261,96 @@ async fn main() -> Result<()> {
             title,
             tags,
             force,
+            metadata,
+            recursive,
+            base64,
         } => {
             let kb = KnowledgeBase::open(cfg()?).await?;
-            let req = if *stdin {
-                let mut content = String::new();
-                std::io::stdin().read_to_string(&mut content)?;
-                UploadRequest {
-                    path: None,
-                    url: None,
-                    content_base64: None,
-                    content: Some(content),
-                    title: title.clone(),
-                    tags: tags.clone(),
-                    metadata: None,
-                    force: Some(*force),
+            let meta: HashMap<String, String> = metadata
+                .as_ref()
+                .map(|s| serde_json::from_str::<HashMap<String, String>>(s))
+                .transpose()?
+                .unwrap_or_default();
+
+            // Expand a directory path into individual files when --recursive.
+            let mut paths: Vec<String> = Vec::new();
+            if *recursive {
+                if let Some(p) = path {
+                    let p = std::path::Path::new(p);
+                    if p.is_dir() {
+                        for entry in collect_files(p)? {
+                            paths.push(entry.display().to_string());
+                        }
+                    } else {
+                        paths.push(p.display().to_string());
+                    }
+                } else {
+                    anyhow::bail!("--recursive requires --path to a directory");
                 }
-            } else {
-                UploadRequest {
-                    path: path.clone(),
-                    url: url.clone(),
-                    content: None,
-                    content_base64: None,
-                    title: title.clone(),
-                    tags: tags.clone(),
-                    metadata: None,
-                    force: Some(*force),
-                }
+            } else if let Some(p) = path {
+                paths.push(p.clone());
+            }
+
+            let build = |p: Option<String>, c: Option<String>, b64: Option<String>| UploadRequest {
+                path: p,
+                url: url.clone(),
+                content: c,
+                content_base64: b64,
+                title: title.clone(),
+                tags: tags.clone(),
+                metadata: Some(meta.clone()),
+                force: Some(*force),
             };
-            let result = kb.upload(req).await?;
-            output(&result, &fmt)?;
+
+            if *stdin {
+                let mut content = String::new();
+                if *base64 {
+                    let mut raw = Vec::new();
+                    std::io::stdin().read_to_end(&mut raw)?;
+                    content = String::from_utf8(raw)?;
+                    let result = kb.upload(build(None, None, Some(content))).await?;
+                    output(&result, &fmt)?;
+                } else {
+                    std::io::stdin().read_to_string(&mut content)?;
+                    let result = kb.upload(build(None, Some(content), None)).await?;
+                    output(&result, &fmt)?;
+                }
+            } else if !paths.is_empty() {
+                let mut results = Vec::new();
+                for p in paths {
+                    results.push(kb.upload(build(Some(p), None, None)).await?);
+                }
+                output(&results, &fmt)?;
+            } else {
+                let result = kb.upload(build(path.clone(), None, None)).await?;
+                output(&result, &fmt)?;
+            }
         }
         Commands::Search {
             query,
             mode,
             top_k,
             graph_expand,
+            filter,
         } => {
             let kb = KnowledgeBase::open(cfg()?).await?;
+            let filter: HashMap<String, String> = filter
+                .iter()
+                .filter_map(|kv| {
+                    kv.split_once('=')
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                })
+                .collect();
             let req = SearchRequest {
                 query: query.clone(),
                 mode: Some(mode.clone()),
                 top_k: Some(*top_k),
                 graph_expand: *graph_expand,
-                filter: None,
+                filter: if filter.is_empty() {
+                    None
+                } else {
+                    Some(filter)
+                },
             };
             let resp = kb.search(req).await?;
             output(&resp, &fmt)?;
@@ -290,9 +403,10 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Commands::Reindex => {
+        Commands::Reindex { dry_run } => {
             let kb = KnowledgeBase::open(cfg()?).await?;
-            let result = kb.reindex().await?;
+            let req = skb_core::reindex::ReindexRequest { dry_run: *dry_run };
+            let result = kb.reindex(&req).await?;
             output(&result, &fmt)?;
         }
         Commands::Config { cmd } => match cmd {
@@ -306,19 +420,69 @@ async fn main() -> Result<()> {
                 let c = cfg()?;
                 output(&c, &fmt)?;
             }
-        },
-        Commands::Mcp { cmd } => match cmd {
-            McpCmd::Serve { http, port } => {
-                if *http {
-                    println!("MCP HTTP server starting on port {port}... (not yet implemented)");
-                } else {
-                    println!("MCP stdio server starting... (not yet implemented)");
-                }
-            }
+            ConfigCmd::Set { key, value } => set_config(key, value)?,
         },
     }
 
     Ok(())
+}
+
+/// `skb config set storage.path './db'`: write a dotted key into the writable
+/// config file (./skb.toml or ~/.config/skb/config.toml), preserving other keys.
+fn set_config(key: &str, value: &str) -> Result<()> {
+    let path = Config::writable_config_path();
+    let content = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut root: toml::Value = if content.trim().is_empty() {
+        toml::Value::Table(toml::map::Map::new())
+    } else {
+        toml::from_str(&content).map_err(|e| anyhow::anyhow!("parse config: {e}"))?
+    };
+
+    let parts: Vec<&str> = key.trim().split('.').filter(|s| !s.is_empty()).collect();
+    if parts.is_empty() {
+        anyhow::bail!("invalid key: {key}");
+    }
+
+    // Walk (or create) nested tables for all but the last segment.
+    let mut cur = &mut root;
+    for seg in &parts[..parts.len() - 1] {
+        let entry = cur
+            .as_table_mut()
+            .ok_or_else(|| anyhow::anyhow!("path segment '{seg}' is not a table"))?;
+        cur = entry
+            .entry((*seg).to_string())
+            .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    }
+    let last = *parts.last().unwrap();
+    let entry = cur
+        .as_table_mut()
+        .ok_or_else(|| anyhow::anyhow!("path '{key}' parent is not a table"))?;
+    entry.insert(last.to_string(), parse_scalar(value));
+
+    if let Some(parent) = std::path::Path::new(&path).parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    std::fs::write(&path, toml::to_string(&root)?)?;
+    println!(
+        "Set {key} = {value} in {} (restart to retload; reindex if it changes embedding/chunking).",
+        path.display()
+    );
+    Ok(())
+}
+
+fn parse_scalar(raw: &str) -> toml::Value {
+    if let Ok(b) = raw.parse::<bool>() {
+        return toml::Value::Boolean(b);
+    }
+    if let Ok(i) = raw.parse::<i64>() {
+        return toml::Value::Integer(i);
+    }
+    if let Ok(f) = raw.parse::<f64>() {
+        return toml::Value::Float(f);
+    }
+    toml::Value::String(raw.to_string())
 }
 
 fn cfg() -> Result<Config> {

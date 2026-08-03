@@ -2,6 +2,7 @@ use crate::config::Config;
 use crate::db::Db;
 use crate::embed::Embed;
 use crate::error::{ErrorCode, SkbError};
+use crate::graph;
 use crate::tokenize::{Chunk, Tokenize};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -27,6 +28,7 @@ pub struct UploadResult {
     pub chunks: usize,
     pub tokens: usize,
     pub sha256: String,
+    pub entities: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -38,6 +40,7 @@ struct DocumentData {
     sha256: String,
     tags: Vec<String>,
     metadata: HashMap<String, String>,
+    mime: Option<String>,
 }
 
 pub async fn upload(
@@ -49,7 +52,8 @@ pub async fn upload(
 ) -> Result<UploadResult, SkbError> {
     let force = req.force.unwrap_or(false);
     let doc = extract_document_data(req, config)?;
-    if !force && doc_exists(db, &doc.sha256).await? {
+    let existed = doc_exists(db, &doc.sha256).await?;
+    if !force && existed {
         return Ok(UploadResult {
             document_id: None,
             title: doc.title,
@@ -57,10 +61,11 @@ pub async fn upload(
             chunks: 0,
             tokens: 0,
             sha256: doc.sha256,
+            entities: vec![],
         });
     }
 
-    if force {
+    if force && existed {
         delete_existing(db, &doc.sha256).await?;
     }
 
@@ -78,21 +83,38 @@ pub async fn upload(
             chunks: 0,
             tokens: 0,
             sha256: doc.sha256,
+            entities: vec![],
         });
     }
 
     let texts: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
     let embeddings = embed_batch(embedder, &texts, config.embedding.batch_size)?;
     let total_tokens: usize = chunks.iter().map(|c| c.token_count).sum();
-    let doc_id = store_document(db, &doc, &chunks, &embeddings).await?;
+    let (doc_id, chunk_ids) = store_document(db, &doc, &chunks, &embeddings).await?;
+    let mut entities = Vec::new();
+    for (chunk_id, chunk) in chunk_ids.iter().zip(chunks.iter()) {
+        let _ = graph::index_chunk_entities(db, chunk_id, &chunk.content).await;
+        entities.extend(
+            graph::extract_entities(&chunk.content)
+                .into_iter()
+                .map(|entity| entity.name),
+        );
+    }
+    entities.sort();
+    entities.dedup();
 
     Ok(UploadResult {
         document_id: Some(doc_id),
         title: doc.title,
-        status: "created".into(),
+        status: if existed {
+            "updated".into()
+        } else {
+            "created".into()
+        },
         chunks: chunks.len(),
         tokens: total_tokens,
         sha256: doc.sha256,
+        entities,
     })
 }
 
@@ -143,6 +165,7 @@ fn extract_document_data(req: UploadRequest, config: &Config) -> Result<Document
         .map(|b| format!("{b:02x}"))
         .collect::<String>();
 
+    let mime = mime_for(&file_title);
     Ok(DocumentData {
         title: req.title.unwrap_or(file_title),
         source,
@@ -151,7 +174,28 @@ fn extract_document_data(req: UploadRequest, config: &Config) -> Result<Document
         sha256,
         tags: req.tags.unwrap_or_default(),
         metadata: req.metadata.unwrap_or_default(),
+        mime,
     })
+}
+
+fn mime_for(name: &str) -> Option<String> {
+    let ext = std::path::Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())
+        .unwrap_or_default();
+    let mime = match ext.as_str() {
+        "md" | "markdown" => "text/markdown",
+        "txt" => "text/plain",
+        "html" | "htm" => "text/html",
+        "json" => "application/json",
+        "yaml" | "yml" => "application/x-yaml",
+        "pdf" => "application/pdf",
+        "csv" => "text/csv",
+        "rs" => "text/x-rust",
+        _ => "",
+    };
+    (!mime.is_empty()).then(|| mime.to_string())
 }
 
 fn extract_text(content: &str, source: &str) -> String {
@@ -242,8 +286,9 @@ fn fetch_url(url_str: &str, config: &Config) -> Result<String, SkbError> {
 
 fn base64_decode(b64: &str) -> Result<Vec<u8>, SkbError> {
     use base64::Engine;
+    let compact: String = b64.chars().filter(|c| !c.is_whitespace()).collect();
     base64::engine::general_purpose::STANDARD
-        .decode(b64)
+        .decode(compact)
         .map_err(|e| SkbError::new(ErrorCode::Validation, format!("base64: {e}")))
 }
 
@@ -296,23 +341,14 @@ async fn doc_exists(db: &Db, sha256: &str) -> Result<bool, SkbError> {
 }
 
 async fn delete_existing(db: &Db, sha256: &str) -> Result<(), SkbError> {
-    let find =
-        format!("SELECT meta::id(id) AS did FROM document WHERE sha256 = '{sha256}' LIMIT 1");
-    let mut r = db
-        .db
-        .query(&find)
+    let del = format!(
+        "DELETE FROM chunk WHERE document.sha256 = '{sha256}'; \
+         DELETE FROM document WHERE sha256 = '{sha256}';"
+    );
+    db.db
+        .query(&del)
         .await
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete find: {e}")))?;
-    let rows: Vec<serde_json::Value> = r
-        .take(0)
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete find take: {e}")))?;
-    if let Some(did) = rows.first().and_then(|v| v["did"].as_str()) {
-        let del = format!("DELETE FROM chunk WHERE document = {did}; DELETE FROM {did};");
-        db.db
-            .query(&del)
-            .await
-            .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete: {e}")))?;
-    }
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete: {e}")))?;
     Ok(())
 }
 
@@ -321,10 +357,15 @@ async fn store_document(
     doc: &DocumentData,
     chunks: &[Chunk],
     embeddings: &[Vec<f32>],
-) -> Result<String, SkbError> {
+) -> Result<(String, Vec<String>), SkbError> {
     let title = doc.title.replace('\'', "\\'");
     let source = doc.source.replace('\'', "\\'");
     let content = doc.content.replace('\'', "\\'").replace('\n', "\\n");
+    let mime = doc
+        .mime
+        .as_deref()
+        .map(|value| format!("'{}'", value.replace('\'', "\\'")))
+        .unwrap_or_else(|| "NONE".to_string());
     let tags_str = serde_json::to_string(&doc.tags).unwrap_or_else(|_| "[]".into());
     let meta_str = serde_json::to_string(&doc.metadata).unwrap_or_else(|_| "{}".into());
 
@@ -332,13 +373,15 @@ async fn store_document(
     let sql = format!(
         "CREATE document SET \
          title = '{title}', source = '{source}', source_type = '{stype}', \
-         sha256 = '{sha}', content = '{content}', tags = {tags}, metadata = {meta} \
+         sha256 = '{sha}', content = '{content}', mime = {mime}, \
+         tags = {tags}, metadata = {meta} \
          RETURN string::concat('document:', meta::id(id)) AS did",
         title = title,
         source = source,
         stype = doc.source_type,
         sha = doc.sha256,
         content = content,
+        mime = mime,
         tags = tags_str,
         meta = meta_str,
     );
@@ -359,21 +402,36 @@ async fn store_document(
         return Err(SkbError::new(ErrorCode::Db, "failed to get document id"));
     }
 
-    // Create chunks
+    // Create chunks, capturing each generated id
+    let mut chunk_ids = Vec::with_capacity(chunks.len());
     for (i, (chunk, emb)) in chunks.iter().zip(embeddings.iter()).enumerate() {
         let emb_str = serde_json::to_string(emb).unwrap_or_else(|_| "[]".into());
         let c = chunk.content.replace('\'', "\\'").replace('\n', "\\n");
         let chunk_sql = format!(
             "CREATE chunk SET document = {doc_id}, idx = {i}, content = '{c}', \
-             token_count = {tc}, embedding = {emb}",
+             token_count = {tc}, embedding = {emb} \
+             RETURN string::concat('chunk:', meta::id(id)) AS cid",
             tc = chunk.token_count,
             emb = emb_str,
         );
-        db.db
+        let mut cr = db
+            .db
             .query(&chunk_sql)
             .await
             .map_err(|e| SkbError::new(ErrorCode::Db, format!("chunk {i}: {e}")))?;
+        let rows: Vec<serde_json::Value> = cr
+            .take(0)
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("chunk {i} take: {e}")))?;
+        let cid = rows
+            .first()
+            .and_then(|v| v["cid"].as_str())
+            .unwrap_or("")
+            .to_string();
+        if cid.is_empty() {
+            return Err(SkbError::new(ErrorCode::Db, "failed to get chunk id"));
+        }
+        chunk_ids.push(cid);
     }
 
-    Ok(doc_id)
+    Ok((doc_id, chunk_ids))
 }
