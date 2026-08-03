@@ -82,6 +82,7 @@ pub async fn upsert_entity(db: &Db, entity: &EntityInfo) -> Result<(), SkbError>
     Ok(())
 }
 
+/// Create a typed `related_to` edge between two entities.
 pub async fn link(db: &Db, link: &LinkInfo) -> Result<(), SkbError> {
     let weight = link.weight.unwrap_or(1.0);
     let from = entity_rid(&link.from);
@@ -99,6 +100,7 @@ pub async fn link(db: &Db, link: &LinkInfo) -> Result<(), SkbError> {
     Ok(())
 }
 
+/// Create a `mentions` edge from a chunk to an entity.
 pub async fn link_chunk_to_entity(
     db: &Db,
     chunk_id: &str,
@@ -131,6 +133,7 @@ pub async fn index_chunk_entities(
     Ok(linked)
 }
 
+/// Index a chunk's entities and mentions edges inside an existing transaction.
 pub(crate) async fn index_chunk_entities_in_transaction(
     tx: &surrealdb::method::Transaction<surrealdb::engine::local::Db>,
     chunk_id: &str,
@@ -168,6 +171,7 @@ pub(crate) async fn index_chunk_entities_in_transaction(
     Ok(linked)
 }
 
+/// Traverse entity relations, optionally starting from a document record.
 pub async fn graph_query(db: &Db, req: &GraphQueryRequest) -> Result<GraphQueryResult, SkbError> {
     let depth = req.depth.unwrap_or(1).min(5);
     let limit = req.limit.unwrap_or(50);
@@ -335,6 +339,7 @@ pub async fn graph_query(db: &Db, req: &GraphQueryRequest) -> Result<GraphQueryR
     Ok(GraphQueryResult { nodes, edges })
 }
 
+/// Parse and validate a graph start identifier before binding it to SurrealQL.
 fn start_record_id(value: &str) -> Result<RecordId, SkbError> {
     if let Some((table, key)) = value.split_once(':') {
         if !matches!(table, "entity" | "document") || key.is_empty() {

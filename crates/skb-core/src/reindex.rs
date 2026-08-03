@@ -21,6 +21,7 @@ pub struct ReindexRequest {
     pub dry_run: bool,
 }
 
+/// Rebuild every document's chunks and graph mentions atomically per document.
 pub async fn reindex(
     db: &Db,
     embedder: &dyn Embed,
@@ -109,6 +110,7 @@ pub async fn reindex(
 
 type LocalTransaction = surrealdb::method::Transaction<surrealdb::engine::local::Db>;
 
+/// Replace one document's chunks and mentions within the supplied transaction.
 async fn rebuild_document(
     tx: &LocalTransaction,
     did: &str,

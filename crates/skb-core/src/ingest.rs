@@ -43,6 +43,7 @@ struct DocumentData {
     mime: Option<String>,
 }
 
+/// Upload, embed, persist, and graph-index one document.
 pub async fn upload(
     db: &Db,
     embedder: &dyn Embed,
