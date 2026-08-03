@@ -6,7 +6,7 @@
 - Make commits incrementally at coherent checkpoints. Commits should be focused and reviewable; do not wait until the entire task is finished to create the only commit.
 - Open one GitHub pull request for each task branch. Keep the PR scope aligned with the branch scope and include verification results in the description.
 - After opening a PR, wait for the CodeRabbitAI review before merging. Review the overview, review state, inline comments, and suppressed comments when available.
-- Resolve valid CodeRabbitAI findings or record why a finding is not applicable. If code changes are made in response, rerun checks and wait for the updated CodeRabbitAI review before merging.
+- Resolve valid CodeRabbitAI findings or record why a finding is not applicable. If any code, documentation, or configuration changes are made in response, rerun checks and wait for the updated CodeRabbitAI review before merging.
 - Do not merge while the CodeRabbitAI review is pending unless the user explicitly approves an exception.
 
 ## File System Access
