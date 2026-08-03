@@ -169,10 +169,16 @@ fn collect_files(dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>> {
 }
 
 fn main() -> std::process::ExitCode {
-    let rt = tokio::runtime::Builder::new_multi_thread()
+    let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .expect("failed to start tokio runtime");
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("Error: failed to start tokio runtime: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
     rt.block_on(async_main())
 }
 
