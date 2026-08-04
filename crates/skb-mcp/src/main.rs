@@ -418,11 +418,7 @@ impl SkbServer {
                     .map_err(|e| format!("{e}"))
             }
             "skb_reindex" => {
-                let dry_run = args
-                    .get("dry_run")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                let req = skb_core::reindex::ReindexRequest { dry_run };
+                let req = reindex_request(&args);
                 kb.reindex(&req)
                     .await
                     .map(|r| serde_json::to_value(r).unwrap_or_default())
@@ -430,6 +426,43 @@ impl SkbServer {
             }
             name => Err(format!("unknown tool: {name}")),
         }
+    }
+}
+
+fn reindex_request(args: &serde_json::Map<String, Value>) -> skb_core::reindex::ReindexRequest {
+    skb_core::reindex::ReindexRequest {
+        dry_run: args
+            .get("dry_run")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reindex_tool_has_optional_dry_run() {
+        let tool = tool_optional(
+            "skb_reindex",
+            "Reindex all documents",
+            &[("dry_run", "boolean")],
+        );
+        let schema = serde_json::to_value(tool.input_schema).unwrap();
+        assert_eq!(schema["required"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn reindex_request_defaults_dry_run_to_false() {
+        let args = serde_json::Map::new();
+        assert!(!reindex_request(&args).dry_run);
+    }
+
+    #[test]
+    fn reindex_request_preserves_explicit_dry_run() {
+        let args = serde_json::from_value(serde_json::json!({"dry_run": true})).unwrap();
+        assert!(reindex_request(&args).dry_run);
     }
 }
 
