@@ -23,7 +23,9 @@ fn setup_config() {
 
     let db_path = dir.join("db");
     let config = format!(
-        r#"[embedding]
+        r#"search = {{ rrf_k = 10 }}
+
+[embedding]
 onnx_path = "mock"
 dimension = 8
 
@@ -199,7 +201,7 @@ fn contract_config_set_updates_existing_config() {
     assert!(output.status.success());
 
     let config = std::fs::read_to_string(test_dir().join("skb.toml")).unwrap();
-    assert!(config.contains("rrf_k = 42"));
+    assert!(config.contains("search = { rrf_k = 42 }"));
     let shown = run_skb(&["config", "show"], None);
     assert_eq!(shown["search"]["rrf_k"], 42);
 }

@@ -450,17 +450,24 @@ fn set_config(key: &str, value: &str) -> Result<()> {
     }
 
     // Walk (or create) nested tables for all but the last segment.
-    let mut cur = root.as_table_mut();
+    let mut cur: &mut dyn toml_edit::TableLike = root.as_table_mut();
     for seg in &parts[..parts.len() - 1] {
         let item = cur
-            .entry(*seg)
+            .entry(seg)
             .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
         cur = item
-            .as_table_mut()
+            .as_table_like_mut()
             .ok_or_else(|| anyhow::anyhow!("path segment '{seg}' is not a table"))?;
     }
     let last = *parts.last().unwrap();
-    cur[&last] = parse_scalar_item(value);
+    let decor = cur
+        .get(last)
+        .and_then(|item| item.as_value().map(|value| value.decor().clone()));
+    let mut replacement = parse_scalar_item(value);
+    if let (Some(decor), Some(value)) = (decor, replacement.as_value_mut()) {
+        *value.decor_mut() = decor;
+    }
+    cur.insert(last, replacement);
 
     if let Some(parent) = std::path::Path::new(&path).parent() {
         if !parent.as_os_str().is_empty() {
