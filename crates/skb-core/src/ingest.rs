@@ -166,7 +166,9 @@ fn extract_document_data(req: UploadRequest, config: &Config) -> Result<Document
         .map(|b| format!("{b:02x}"))
         .collect::<String>();
 
-    let mime = mime_for(&file_title);
+    let mime = mime_for(&source)
+        .or_else(|| req.title.as_deref().and_then(mime_for))
+        .or_else(|| mime_for(&file_title));
     Ok(DocumentData {
         title: req.title.unwrap_or(file_title),
         source,
