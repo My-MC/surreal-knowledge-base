@@ -372,6 +372,57 @@ mod tests {
         let doc = kb.get_document(&docs[0].id, false).await.unwrap();
         assert!(doc.content.contains("SurrealDB"));
 
+        let graph = kb
+            .graph_query(&GraphQueryRequest {
+                from: docs[0].id.clone(),
+                relation: None,
+                depth: Some(1),
+                limit: Some(1),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            graph.nodes.first().map(|node| node.kind.as_str()),
+            Some("document")
+        );
+
+        for name in ["A", "B", "C"] {
+            kb.upsert_entity(&EntityInfo {
+                name: name.into(),
+                kind: "test".into(),
+                description: None,
+            })
+            .await
+            .unwrap();
+        }
+        for (from, to) in [("A", "B"), ("B", "C")] {
+            kb.link_entities(&LinkInfo {
+                from: from.into(),
+                to: to.into(),
+                relation: "related".into(),
+                weight: None,
+            })
+            .await
+            .unwrap();
+        }
+        let multi_hop = kb
+            .graph_query(&GraphQueryRequest {
+                from: "A".into(),
+                relation: None,
+                depth: Some(2),
+                limit: Some(10),
+            })
+            .await
+            .unwrap();
+        assert!(multi_hop.nodes.iter().any(|node| node.name == "B"));
+        assert!(multi_hop.nodes.iter().any(|node| node.name == "C"));
+
+        let reindexed = kb
+            .reindex(&reindex::ReindexRequest::default())
+            .await
+            .unwrap();
+        assert_eq!(reindexed.documents_processed, 1);
+
         let _ = std::fs::remove_dir_all(&path);
     }
 }

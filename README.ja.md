@@ -120,7 +120,7 @@ bunx surreal-knowledge-base
   "mcp": {
     "surreal-knowledge-base": {
       "type": "local",
-      "command": ["skb-mcp"],
+      "command": ["npx", "-y", "surreal-knowledge-base"],
       "enabled": true
     }
   }
@@ -140,7 +140,7 @@ bunx surreal-knowledge-base
 | `skb delete <ID>` | 文書削除（`--yes`） |
 | `skb stats` | 統計情報 |
 | `skb graph query --from <ENTITY>` | 知識グラフ検索 |
-| `skb graph entity <NAME>` | エンティティ追加・更新 |
+| `skb graph entity <NAME> --kind <KIND>` | エンティティ追加・更新 |
 | `skb graph link <FROM> <TO>` | エンティティ間リンク |
 | `skb reindex` | 全文書を再インデックス（`--dry-run` 対応） |
 | `skb config init\|show\|set` | 設定管理 |

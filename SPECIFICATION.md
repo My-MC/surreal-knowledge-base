@@ -271,7 +271,8 @@ LLM 抽出は `EntityExtractor` トレイトの差し替え実装として将来
 1. 設定ファイルを編集（モデル / チャンク長）。
 2. `skb reindex`（MCP: `skb_reindex`）を実行:
    - モデル変更時: 新モデル・新トークナイザをロード。次元が変わる場合は `chunk.embedding` フィールドと HNSW インデックスを新次元で再定義。
-   - 全ドキュメントの `document.content`（抽出済み全文）を新設定で再チャンク化 → 再埋め込み → `chunk` を置換（ドキュメント単位のトランザクション）。グラフの `mentions` も再構築。
+   - 全ドキュメントの `document.content`（抽出済み全文）を新設定で再チャンク化 → 再埋め込み → `chunk` を置換（ドキュメント単位のトランザクション）。対象チャンクの `mentions` エッジを削除し、新チャンクから再構築する。
+   - 旧チャンクとその `mentions` エッジの削除、新チャンク作成、エンティティ索引を同一トランザクションで実行する。チャンクIDの取得、削除、作成、索引のいずれかが失敗した場合は `E_DB` を返し、対象ドキュメントの変更をロールバックする。
    - `meta` テーブルを新モデル情報で更新。
 3. チャンク長のみの変更も、既存ドキュメントへの反映には同じ `reindex` が必要（新規アップロード分には即時反映される）。
 
@@ -413,7 +414,8 @@ allowed_dirs = []                    # MCP経由の path アップロード許�
 ### 8.3 リソース・プロンプト
 
 - **Resources**: `skb://documents`（一覧）, `skb://documents/{id}`（本文）, `skb://stats` — 読み取り専用。
-- **Prompts**: `skb-answer`（`question` を受け取り `skb_search` の結果を根拠に回答する RAG 用テンプレート）。
+  一覧・本文・統計の JSON シリアライズに失敗した場合は MCP の内部エラーを返す。存在しない URI は resource-not-found エラーとする。
+- **Prompts**: `skb-answer` — `question` は任意。未指定または空の場合はローカル知識ベースを使って回答する既定の指示を生成する。指定時はその質問を使い、`skb_search` の結果を根拠に回答し、各引用に `document_id` と `chunk_idx` を含める。
 
 ### 8.4 MCP クライアント設定例
 
@@ -636,7 +638,7 @@ bunx surreal-knowledge-base --http --port 8787   # HTTP モード
 | `E_MODEL_MISMATCH` | 稼働中モデルと設定の不一致（reindex 必要、§5.4） | 9 |
 | `E_TOKENIZE` | トークナイズ/チャンク化失敗 | 10 |
 
-- MCP 側はツール結果として `{ isError: true, content: [上記 JSON の text] }` を返す（プロトコルエラーにはしない。起動不能時のみプロトコルエラー）。
+- MCP 側はツール結果として `{ isError: true, content: [text "[E_*] ..."] }` を返す（プロトコルエラーにはしない。起動不能時のみプロトコルエラー）。
 - ログ: `tracing` + `RUST_LOG`。MCP は **stderr のみ**、CLI は stderr。機微情報（本文・パス）のログ出力は `debug` レベル以下に限定。
 
 ---

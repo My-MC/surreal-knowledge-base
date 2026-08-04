@@ -437,11 +437,17 @@ async fn run(cli: &Cli) -> Result<()> {
 /// config file (./skb.toml or ~/.config/skb/config.toml), preserving other keys.
 fn set_config(key: &str, value: &str) -> Result<()> {
     let path = Config::writable_config_path();
-    let content = std::fs::read_to_string(&path).unwrap_or_default();
-    let mut root: toml::Value = if content.trim().is_empty() {
-        toml::Value::Table(toml::map::Map::new())
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(anyhow::anyhow!("read config {}: {e}", path.display())),
+    };
+    let mut root = if content.trim().is_empty() {
+        toml_edit::DocumentMut::new()
     } else {
-        toml::from_str(&content).map_err(|e| anyhow::anyhow!("parse config: {e}"))?
+        content
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|e| anyhow::anyhow!("parse config {}: {e}", path.display()))?
     };
 
     let parts: Vec<&str> = key.trim().split('.').filter(|s| !s.is_empty()).collect();
@@ -450,45 +456,49 @@ fn set_config(key: &str, value: &str) -> Result<()> {
     }
 
     // Walk (or create) nested tables for all but the last segment.
-    let mut cur = &mut root;
+    let mut cur: &mut dyn toml_edit::TableLike = root.as_table_mut();
     for seg in &parts[..parts.len() - 1] {
-        let entry = cur
-            .as_table_mut()
+        let item = cur
+            .entry(seg)
+            .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
+        cur = item
+            .as_table_like_mut()
             .ok_or_else(|| anyhow::anyhow!("path segment '{seg}' is not a table"))?;
-        cur = entry
-            .entry((*seg).to_string())
-            .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
     }
     let last = *parts.last().unwrap();
-    let entry = cur
-        .as_table_mut()
-        .ok_or_else(|| anyhow::anyhow!("path '{key}' parent is not a table"))?;
-    entry.insert(last.to_string(), parse_scalar(value));
+    let decor = cur
+        .get(last)
+        .and_then(|item| item.as_value().map(|value| value.decor().clone()));
+    let mut replacement = parse_scalar_item(value);
+    if let (Some(decor), Some(value)) = (decor, replacement.as_value_mut()) {
+        *value.decor_mut() = decor;
+    }
+    cur.insert(last, replacement);
 
     if let Some(parent) = std::path::Path::new(&path).parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
         }
     }
-    std::fs::write(&path, toml::to_string(&root)?)?;
+    std::fs::write(&path, root.to_string())?;
     println!(
-        "Set {key} = {value} in {} (restart to retload; reindex if it changes embedding/chunking).",
+        "Set {key} = {value} in {} (restart to reload; reindex if it changes embedding/chunking).",
         path.display()
     );
     Ok(())
 }
 
-fn parse_scalar(raw: &str) -> toml::Value {
+fn parse_scalar_item(raw: &str) -> toml_edit::Item {
     if let Ok(b) = raw.parse::<bool>() {
-        return toml::Value::Boolean(b);
+        return toml_edit::value(b);
     }
     if let Ok(i) = raw.parse::<i64>() {
-        return toml::Value::Integer(i);
+        return toml_edit::value(i);
     }
     if let Ok(f) = raw.parse::<f64>() {
-        return toml::Value::Float(f);
+        return toml_edit::value(f);
     }
-    toml::Value::String(raw.to_string())
+    toml_edit::value(raw)
 }
 
 fn cfg() -> Result<Config> {
