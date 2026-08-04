@@ -342,11 +342,18 @@ async fn run(cli: &Cli) -> Result<()> {
             let kb = KnowledgeBase::open(cfg()?).await?;
             let filter: HashMap<String, String> = filter
                 .iter()
-                .filter_map(|kv| {
-                    kv.split_once('=')
-                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                .map(|kv| {
+                    kv.split_once('=').map_or_else(
+                        || anyhow::bail!("invalid filter '{kv}'; expected KEY=VALUE"),
+                        |(k, v)| {
+                            if k.is_empty() {
+                                anyhow::bail!("invalid filter '{kv}'; key must not be empty")
+                            }
+                            Ok((k.to_string(), v.to_string()))
+                        },
+                    )
                 })
-                .collect();
+                .collect::<Result<_, _>>()?;
             let req = SearchRequest {
                 query: query.clone(),
                 mode: Some(mode.clone()),
