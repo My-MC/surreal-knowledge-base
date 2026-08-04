@@ -21,6 +21,7 @@ pub struct ReindexRequest {
     pub dry_run: bool,
 }
 
+/// Rebuild every document's chunks and graph mentions atomically per document.
 pub async fn reindex(
     db: &Db,
     embedder: &dyn Embed,
@@ -55,19 +56,6 @@ pub async fn reindex(
             continue;
         }
 
-        // Delete old mentions + chunks for this document (no-op in dry-run)
-        if !dry_run {
-            let del_sql = format!(
-                "LET $chunks = (SELECT value id FROM chunk WHERE meta::id(document) = '{did}'); \
-                 DELETE FROM mentions WHERE ->in IN $chunks; \
-                 DELETE FROM chunk WHERE meta::id(document) = '{did}';"
-            );
-            db.db
-                .query(&del_sql)
-                .await
-                .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex del: {e}")))?;
-        }
-
         // Re-chunk
         let chunks = tokenizer.chunk(
             content,
@@ -91,38 +79,26 @@ pub async fn reindex(
         // Re-embed
         let texts: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
         let embeddings = embed_in_batches(embedder, &texts, config.embedding.batch_size)?;
-
-        // Re-create chunks
-        let mut chunk_ids: Vec<String> = Vec::with_capacity(chunks.len());
-        for (i, (chunk, emb)) in chunks.iter().zip(embeddings.iter()).enumerate() {
-            let emb_str = serde_json::to_string(emb).unwrap_or_else(|_| "[]".into());
-            let c = chunk.content.replace('\'', "\\'").replace('\n', "\\n");
-            let chunk_sql = format!(
-                "CREATE chunk SET document = document:⟨{did}⟩, idx = {i}, content = '{c}', \
-                 token_count = {tc}, embedding = {emb} \
-                 RETURN string::concat('chunk:', meta::id(id)) AS cid",
-                tc = chunk.token_count,
-                emb = emb_str,
-            );
-            let mut cr = db
-                .db
-                .query(&chunk_sql)
-                .await
-                .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex chunk: {e}")))?;
-            let rows: Vec<serde_json::Value> = cr
-                .take(0)
-                .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex chunk take: {e}")))?;
-            if let Some(cid) = rows.first().and_then(|v| v["cid"].as_str()) {
-                chunk_ids.push(cid.to_string());
+        let tx = db
+            .db
+            .clone()
+            .begin()
+            .await
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex begin: {e}")))?;
+        let rebuilt = rebuild_document(&tx, did, &chunks, &embeddings).await;
+        let entities_extracted = match rebuilt {
+            Ok(count) => {
+                tx.commit()
+                    .await
+                    .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex commit: {e}")))?;
+                count
             }
-        }
-
-        // Re-extract entities and rebuild mentions per chunk
-        for (cid, chunk) in chunk_ids.iter().zip(chunks.iter()) {
-            if let Ok(n) = crate::graph::index_chunk_entities(db, cid, &chunk.content).await {
-                result.entities_extracted += n;
+            Err(e) => {
+                let _ = tx.cancel().await;
+                return Err(e);
             }
-        }
+        };
+        result.entities_extracted += entities_extracted;
 
         result.documents_processed += 1;
         result.chunks_created += chunks.len();
@@ -130,6 +106,65 @@ pub async fn reindex(
     }
 
     Ok(result)
+}
+
+type LocalTransaction = surrealdb::method::Transaction<surrealdb::engine::local::Db>;
+
+/// Replace one document's chunks and mentions within the supplied transaction.
+async fn rebuild_document(
+    tx: &LocalTransaction,
+    did: &str,
+    chunks: &[crate::tokenize::Chunk],
+    embeddings: &[Vec<f32>],
+) -> Result<usize, SkbError> {
+    let document = surrealdb::types::RecordId::new("document", did);
+    tx.query(
+        "DELETE FROM mentions WHERE in.document = $document; \
+         DELETE FROM chunk WHERE document = $document;",
+    )
+    .bind(("document", document.clone()))
+    .await
+    .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex del: {e}")))?
+    .check()
+    .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex del check: {e}")))?;
+
+    let mut chunk_ids = Vec::with_capacity(chunks.len());
+    for (i, (chunk, emb)) in chunks.iter().zip(embeddings.iter()).enumerate() {
+        let chunk_sql = "CREATE chunk SET document = $document, idx = $idx, \
+                         content = $content, token_count = $token_count, embedding = $embedding \
+                         RETURN string::concat('chunk:', meta::id(id)) AS cid";
+        let mut response = tx
+            .query(chunk_sql)
+            .bind(("document", document.clone()))
+            .bind(("idx", i as i64))
+            .bind(("content", chunk.content.clone()))
+            .bind(("token_count", chunk.token_count as i64))
+            .bind(("embedding", emb.clone()))
+            .await
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex chunk: {e}")))?
+            .check()
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex chunk check: {e}")))?;
+        let rows: Vec<serde_json::Value> = response
+            .take(0)
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex chunk take: {e}")))?;
+        let cid = rows
+            .first()
+            .and_then(|v| v["cid"].as_str())
+            .ok_or_else(|| {
+                SkbError::new(
+                    ErrorCode::Db,
+                    format!("reindex chunk {i} did not return a chunk id"),
+                )
+            })?;
+        chunk_ids.push(cid.to_string());
+    }
+
+    let mut entities = 0;
+    for (cid, chunk) in chunk_ids.iter().zip(chunks.iter()) {
+        entities +=
+            crate::graph::index_chunk_entities_in_transaction(tx, cid, &chunk.content).await?;
+    }
+    Ok(entities)
 }
 
 fn embed_in_batches(

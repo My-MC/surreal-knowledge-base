@@ -120,7 +120,7 @@ bunx surreal-knowledge-base
   "mcp": {
     "surreal-knowledge-base": {
       "type": "local",
-      "command": ["skb-mcp"],
+      "command": ["npx", "-y", "surreal-knowledge-base"],
       "enabled": true
     }
   }
@@ -140,7 +140,7 @@ bunx surreal-knowledge-base
 | `skb delete <ID>` | Delete a document (`--yes`) |
 | `skb stats` | Show statistics |
 | `skb graph query --from <ENTITY>` | Query knowledge graph |
-| `skb graph entity <NAME>` | Add/update an entity |
+| `skb graph entity <NAME> --kind <KIND>` | Add/update an entity |
 | `skb graph link <FROM> <TO>` | Link two entities |
 | `skb reindex` | Reindex all documents (`--dry-run` supported) |
 | `skb config init\|show\|set` | Manage configuration |

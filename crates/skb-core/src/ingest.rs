@@ -43,6 +43,7 @@ struct DocumentData {
     mime: Option<String>,
 }
 
+/// Upload, embed, persist, and graph-index one document.
 pub async fn upload(
     db: &Db,
     embedder: &dyn Embed,
@@ -93,7 +94,7 @@ pub async fn upload(
     let (doc_id, chunk_ids) = store_document(db, &doc, &chunks, &embeddings).await?;
     let mut entities = Vec::new();
     for (chunk_id, chunk) in chunk_ids.iter().zip(chunks.iter()) {
-        let _ = graph::index_chunk_entities(db, chunk_id, &chunk.content).await;
+        graph::index_chunk_entities(db, chunk_id, &chunk.content).await?;
         entities.extend(
             graph::extract_entities(&chunk.content)
                 .into_iter()
@@ -165,7 +166,9 @@ fn extract_document_data(req: UploadRequest, config: &Config) -> Result<Document
         .map(|b| format!("{b:02x}"))
         .collect::<String>();
 
-    let mime = mime_for(&file_title);
+    let mime = mime_for(&source)
+        .or_else(|| req.title.as_deref().and_then(mime_for))
+        .or_else(|| mime_for(&file_title));
     Ok(DocumentData {
         title: req.title.unwrap_or(file_title),
         source,

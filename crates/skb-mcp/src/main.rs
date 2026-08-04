@@ -173,25 +173,22 @@ impl ServerHandler for SkbServer {
         let uri = request.uri.clone();
         let contents: Vec<ResourceContents> = if uri == "skb://documents" {
             let docs = kb.list_documents(100, 0, None).await.map_err(err_data)?;
-            vec![ResourceContents::text(
-                serde_json::to_string_pretty(&docs).unwrap_or_default(),
-                uri,
-            )]
+            let body = serde_json::to_string_pretty(&docs)
+                .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+            vec![ResourceContents::text(body, uri)]
         } else if uri == "skb://stats" {
             let stats = kb.stats().await.map_err(err_data)?;
-            vec![ResourceContents::text(
-                serde_json::to_string_pretty(&stats).unwrap_or_default(),
-                uri,
-            )]
+            let body = serde_json::to_string_pretty(&stats)
+                .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+            vec![ResourceContents::text(body, uri)]
         } else if let Some(id) = uri.strip_prefix("skb://documents/") {
             let doc = kb
                 .get_document(id, true)
                 .await
                 .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
-            vec![ResourceContents::text(
-                serde_json::to_string_pretty(&doc).unwrap_or_default(),
-                uri,
-            )]
+            let body = serde_json::to_string_pretty(&doc)
+                .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+            vec![ResourceContents::text(body, uri)]
         } else {
             return Err(rmcp::ErrorData::resource_not_found(uri, None));
         };
@@ -210,7 +207,7 @@ impl ServerHandler for SkbServer {
             Some("Answer a question grounded in the knowledge base via skb_search."),
             Some(vec![PromptArgument::new("question")
                 .with_description("The question to answer")
-                .with_required(true)]),
+                .with_required(false)]),
         )];
         Ok(ListPromptsResult::with_all_items(prompts))
     }
@@ -236,7 +233,8 @@ impl ServerHandler for SkbServer {
             Role::User,
             format!(
                 "You are an assistant that answers questions strictly using the user's local \
-                knowledge base. Call the skb_search tool, then cite its source field.\n\nQuestion: {user}"
+                 knowledge base. Call the skb_search tool, then cite each result's document_id and \
+                 chunk_idx.\n\nQuestion: {user}"
             ),
         )];
         Ok(GetPromptResponse::from(GetPromptResult::new(messages)))
@@ -328,14 +326,14 @@ impl SkbServer {
                     args.get("content_base64"),
                 ]
                 .iter()
-                .any(|v| v.is_some());
+                .any(|v| v.is_some_and(|value| !value.is_null()));
                 if !has_source {
                     return Err(valid_err(
                         "skb_upload requires one of: path, url, content, content_base64",
                     ));
                 }
-                let params: UploadRequest =
-                    serde_json::from_value(Value::Object(args)).map_err(|e| format!("{e}"))?;
+                let params: UploadRequest = serde_json::from_value(Value::Object(args))
+                    .map_err(|e| valid_err(&format!("invalid upload parameters: {e}")))?;
                 kb.upload(params)
                     .await
                     .map(|r| serde_json::to_value(r).unwrap_or_default())
@@ -345,8 +343,8 @@ impl SkbServer {
                 if !args.contains_key("query") {
                     return Err(valid_err("skb_search requires 'query'"));
                 }
-                let params: SearchRequest =
-                    serde_json::from_value(Value::Object(args)).map_err(|e| format!("{e}"))?;
+                let params: SearchRequest = serde_json::from_value(Value::Object(args))
+                    .map_err(|e| valid_err(&format!("invalid search parameters: {e}")))?;
                 kb.search(params)
                     .await
                     .map(|r| serde_json::to_value(r).unwrap_or_default())
@@ -394,24 +392,24 @@ impl SkbServer {
                 .map(|r| serde_json::to_value(r).unwrap_or_default())
                 .map_err(|e| format!("{e}")),
             "skb_graph_query" => {
-                let params: GraphQueryRequest =
-                    serde_json::from_value(Value::Object(args)).map_err(|e| format!("{e}"))?;
+                let params: GraphQueryRequest = serde_json::from_value(Value::Object(args))
+                    .map_err(|e| valid_err(&format!("invalid graph query parameters: {e}")))?;
                 kb.graph_query(&params)
                     .await
                     .map(|r| serde_json::to_value(r).unwrap_or_default())
                     .map_err(|e| format!("{e}"))
             }
             "skb_graph_upsert_entity" => {
-                let params: EntityInfo =
-                    serde_json::from_value(Value::Object(args)).map_err(|e| format!("{e}"))?;
+                let params: EntityInfo = serde_json::from_value(Value::Object(args))
+                    .map_err(|e| valid_err(&format!("invalid entity parameters: {e}")))?;
                 kb.upsert_entity(&params)
                     .await
                     .map(|_| json!({"status": "ok"}))
                     .map_err(|e| format!("{e}"))
             }
             "skb_graph_link" => {
-                let params: LinkInfo =
-                    serde_json::from_value(Value::Object(args)).map_err(|e| format!("{e}"))?;
+                let params: LinkInfo = serde_json::from_value(Value::Object(args))
+                    .map_err(|e| valid_err(&format!("invalid link parameters: {e}")))?;
                 kb.link_entities(&params)
                     .await
                     .map(|_| json!({"status": "ok"}))
