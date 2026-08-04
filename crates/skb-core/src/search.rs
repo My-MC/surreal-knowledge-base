@@ -230,18 +230,13 @@ async fn apply_filter(
     hits: Vec<SearchHit>,
     filter: &HashMap<String, String>,
 ) -> Result<Vec<SearchHit>, SkbError> {
-    if hits.is_empty() || filter.is_empty() {
+    if filter.is_empty() {
         return Ok(hits);
     }
 
-    const FILTER_FIELDS: &[&str] = &["title", "source", "source_type", "mime", "sha256"];
-    for field in filter.keys() {
-        if !FILTER_FIELDS.contains(&field.as_str()) {
-            return Err(SkbError::new(
-                ErrorCode::Validation,
-                format!("unsupported search filter field: {field}"),
-            ));
-        }
+    validate_filter_fields(filter)?;
+    if hits.is_empty() {
+        return Ok(hits);
     }
 
     let mut ids: Vec<String> = hits.iter().map(|h| h.document_id.clone()).collect();
@@ -291,4 +286,35 @@ async fn apply_filter(
         }
     }
     Ok(keep)
+}
+
+fn validate_filter_fields(filter: &HashMap<String, String>) -> Result<(), SkbError> {
+    const FILTER_FIELDS: &[&str] = &["title", "source", "source_type", "mime", "sha256"];
+    for field in filter.keys() {
+        if !FILTER_FIELDS.contains(&field.as_str()) {
+            return Err(SkbError::new(
+                ErrorCode::Validation,
+                format!("unsupported search filter field: {field}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validates_unsupported_filter_even_when_hits_are_empty() {
+        let filter = HashMap::from([(String::from("unsupported"), String::from("value"))]);
+        let result = validate_filter_fields(&filter);
+        assert!(matches!(
+            result,
+            Err(SkbError {
+                code: ErrorCode::Validation,
+                ..
+            })
+        ));
+    }
 }
