@@ -15,7 +15,7 @@ Local-first knowledge base: SurrealDB (embedded SurrealKV) + BAAI/bge-m3 embeddi
 
 - Create a dedicated branch for each feature, bug fix, cleanup, or documentation task. Do not combine unrelated tasks in one branch.
 - Commit incrementally as coherent work is completed. Prefer small, focused commits over one large end-of-task commit.
-- Open exactly one pull request per task branch. The PR description must identify the task and summarize verification.
+- Open exactly one pull request per task branch as soon as that independent task is complete. When multiple independent tasks are received, open each task's PR separately rather than waiting to bundle them at the end. The PR description must identify the task and summarize verification.
 - After opening a PR, wait for the CodeRabbitAI review to be published before merging. Inspect both the review summary and every inline comment, including suppressed comments when available.
 - Address valid CodeRabbitAI findings, or document the rationale for not addressing them, then re-run the relevant checks and request/wait for a follow-up review after any code, documentation, or configuration change.
 - Do not merge a PR while its CodeRabbitAI review is pending unless the user explicitly authorizes an exception.
