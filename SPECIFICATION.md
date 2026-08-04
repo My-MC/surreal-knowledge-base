@@ -638,7 +638,7 @@ bunx surreal-knowledge-base --http --port 8787   # HTTP モード
 | `E_MODEL_MISMATCH` | 稼働中モデルと設定の不一致（reindex 必要、§5.4） | 9 |
 | `E_TOKENIZE` | トークナイズ/チャンク化失敗 | 10 |
 
-- MCP 側はツール結果として `{ isError: true, content: [上記 JSON の text] }` を返す（プロトコルエラーにはしない。起動不能時のみプロトコルエラー）。
+- MCP 側はツール結果として `{ isError: true, content: [text "[E_*] ..."] }` を返す（プロトコルエラーにはしない。起動不能時のみプロトコルエラー）。
 - ログ: `tracing` + `RUST_LOG`。MCP は **stderr のみ**、CLI は stderr。機微情報（本文・パス）のログ出力は `debug` レベル以下に限定。
 
 ---
