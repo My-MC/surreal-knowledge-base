@@ -173,25 +173,22 @@ impl ServerHandler for SkbServer {
         let uri = request.uri.clone();
         let contents: Vec<ResourceContents> = if uri == "skb://documents" {
             let docs = kb.list_documents(100, 0, None).await.map_err(err_data)?;
-            vec![ResourceContents::text(
-                serde_json::to_string_pretty(&docs).unwrap_or_default(),
-                uri,
-            )]
+            let body = serde_json::to_string_pretty(&docs)
+                .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+            vec![ResourceContents::text(body, uri)]
         } else if uri == "skb://stats" {
             let stats = kb.stats().await.map_err(err_data)?;
-            vec![ResourceContents::text(
-                serde_json::to_string_pretty(&stats).unwrap_or_default(),
-                uri,
-            )]
+            let body = serde_json::to_string_pretty(&stats)
+                .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+            vec![ResourceContents::text(body, uri)]
         } else if let Some(id) = uri.strip_prefix("skb://documents/") {
             let doc = kb
                 .get_document(id, true)
                 .await
                 .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
-            vec![ResourceContents::text(
-                serde_json::to_string_pretty(&doc).unwrap_or_default(),
-                uri,
-            )]
+            let body = serde_json::to_string_pretty(&doc)
+                .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+            vec![ResourceContents::text(body, uri)]
         } else {
             return Err(rmcp::ErrorData::resource_not_found(uri, None));
         };
@@ -210,7 +207,7 @@ impl ServerHandler for SkbServer {
             Some("Answer a question grounded in the knowledge base via skb_search."),
             Some(vec![PromptArgument::new("question")
                 .with_description("The question to answer")
-                .with_required(true)]),
+                .with_required(false)]),
         )];
         Ok(ListPromptsResult::with_all_items(prompts))
     }
@@ -236,7 +233,8 @@ impl ServerHandler for SkbServer {
             Role::User,
             format!(
                 "You are an assistant that answers questions strictly using the user's local \
-                knowledge base. Call the skb_search tool, then cite its source field.\n\nQuestion: {user}"
+                 knowledge base. Call the skb_search tool, then cite each result's document_id and \
+                 chunk_idx.\n\nQuestion: {user}"
             ),
         )];
         Ok(GetPromptResponse::from(GetPromptResult::new(messages)))
