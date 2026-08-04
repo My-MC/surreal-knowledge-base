@@ -309,14 +309,14 @@ impl SkbServer {
                     args.get("content_base64"),
                 ]
                 .iter()
-                .any(|v| v.is_some());
+                .any(|v| v.is_some_and(|value| !value.is_null()));
                 if !has_source {
                     return Err(valid_err(
                         "skb_upload requires one of: path, url, content, content_base64",
                     ));
                 }
-                let params: UploadRequest =
-                    serde_json::from_value(Value::Object(args)).map_err(|e| format!("{e}"))?;
+                let params: UploadRequest = serde_json::from_value(Value::Object(args))
+                    .map_err(|e| valid_err(&format!("invalid upload parameters: {e}")))?;
                 kb.upload(params)
                     .await
                     .map(|r| serde_json::to_value(r).unwrap_or_default())
@@ -326,8 +326,8 @@ impl SkbServer {
                 if !args.contains_key("query") {
                     return Err(valid_err("skb_search requires 'query'"));
                 }
-                let params: SearchRequest =
-                    serde_json::from_value(Value::Object(args)).map_err(|e| format!("{e}"))?;
+                let params: SearchRequest = serde_json::from_value(Value::Object(args))
+                    .map_err(|e| valid_err(&format!("invalid search parameters: {e}")))?;
                 kb.search(params)
                     .await
                     .map(|r| serde_json::to_value(r).unwrap_or_default())
@@ -375,24 +375,24 @@ impl SkbServer {
                 .map(|r| serde_json::to_value(r).unwrap_or_default())
                 .map_err(|e| format!("{e}")),
             "skb_graph_query" => {
-                let params: GraphQueryRequest =
-                    serde_json::from_value(Value::Object(args)).map_err(|e| format!("{e}"))?;
+                let params: GraphQueryRequest = serde_json::from_value(Value::Object(args))
+                    .map_err(|e| valid_err(&format!("invalid graph query parameters: {e}")))?;
                 kb.graph_query(&params)
                     .await
                     .map(|r| serde_json::to_value(r).unwrap_or_default())
                     .map_err(|e| format!("{e}"))
             }
             "skb_graph_upsert_entity" => {
-                let params: EntityInfo =
-                    serde_json::from_value(Value::Object(args)).map_err(|e| format!("{e}"))?;
+                let params: EntityInfo = serde_json::from_value(Value::Object(args))
+                    .map_err(|e| valid_err(&format!("invalid entity parameters: {e}")))?;
                 kb.upsert_entity(&params)
                     .await
                     .map(|_| json!({"status": "ok"}))
                     .map_err(|e| format!("{e}"))
             }
             "skb_graph_link" => {
-                let params: LinkInfo =
-                    serde_json::from_value(Value::Object(args)).map_err(|e| format!("{e}"))?;
+                let params: LinkInfo = serde_json::from_value(Value::Object(args))
+                    .map_err(|e| valid_err(&format!("invalid link parameters: {e}")))?;
                 kb.link_entities(&params)
                     .await
                     .map(|_| json!({"status": "ok"}))
