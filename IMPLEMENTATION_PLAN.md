@@ -189,16 +189,19 @@ Phase 0〜8 で確定した方針（`tokenizers`、SurrealKV 組込み、ORT 静
 - CLI 引数、`SKB_*` 環境変数、`./skb.toml`、ユーザー設定の優先順位を実装する。
 - モデル設定から dimension と最大入力トークン数を検出し、明示設定との不一致を `E_VALIDATION` にする。
 - `KnowledgeBase::open` で model、dimension、max input tokens、tokenizer の `meta` を比較する。
-- **完了条件**: 不正設定、環境変数上書き、モデル不一致、dimension 不一致のテストが緑。
+- `embedding.tokenizer` の明示パスを検証し、tokenizer.json の vocabulary、normalizer、pre-tokenizer、model revision、その他の構成情報から決定的な metadata fingerprint を作成する。
+- tokenizer metadata fingerprint を `meta` に保存し、既存値と一致しない場合は `E_MODEL_MISMATCH` とする。tokenizer の変更も reindex 完了まで通常操作を拒否する。
+- **完了条件**: 不正設定、環境変数上書き、モデル不一致、dimension 不一致、明示 tokenizer の fingerprint 不一致と再起動後の検証テストが緑。
 
 ### 9-2: Upload の安全性・原子性
 
 - ファイル、stdin、base64、URL の全入力に `upload.max_file_mb` を適用する。
-- URL は HTTP(S) のみ許可し、リダイレクト数と応答サイズを制限する。
+- base64 はデコード前の入力長とデコード後のバイト数、ファイルは読み込み前のファイルサイズ、インライン本文は受信サイズ、URL は受信ストリームと抽出後の本文サイズを検査する。PDF 等の展開・抽出処理にも同じ上限を適用し、可能な箇所は上限超過前に停止する。
+- URL は HTTP(S) のみ許可し、リダイレクト数と応答サイズを制限する。DNS 解決後の private/reserved、loopback、link-local、multicast、クラウドメタデータ範囲を拒否し、各リダイレクトで URL と IP を再検証して DNS rebinding を防止する。プロキシを使用する場合も許可する宛先を明示的に制御する。
 - base64 は任意バイナリとして保持し、形式に応じて PDF 等を抽出する。
 - document、chunk、entity、mentions と force 更新時の旧データ削除を一つのトランザクションで処理する。
 - 複数入力時は成功結果と `errors[]` を集約する。
-- **完了条件**: サイズ超過、SSRF 相当 URL、部分失敗、トランザクションロールバックのテストが緑。
+- **完了条件**: デコード爆弾、圧縮・展開爆弾、各入力段階のサイズ超過、SSRF 相当 URL、リダイレクト先の再検証、部分失敗、トランザクションロールバックのテストが緑。
 
 ### 9-3: Tokenize・Graph・Search
 
@@ -220,6 +223,7 @@ Phase 0〜8 で確定した方針（`tokenizers`、SurrealKV 組込み、ORT 静
 ### 9-5: Reindex・配布・E2E
 
 - reindex のトランザクション内でモデル関連 `meta` を更新し、モデル変更後に再起動できるようにする。
+- dimension 変更時は `chunk.embedding` フィールドと HNSW インデックスを新しい dimension で再定義する。インデックス再構築、旧チャンク・旧 mentions 削除、新チャンク作成、entity 索引、モデル metadata 更新は単一トランザクションで完了させ、中断時はロールバックする。
 - MCP progress notification と CLI progress bar を実装する。
 - 4 ターゲットの npm package 生成、`npm pack`、npx/bunx 起動、initialize → tools/list → upload → search の E2E を CI に追加する。
-- **完了条件**: `cargo check`、`cargo clippy`、`cargo fmt --check`、シリアルテスト、4 ターゲット build、Linux smoke、契約テストがすべて緑。
+- **完了条件**: dimension 変更後に新しい `chunk.embedding` と HNSW インデックスが使用され、再起動後も維持されること、更新処理を中断した場合に旧状態へロールバックされることを確認する。加えて `cargo check`、`cargo clippy`、`cargo fmt --check`、シリアルテスト、4 ターゲット build、Linux smoke、契約テストがすべて緑。

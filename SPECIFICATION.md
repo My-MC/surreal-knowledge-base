@@ -265,6 +265,7 @@ LLM 抽出は `EntityExtractor` トレイトの差し替え実装として将来
 
 1. `0 < overlap_tokens < max_tokens ≤ max_input_tokens` を検証。違反時は `E_VALIDATION`。
 2. `meta` テーブルに記録された `embedding_model` / `embedding_dimension` と設定値を比較。**不一致のまま通常操作は行わず** `E_MODEL_MISMATCH` を返し、再構築（`reindex`）を案内する。これにより、異なる次元・語彙のベクトルが同一インデックスに混在することを防ぐ。
+3. `embedding.tokenizer` が明示パスの場合は tokenizer.json の存在と形式を検証し、vocabulary、normalizer、pre-tokenizer、model revision、その他の構成情報から決定的な metadata fingerprint を生成する。`meta` に保存された fingerprint と不一致の場合は `E_MODEL_MISMATCH` を返し、再構築（`reindex`）を案内する。新規作成時・reindex 完了時には、使用した tokenizer metadata を同じ `meta` に保存する。
 
 #### 変更手順（reindex）
 

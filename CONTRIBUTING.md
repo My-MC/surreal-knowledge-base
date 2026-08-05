@@ -42,7 +42,7 @@
 - glibc >= 2.38 (build runner: ubuntu-24.04)
 - libz, libzstd (from ONNX Runtime prebuilt static lib)
 - ca-certificates (for hf-hub model download; ureq uses embedded webpki-roots)
-- libstdc++ is statically linked on Linux (`CXXSTDLIB=""` and `-C link-arg=-l:libstdc++.a`); libgcc_s remains dynamic. Windows uses the CRT linkage required by ONNX Runtime.
+- libstdc++ is statically linked on Linux (`CXXSTDLIB=""` and `-C link-arg=-l:libstdc++.a`); libgcc_s remains dynamic. Windows uses dynamic CRT (the ORT prebuilt uses `/MD` and requires the VC++ runtime DLLs).
 
 ## SurrealDB Versions
 
