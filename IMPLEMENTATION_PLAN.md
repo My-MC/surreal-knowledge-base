@@ -12,7 +12,7 @@
 
 | 項目 | 調査結果 | 影響 |
 |---|---|---|
-| **gigatoken** | crates.io 未公開（404）。git 依存が必須。lib.rs に `#![feature(portable_simd)]` があり **Rust nightly 必須**。`pyo3`（abi3-py310）・`numpy`・`parquet`・`icu(datagen)` の重い依存あり、ビルド時に Python 3.10+ が必要 | 仕様書 §3.1 のリスクが現実化。Phase 0 スパイクで検証し、ダメなら `tokenizers` クレートへ切替（`Tokenizer` トレイトで抽象化済み） |
+| **gigatoken** | crates.io 未公開（404）。git 依存が必須。lib.rs に `#![feature(portable_simd)]` があり **Rust nightly 必須**。`pyo3`（abi3-py310）等の重い依存も必要 | Phase 0 の検証で不採用と判断。HuggingFace 公式の `tokenizers` クレートを採用済み |
 | **rmcp** | crates.io で公開済み（公式 Rust SDK） | 問題なし |
 | **bge-m3 ONNX** | HF リポジトリに公式提供 | `hf-hub` + `ort` で実現可能 |
 
@@ -33,11 +33,11 @@
 
 | # | タスク | 検証内容 | 判断基準 |
 |---|---|---|---|
-| 0-1 | **gigatoken Rust 依存スパイク** | git 依存でビルド可能か（nightly、libpython リンク）、`load_tokenizer` で bge-m3 の `tokenizer.json` をロードできるか、`tokenizers` クレートとエンコード結果が一致するか | 一致＆実用的なビルド時間 → 採用。困難 → `tokenizers` クレート採用 |
+| 0-1 | **gigatoken Rust 依存スパイク（完了）** | git 依存のビルド条件と bge-m3 tokenizer の互換性を確認 | nightly・重い Python 依存・未公開依存のため不採用。`tokenizers` クレートへ切替済み |
 | 0-2 | **SurrealDB 組込みスパイク** | `kv-surrealkv` 組込みモードで SPEC §4.1 スキーマ（HNSW・FTS analyzer・RELATION）が全て定義・動作するか | 全機能動作 → 継続 |
 | 0-3 | **ort + bge-m3 スパイク** | `hf-hub` で ONNX DL、`ort` で推論、CLS+L2 正規化で次元検出、妥当な類似度スコアが出るか | 妥当なスコア → 採用 |
 
-**決定事項**: gigatoken の採否はこのスパイク結果で判断する。
+**決定事項（完了）**: gigatoken は不採用とし、HuggingFace 公式の `tokenizers` クレートを使用する。v1 の DB は SurrealKV 組込みモードのみとし、リモート接続は将来拡張とする。
 
 ---
 
@@ -50,7 +50,7 @@
 | 1-1 | workspace 構築 | `crates/{skb-core,skb-cli,skb-mcp}`、ツールチェイン（スパイク結果に応じて stable/nightly）、CI 骨格（fmt/clippy/test） |
 | 1-2 | `config` モジュール | TOML 読込、優先順位（引数 > 環境変数 > `./skb.toml` > `~/.config/skb/config.toml`）、全キー・バリデーション |
 | 1-3 | `error` モジュール | エラーコード体系、`thiserror` |
-| 1-4 | `db` モジュール | 組込み/リモート接続、`001_init.surql` テンプレート（`{DIM}` 埋め込み）、`meta` テーブル・モデル不整合検出（`E_MODEL_MISMATCH`） |
+| 1-4 | `db` モジュール | SurrealKV 組込み接続、`001_init.surql` テンプレート（`{DIM}` 埋め込み）、`meta` テーブル・モデル不整合検出（`E_MODEL_MISMATCH`）。リモート接続は v1 対象外 |
 | 1-5 | `tokenize` モジュール | `Tokenizer` トレイト定義 + 実装、チャンカー（見出し/段落/文境界優先） |
 | 1-6 | `embed` モジュール | `Embedder` トレイト定義 + ort 実装、HF DL、遅延ロード、バッチ推論、次元自動検出、テスト用モック |
 | 1-7 | `ingest` モジュール | 入力統一（path/url/content/base64/stdin）、テキスト抽出（txt/md/html）、SHA-256 重複排除、トランザクション保存、進捗コールバック |
@@ -98,7 +98,7 @@
 |---|---|---|
 | 5-1 | **契約テスト** | MCP ハンドラ経由・CLI 経由の同一 JSON リクエストでレスポンス一致を検証するゴールデンテスト。CI 必須化 |
 | 5-2 | クロスビルド | GitHub Actions で 4 ターゲット（linux-x64/arm64, darwin-arm64, win32-x64） |
-| 5-3 | npm パッケージ | メタパッケージ + プラットフォーム別 optionalDependencies、`bin/skb-mcp.js` ラッパ（依存ゼロ・spawn）、`libonnxruntime` 同梱 |
+| 5-3 | npm パッケージ | メタパッケージ + プラットフォーム別 optionalDependencies、`bin/skb-mcp.js` ラッパ（依存ゼロ・spawn）。ONNX Runtime は静的リンクし、共有ライブラリは同梱しない |
 | 5-4 | E2E（全 4 ターゲット） | `npm pack` → 各実機ランナーで `npx`/`bunx` スモークテスト |
 
 **Exit Criteria**: 契約テスト全緑。全 4 ターゲットの CI 実機 E2E が通ること。
@@ -159,8 +159,8 @@ Phase 3 (CLI) ──► Phase 4 (MCP) ──► Phase 5 (契約テスト+npm) �
 4. **プラットフォーム別 package.json テンプレート**（4 種すべてコミット済み）
 
 5. **CI 更新**
-   - ランナー: ubuntu-22.04 (x64), ubuntu-22.04-arm (arm64), macos-latest (arm64), windows-2022 (x64)
-   - RUSTFLAGS: linux `-static-libstdc++ -static-libgcc`, windows `-C target-feature=+crt-static`
+   - ランナー: ubuntu-24.04 (x64), ubuntu-24.04-arm (arm64), macos-latest (arm64), windows-2022 (x64)
+   - Linux: `CXXSTDLIB=""` と `-C link-arg=-l:libstdc++.a` で libstdc++ を静的リンク。libgcc_s は動的依存とする。Windows は ORT の要件に合わせて CRT を動的リンクする。
    - ビルド: `cargo build --release -p skb-mcp --features ort --target ...`
    - ~/.cache/ort.pyke.io の actions/cache キャッシュ
    - スモークテスト（linux-x64 ネイティブ）: ldd/objdump 検証 + npm pack/install + mock config で MCP initialize ハンドシェイク
@@ -176,3 +176,50 @@ Phase 3 (CLI) ──► Phase 4 (MCP) ──► Phase 5 (契約テスト+npm) �
 - `ldd target/release/skb-mcp`: libonnxruntime / libssl / libstdc++ 非含有
 - CI 全 4 ターゲットビルド + smoke test 通過
 - `cargo tree -i openssl-sys | grep "did not match"` 成功
+
+---
+
+## Phase 9: 仕様適合化と未実施機能（次フェーズ）
+
+Phase 0〜8 で確定した方針（`tokenizers`、SurrealKV 組込み、ORT 静的リンク）を前提に、仕様書の未実装項目を実装する。各項目は独立した変更として実装し、対応する回帰テストを同じ変更に含める。
+
+### 9-1: 設定・モデル整合性
+
+- `Config::validate()` を追加し、`0 < overlap_tokens < max_tokens <= max_input_tokens` を検証する。
+- CLI 引数、`SKB_*` 環境変数、`./skb.toml`、ユーザー設定の優先順位を実装する。
+- モデル設定から dimension と最大入力トークン数を検出し、明示設定との不一致を `E_VALIDATION` にする。
+- `KnowledgeBase::open` で model、dimension、max input tokens、tokenizer の `meta` を比較する。
+- **完了条件**: 不正設定、環境変数上書き、モデル不一致、dimension 不一致のテストが緑。
+
+### 9-2: Upload の安全性・原子性
+
+- ファイル、stdin、base64、URL の全入力に `upload.max_file_mb` を適用する。
+- URL は HTTP(S) のみ許可し、リダイレクト数と応答サイズを制限する。
+- base64 は任意バイナリとして保持し、形式に応じて PDF 等を抽出する。
+- document、chunk、entity、mentions と force 更新時の旧データ削除を一つのトランザクションで処理する。
+- 複数入力時は成功結果と `errors[]` を集約する。
+- **完了条件**: サイズ超過、SSRF 相当 URL、部分失敗、トランザクションロールバックのテストが緑。
+
+### 9-3: Tokenize・Graph・Search
+
+- `EntityExtractor` トレイトを追加し、WikiLink、Markdown リンク先、frontmatter の tags/aliases、見出し階層を抽出する。
+- Markdown の段落・文・見出し境界を優先した chunking と `Chunk.heading` 保存を実装する。
+- 検索結果に `title`、`source`、keyword の `highlights`、グラフ拡張時の `matched_entities` を追加する。
+- chunk → entity → related entity → chunk の N ホップ探索と、元スコア・距離を使った再ランクを実装する。
+- **完了条件**: 抽出、heading、N ホップ、再ランク、検索レスポンスの契約テストが緑。
+
+### 9-4: 共通 DTO・CRUD・CLI・MCP
+
+- Request/Response 型へ `JsonSchema` を derive し、MCP の手書き schema を共通型から生成する。
+- `skb_upload` の入力経路 one-of、graph query の `from` など必須条件を schema と実行時の双方で検証する。
+- list/delete の chunk 件数、削除対象不存在時の `E_DOCUMENT_NOT_FOUND` を実装する。
+- CLI の複数パス、glob、`graph entity add`、`query`、doctor JSON、進捗表示を仕様へ合わせる。
+- resource URI の不存在を MCP の resource-not-found として返す。
+- **完了条件**: CLI/MCP の同一 JSON 入出力、エラー形式、件数、進捗に関する契約テストが緑。
+
+### 9-5: Reindex・配布・E2E
+
+- reindex のトランザクション内でモデル関連 `meta` を更新し、モデル変更後に再起動できるようにする。
+- MCP progress notification と CLI progress bar を実装する。
+- 4 ターゲットの npm package 生成、`npm pack`、npx/bunx 起動、initialize → tools/list → upload → search の E2E を CI に追加する。
+- **完了条件**: `cargo check`、`cargo clippy`、`cargo fmt --check`、シリアルテスト、4 ターゲット build、Linux smoke、契約テストがすべて緑。
