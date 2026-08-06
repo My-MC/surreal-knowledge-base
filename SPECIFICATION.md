@@ -54,6 +54,10 @@ SurrealDB を **Vector DB / Graph DB / Document DB** の 3 用途に用いたロ
 | Skill | AI エージェントに CLI の使い方を教える指示書（`SKILL.md`） |
 | RRF | Reciprocal Rank Fusion。複数ランキングの統合手法 |
 
+### 1.5 本書の読み方
+
+本書は v1 の目標仕様であり、仕様に記載された機能がすべて実装済みであることを意味しない。現在の実装状況、対応するコード・テスト、未実装項目の優先順位は `IMPLEMENTATION_PLAN.md` で管理する。実装済みと明記されていない契約は、Phase 9 の完了条件を満たすまで実装予定として扱う。
+
 ---
 
 ## 2. システムアーキテクチャ
@@ -113,7 +117,7 @@ SurrealDB を **Vector DB / Graph DB / Document DB** の 3 用途に用いたロ
 ### 3.1 採用技術に関する既知の注意点（検証項目）
 
 - **トークナイザ**: gigatoken は crates.io 未公開・nightly Rust 必須（`portable_simd`, `profile-rustflags`）・pyo3 依存の重さによりビルドできず非採用（2026-07-29 検証）。`tokenizers` クレートを採用。`Tokenizer` トレイトでの抽象化により将来的な差し替えは可能。
-- **ONNX Runtime**: `ort` 2.0-rc の `download-binaries` 戦略により ONNX Runtime は**静的リンク**される（pyke.io の静的ライブラリ）。バイナリ単体で自己完結し、実行時の `libonnxruntime.so` は不要。TLS も全経路で rustls（ring / aws-lc-rs）を使用し、OpenSSL への動的依存はない。ランタイムの外部依存は libc (glibc ≥ 2.38), libz, libzstd のみ（ORT prebuilt 由来）。
+- **ONNX Runtime**: `ort` 2.0-rc の配布設定では、対象tripleごとに生成artifactの依存関係を検査して配布可否を判定する。Linux x64/arm64では`ldd`、macOS arm64では`otool -L`、Windows x64では依存DLL検査を行い、`libonnxruntime.so`、`.dylib`、`.dll`の要否と同梱有無を確認する。TLSは全経路でrustls（ring / aws-lc-rs）を使用し、OpenSSLへの動的依存はない。Linuxの実行時依存はglibc ≥ 2.38、libz、libzstd、libgcc_s、ca-certificates、Windowsの`/MD`バイナリはVisual C++ Redistributable for Visual Studio 2015--2022 (x64)を必要とする。各対象は証明書ストアを含むクリーン環境で起動し、npm配布artifactの検査結果をリリース記録に残す。
 - **SurrealDB Response::take()**: surrealdb 3.x のレスポンス取得では `meta::id()` などの明示的な投影が必要。`id` / `document` の直接選択や `value` フィールドは避ける。
 
 ---
@@ -194,9 +198,9 @@ DEFINE FIELD key   ON meta TYPE string;
 DEFINE FIELD meta_value ON meta TYPE string;
 DEFINE INDEX meta_key_unique ON meta FIELDS key UNIQUE;
 -- 記録キー: schema_version / embedding_model / embedding_dimension /
- --          embedding_max_input_tokens / tokenizer / tokenizer_source /
- --          tokenizer_algorithm / tokenizer_fingerprint_schema /
- --          tokenizer_fingerprint
+--          embedding_max_input_tokens / tokenizer / tokenizer_source /
+--          tokenizer_algorithm / tokenizer_fingerprint_schema /
+--          tokenizer_fingerprint
 ```
 
 ### 4.2 冪等性・重複排除
@@ -330,6 +334,8 @@ impl KnowledgeBase {
 - すべての Request/Response 型は `Serialize`/`Deserialize`/`JsonSchema` を derive し、**CLI の JSON 入出力と MCP ツールスキーマの双方をこの型から生成**する。
 - 非同期（`tokio`）。長時間処理（upload）は内部で進捗コールバックを受け取れる設計とし、MCP では progress notification、CLI ではプログレスバーへ写像する。
 
+上記は v1 の目標API契約である。共通 `JsonSchema`、進捗コールバック、CLI/MCPの同一DTOは Phase 9-2、9-6 の完了条件で検証する。
+
 ### 7.2 設定
 
 読み込み優先順位: フラグ/引数 > 環境変数（`SKB_*`）> プロジェクト `./skb.toml` > ユーザ `~/.config/skb/config.toml`。
@@ -363,6 +369,8 @@ rrf_k = 60
 max_file_mb = 100
 allowed_dirs = []                    # MCP経由の path アップロード許可ディレクトリ（空=無制限）
 ```
+
+リリース用の `ort` 有効バイナリでは `onnx_path = "auto"` により bge-m3 を既定とする。`onnx_path = "mock"` はテスト・開発用の明示設定であり、`ort` featureなしの高速ビルドで使用する。
 
 ---
 
@@ -514,7 +522,7 @@ skb doctor                          # DB・モデル・トークナイザの疎�
 
 1. **構造的保証**: 両アダプタが `skb-core` の同一メソッドを呼ぶ。アダプタへのロジック混入はレビューで禁止。
 2. **型の一元化**: 入出力型をコアで定義し、MCP スキーマ・CLI JSON を自動生成。
-3. **契約テスト**: 同一リクエスト JSON を MCP ハンドラ経由と CLI 経由の双方に投入し、レスポンスの JSON 一致を検証するゴールデンテストを CI で実行（§16）。
+3. **契約テスト（目標）**: 同一リクエスト JSON を MCP ハンドラ経由と CLI 経由の双方に投入し、レスポンスの JSON 一致を検証するゴールデンテストを CI で実行する。実装状況と不足するケースは `IMPLEMENTATION_PLAN.md` の Phase 9-6 に記載する（§16）。
 4. **リリースゲート**: 新機能追加時は本マトリクスの更新を必須とし、両アプローチの実装が揃うまでリリースしない。
 
 ---
@@ -662,10 +670,12 @@ bunx surreal-knowledge-base          # bun 経由
 
 ## 16. テスト計画
 
+以下は v1 の目標テスト計画である。現在のテスト配置・実行範囲は `IMPLEMENTATION_PLAN.md` の検証マトリクスを正とし、未実装のテストは完了扱いにしない。
+
 | 層 | 内容 | ツール |
 |---|---|---|
 | 単体 | チャンク化（`tokenizers` 実測 token_count と overlap の正しさ）、RRF、スキーマ CRUD | `cargo test` |
-| 統合 | 組込み SurrealDB で upload → search → delete の一連動作。bge-m3 は小型ダミー or 実モデルの量子化版で CI 実行 | `cargo test --features it` |
+| 統合 | 組込み SurrealDB で upload → search → delete の一連動作。bge-m3 は小型ダミー or 実モデルの量子化版で CI 実行 | `cargo test --workspace -- --test-threads=1`（目標: 実モデルE2Eを追加） |
 | 契約（パリティ） | §11.2-3。同一 JSON リクエストを MCP/CLI 両経路で実行し応答を比較 | ゴールデンファイル |
 | E2E | `npm pack` したパッケージを `npx` / `bunx` で起動し、initialize→tools/list→skb_upload→skb_search が通ることを検証 | シェルスクリプト + CI |
 | ベンチ | `tokenizers` のトークナイズ速度、Embedding スループット、検索レイテンシ | `criterion` |
@@ -694,6 +704,7 @@ surreal-knowledge-base/
 │   ├── skb-core/                 # 共有コア（本仕様の実体）
 │   │   └── src/{config,db,ingest,embed,tokenize,search,graph,error}.rs
 │   ├── skb-cli/                  # CLI（clap）
+│   │   └── tests/contract.rs     # 現在のCLI契約テスト
 │   └── skb-mcp/                  # MCP サーバー（rmcp）
 ├── npm/
 │   ├── package.json              # メタパッケージ
@@ -704,24 +715,23 @@ surreal-knowledge-base/
 │       └── SKILL.md
 ├── schema/
 │   └── 001_init.surql            # §4.1 のマイグレーション（次元数は初期化時に設定値から埋め込むテンプレート）
-├── tests/
-│   ├── contract/                 # パリティ用ゴールデンテスト
-│   └── e2e/
 ├── .github/workflows/            # build / test / npm publish
 └── SPECIFICATION.md              # 本書
 ```
+
+MCP/CLIのゴールデン契約テストとnpm E2E用の専用ディレクトリは、Phase 9-6/9-7で追加する。
 
 ---
 
 ## 18. マイルストーン
 
-| MS | 内容 | 完了条件 |
-|---|---|---|
-| M1 | `skb-core` + CLI（upload/search/list/get/delete/stats、組込み DB） | CLI 統合テスト緑 |
-| M2 | `skb-mcp` + npm パッケージ化（linux-x64/darwin-arm64 先行） | `npx`/`bunx` E2E 緑 |
-| M3 | Skill 整備 + 契約テストによるパリティ CI 化 | マトリクス全項目 ✅ |
-| M4 | グラフ強化（抽出ルール拡充、グラフ拡張検索の再ランク精度評価） | 評価レポート |
-| M5 | 性能チューニング・win32 対応・docx 対応（v2 スコープ判断） | 性能目標達成 |
+| MS | 内容 | 完了条件 | 状態 |
+|---|---|---|---|
+| M1 | `skb-core` + CLI（upload/search/list/get/delete/stats、組込み DB） | CLI 統合テスト緑 | 部分完了 |
+| M2 | `skb-mcp` + npm パッケージ化（linux-x64/darwin-arm64 先行） | `npx`/`bunx` E2E 緑 | 部分完了 |
+| M3 | Skill 整備 + 契約テストによるパリティ CI 化 | マトリクス全項目 ✅ | 部分完了 |
+| M4 | グラフ強化（抽出ルール拡充、グラフ拡張検索の再ランク精度評価） | 評価レポート | 未着手 |
+| M5 | 性能チューニング・docx 対応（v2 スコープ判断） | 性能目標達成 | 未着手 |
 
 ---
 
