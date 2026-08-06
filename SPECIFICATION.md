@@ -117,7 +117,7 @@ SurrealDB を **Vector DB / Graph DB / Document DB** の 3 用途に用いたロ
 ### 3.1 採用技術に関する既知の注意点（検証項目）
 
 - **トークナイザ**: gigatoken は crates.io 未公開・nightly Rust 必須（`portable_simd`, `profile-rustflags`）・pyo3 依存の重さによりビルドできず非採用（2026-07-29 検証）。`tokenizers` クレートを採用。`Tokenizer` トレイトでの抽象化により将来的な差し替えは可能。
-- **ONNX Runtime**: `ort` 2.0-rc の `download-binaries` 戦略により ONNX Runtime は**静的リンク**される（pyke.io の静的ライブラリ）。バイナリ単体で自己完結し、実行時の `libonnxruntime.so` は不要。TLS も全経路で rustls（ring / aws-lc-rs）を使用し、OpenSSL への動的依存はない。Linux の実行時依存は glibc ≥ 2.38、libz、libzstd、libgcc_s、ca-certificates。Windows の `/MD` バイナリには Visual C++ Redistributable for Visual Studio 2015--2022 (x64) が必要。
+- **ONNX Runtime**: `ort` 2.0-rc の配布設定では、対象tripleごとに生成artifactの依存関係を検査して配布可否を判定する。Linux x64/arm64では`ldd`、macOS arm64では`otool -L`、Windows x64では依存DLL検査を行い、`libonnxruntime.so`、`.dylib`、`.dll`の要否と同梱有無を確認する。TLSは全経路でrustls（ring / aws-lc-rs）を使用し、OpenSSLへの動的依存はない。Linuxの実行時依存はglibc ≥ 2.38、libz、libzstd、libgcc_s、ca-certificates、Windowsの`/MD`バイナリはVisual C++ Redistributable for Visual Studio 2015--2022 (x64)を必要とする。各対象は証明書ストアを含むクリーン環境で起動し、npm配布artifactの検査結果をリリース記録に残す。
 - **SurrealDB Response::take()**: surrealdb 3.x のレスポンス取得では `meta::id()` などの明示的な投影が必要。`id` / `document` の直接選択や `value` フィールドは避ける。
 
 ---

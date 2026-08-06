@@ -50,7 +50,7 @@
 | 6 | Skill | 部分完了 | 実装済みレスポンスとSkillの引用・エラー説明の同期が必要 |
 | 7 | 仕上げ | 進行中 | ベンチ結果の判定、日本語FTS評価、公開手順の整理が必要 |
 | 8 | ort有効バイナリ + 依存最小化 | 部分完了 | CI証跡と生成artifactの扱い、Windows runtime案内のE2Eが必要 |
-| 9 | 仕様適合化と未実施機能 | 未着手 | 本書のPhase 9-1〜9-7を順に実装する。既存の部分実装は完了条件を満たすまで未完了とする |
+| 9 | 仕様適合化と未実施機能 | 部分完了 | 本書のPhase 9-1〜9-7を順に実装する。既存の部分実装は完了条件を満たすまで未完了とする |
 
 ### 現状検証マトリクス
 
@@ -179,7 +179,7 @@ Phase 3 (CLI) ──► Phase 4 (MCP) ──► Phase 5 (契約テスト+npm) �
 
 ### 目標
 - ort feature を有効にした self-contained バイナリを全 4 プラットフォームでビルドし npm 配布可能にする
-- 外部動的依存（OpenSSL, libstdc++）を排除し、Linux ランタイム要件を glibc + libz + libzstd + libgcc_s に限定する。Windows は `/MD` のVisual C++ Redistributableを前提とする。
+- 外部動的依存（OpenSSL, libstdc++）を排除し、Linux ランタイム要件を glibc >= 2.38 + libz + libzstd + libgcc_s + ca-certificates とする。Windows は `/MD` のVisual C++ Redistributableを前提とする。
 
 ### 実施内容
 
@@ -205,7 +205,8 @@ Phase 3 (CLI) ──► Phase 4 (MCP) ──► Phase 5 (契約テスト+npm) �
    - Windows の `/MD` バイナリは `MSVCP140.dll`、`MSVCP140_1.dll`、`VCRUNTIME140.dll`、`VCRUNTIME140_1.dll` を必要とする。これらは npm パッケージへ同梱せず、Visual C++ Redistributable for Visual Studio 2015--2022 (x64) の事前インストールをリリース手順と実行時エラーで案内する。
    - ビルド: `cargo build --release -p skb-mcp --features ort --target ...`
    - ~/.cache/ort.pyke.io の actions/cache キャッシュ
-   - スモークテスト（linux-x64 ネイティブ）: ldd/objdump 検証 + npm pack/install + mock config で MCP initialize ハンドシェイク
+    - スモークテスト（linux-x64 ネイティブ）: ldd/objdump 検証 + npm pack/install + mock config で MCP initialize ハンドシェイク
+    - 対象別検証: Linux x64/arm64 は `ldd`、macOS arm64 は `otool -L`、Windows x64 は依存DLL検査で `libonnxruntime.so`/`.dylib`/`.dll` の要否を確認し、各artifactをクリーン環境で起動する。Linuxではglibc >= 2.38、ca-certificates、WindowsではVisual C++ Redistributableを検証する。
 
 6. **ドキュメント更新**
    - SPECIFICATION.md §3.1/§13.1/§13.4: ort 静的リンクの実態に合わせて書き換え + ランタイム要件表
@@ -229,7 +230,7 @@ Phase 0〜8 で確定した方針（`tokenizers`、SurrealKV 組込み、ORT 静
 
 ### 9-1: 設定・モデル・tokenizer整合性（部分完了）
 
-- `Config::validate()` で `0 < overlap_tokens < max_tokens <= max_input_tokens` を検証する。
+- `KnowledgeBase::open` は明示設定か自動検出かを保持したまま、`max_input_tokens = 0` をモデル設定から解決し、dimension/max inputを正規化してから `Config::validate()` の `0 < overlap_tokens < max_tokens <= max_input_tokens` を適用する。明示値とモデル値が不一致の場合は `E_VALIDATION` とする。
 - CLI引数、`SKB_*`環境変数、`./skb.toml`、ユーザー設定の優先順位を実装する。
 - モデル設定からdimensionと最大入力トークン数を検出し、明示設定との不一致を`E_VALIDATION`にする。
 - `embedding.tokenizer` の明示パスと`"auto"`を同じ解決経路として扱い、取得元、`tokenizers`のアルゴリズム/バージョン、対象構成をcanonical JSON serializationしてSHA-256 fingerprintを作成する。
@@ -247,10 +248,11 @@ Phase 0〜8 で確定した方針（`tokenizers`、SurrealKV 組込み、ORT 静
 
 - ファイル、stdin、base64、inline、URLの全入力に`upload.max_file_mb`を適用し、decode/extract前後のサイズを検査する。
 - base64は任意バイナリとして保持し、MIME/拡張子に応じてPDF等を抽出する。未対応形式は`E_UNSUPPORTED_FORMAT`で拒否する。
-- URLはHTTP(S)のみ許可し、redirect数、受信ストリーム、DNS解決後のprivate/reserved、loopback、link-local、multicast、metadata IPを検証する。各redirectでURL/IPを再検証する。
+- URLはHTTP(S)のみ許可し、redirect数、受信ストリーム、DNS解決後のprivate/reserved、loopback、link-local、multicast、metadata IPを検証する。検証済みIPへの接続固定または同一のDNS解決結果を使うresolver/connectorを用い、各redirectでもURL検証から接続まで同じ対策を適用する。
+- 入力ストリーム、base64 decoded data、展開後データ、抽出出力、処理時間、メモリ、PDFページ数、圧縮/抽出のネスト深度に上限を設け、上限到達時は直ちに停止する。上限はdecode/extract前後の検査だけに依存しない。
 - document、chunk、entity、mentions、force更新時の旧データ削除を一つのトランザクションで処理する。
 - 複数入力時は成功結果と`errors[]`を集約し、一件の失敗で全体を中断しない。
-- **完了条件**: サイズ超過、decode/extract爆弾、SSRF、redirect再検証、未対応形式、部分失敗、rollbackのテストが緑。
+- **完了条件**: サイズ超過base64、圧縮爆弾、PDF爆弾、decode/extractの時間・メモリ・ページ・ネスト上限、DNS rebinding、redirect再検証、未対応形式、部分失敗、rollbackのテストが緑。
 
 ### 9-4: Chunk・Graph・Search（部分完了）
 
@@ -262,6 +264,7 @@ Phase 0〜8 で確定した方針（`tokenizers`、SurrealKV 組込み、ORT 静
 
 ### 9-5: Reindex・進捗（部分完了）
 
+- `KnowledgeBase::open` は `Db::migrate` より前に保存済みの `embedding_model` と `embedding_dimension` を現在値と比較し、mismatch時は `E_MODEL_MISMATCH` を返してschema、field、index、metaを変更しない。dimension変更はreindex経路でのみ実施し、migrateはモデル一致時または本当に不足している定義への適用に限る。
 - reindexを起動時のmodel mismatch状態から実行できる管理経路を用意する。
 - dimension変更時に`chunk.embedding`フィールドとHNSWインデックスを再定義し、旧chunk/mentions削除、新chunk/entity索引、model metadata更新を同一transaction境界で処理する。
 - 中断時は旧schema、旧chunk、旧metaを維持し、再起動後も整合性を検証する。
@@ -280,6 +283,6 @@ Phase 0〜8 で確定した方針（`tokenizers`、SurrealKV 組込み、ORT 静
 
 - 4ターゲットのnpm package生成、`npm pack`、npx/bunx起動を検証する。
 - `initialize → tools/list → skb_upload → skb_search`をlinux-x64 smokeと各ターゲットE2Eで検証する。
-- WindowsのVisual C++ Redistributable prerequisiteと、Linuxの動的依存をartifactごとに検証する。
+- Linux x64/arm64、macOS arm64、Windows x64の各artifactについて、Linuxは`ldd`、macOSは`otool -L`、Windowsは依存DLL検査を実行し、ORT共有ライブラリの同梱要否、OSランタイム、証明書ストアを確認する。各対象をクリーン環境で起動し、WindowsのVisual C++ Redistributable prerequisiteとLinuxのglibc >= 2.38 + ca-certificatesを検証する。
 - `cargo check`、`cargo clippy`、`cargo fmt --check`、シリアルテスト、契約テストをCIのリリースゲートに追加する。
-- **完了条件**: 4ターゲットbuild、npm pack/install、npx/bunx、MCP upload/search、runtime dependency検証がすべて緑。
+- **完了条件**: 4ターゲットbuild、npm pack/install、npx/bunx、MCP upload/search、各対象のruntime dependency・証明書ストア・クリーン環境起動検証がすべて緑。
