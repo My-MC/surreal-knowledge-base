@@ -65,7 +65,7 @@ SurrealDB を **Vector DB / Graph DB / Document DB** の 3 用途に用いたロ
 │   AIエージェント等     │      │   AIエージェント      │
 │  (MCPクライアント)     │      │  (opencode等) + Skill │
 └──────────┬───────────┘      └──────────┬───────────┘
-           │ MCP (stdio/HTTP)            │ シェル実行
+           │ MCP (stdio)                 │ シェル実行
            ▼                             ▼
 ┌──────────────────────┐      ┌──────────────────────┐
 │  skb-mcp (Rust)      │      │  skb CLI (Rust)      │
@@ -78,18 +78,18 @@ SurrealDB を **Vector DB / Graph DB / Document DB** の 3 用途に用いたロ
               │   skb-core (Rust lib)  │   ← 全機能の実体（共有コア）
               │  ingest/search/graph/… │
               └───┬────────┬────────┬──┘
-                  ▼        ▼        ▼
-        ┌────────────┐┌─────────┐┌─────────────┐
-        │ SurrealDB  ││gigatoken││ BAAI/bge-m3 │
-        │ (Vector/   ││(Rust)   ││ (ONNX, ort) │
-        │ Graph/Doc) │└─────────┘└─────────────┘
+                   ▼        ▼        ▼
+         ┌────────────┐┌─────────────┐┌─────────────┐
+         │ SurrealDB  ││ tokenizers  ││ BAAI/bge-m3 │
+         │ (Vector/   ││ (Rust/HF)   ││ (ONNX, ort) │
+         │ Graph/Doc) │└─────────────┘└─────────────┘
         └────────────┘
 ```
 
 ### 2.2 設計方針
 
 1. **単一コア（Single Core）**: `skb-mcp` と `skb` CLI は `skb-core` の公開 API を呼ぶだけのアダプタ。機能は必ずコアに実装し、アダプタ側に独自ロジックを持たせない。
-2. **ローカルファースト**: デフォルトは SurrealDB 組込みモード（SurrealKV）で、外部サーバー不要。リモート SurrealDB への接続も設定で切替可能。
+2. **ローカルファースト**: v1 は SurrealDB 組込みモード（SurrealKV）のみを対象とし、外部サーバーを不要とする。リモート SurrealDB 接続は将来拡張とする。
 3. **決定的な同一入出力**: コアのリクエスト/レスポンス型を serde + schemars で定義し、CLI の JSON 出力と MCP ツールの入出力スキーマを同一型から生成する。
 
 ---
@@ -113,7 +113,7 @@ SurrealDB を **Vector DB / Graph DB / Document DB** の 3 用途に用いたロ
 ### 3.1 採用技術に関する既知の注意点（検証項目）
 
 - **トークナイザ**: gigatoken は crates.io 未公開・nightly Rust 必須（`portable_simd`, `profile-rustflags`）・pyo3 依存の重さによりビルドできず非採用（2026-07-29 検証）。`tokenizers` クレートを採用。`Tokenizer` トレイトでの抽象化により将来的な差し替えは可能。
-- **ONNX Runtime**: `ort` 2.0-rc の `download-binaries` 戦略により ONNX Runtime は**静的リンク**される（pyke.io の静的ライブラリ）。バイナリ単体で自己完結し、実行時の `libonnxruntime.so` は不要。TLS も全経路で rustls（ring / aws-lc-rs）を使用し、OpenSSL への動的依存はない。ランタイムの外部依存は libc (glibc ≥ 2.35), libz, libzstd のみ（ORT prebuilt 由来）。
+- **ONNX Runtime**: `ort` 2.0-rc の `download-binaries` 戦略により ONNX Runtime は**静的リンク**される（pyke.io の静的ライブラリ）。バイナリ単体で自己完結し、実行時の `libonnxruntime.so` は不要。TLS も全経路で rustls（ring / aws-lc-rs）を使用し、OpenSSL への動的依存はない。ランタイムの外部依存は libc (glibc ≥ 2.38), libz, libzstd のみ（ORT prebuilt 由来）。
 - **SurrealDB Response::take()**: surrealdb 3.x のレスポンス取得では `meta::id()` などの明示的な投影が必要。`id` / `document` の直接選択や `value` フィールドは避ける。
 
 ---
@@ -194,7 +194,9 @@ DEFINE FIELD key   ON meta TYPE string;
 DEFINE FIELD meta_value ON meta TYPE string;
 DEFINE INDEX meta_key_unique ON meta FIELDS key UNIQUE;
 -- 記録キー: schema_version / embedding_model / embedding_dimension /
---          embedding_max_input_tokens / tokenizer
+ --          embedding_max_input_tokens / tokenizer / tokenizer_source /
+ --          tokenizer_algorithm / tokenizer_fingerprint_schema /
+ --          tokenizer_fingerprint
 ```
 
 ### 4.2 冪等性・重複排除
@@ -209,18 +211,18 @@ DEFINE INDEX meta_key_unique ON meta FIELDS key UNIQUE;
 入力(ファイル/URL/テキスト/stdin/base64)
   → ① 取得・形式判定          … MIME/拡張子で分岐
   → ② テキスト抽出            … プレーンテキスト化（Markdown構造は保持）
-  → ③ チャンク化              … gigatoken でトークン単位分割
+  → ③ チャンク化              … tokenizers でトークン単位分割
   → ④ 埋め込み                … bge-m3 (ONNX) で dense ベクトル化
   → ⑤ 保存                    … document + chunk をトランザクションで保存
   → ⑥ グラフ構築              … エンティティ抽出（ルールベース）→ RELATE
 ```
 
-### 5.1 チャンク化（gigatoken）
+### 5.1 チャンク化（tokenizers）
 
-- トークナイザ: **BAAI/bge-m3 と同一のトークナイザ**（XLM-RoBERTa 系）を gigatoken でロードし、埋め込みモデルの語彙と完全に一致したトークン数で分割する。
+- トークナイザ: **BAAI/bge-m3 と同一の tokenizer.json**（XLM-RoBERTa 系）を HuggingFace 公式の `tokenizers` クレートでロードし、埋め込みモデルの語彙と一致したトークン数で分割する。
 - 既定値: `max_tokens = 512`、`overlap_tokens = 64`。いずれも **設定ファイルで変更可能**（§5.4）。`max_tokens` は使用中モデルの最大入力トークン数以下であれば任意に設定できる。
 - 分割方針: 見出し・段落・文境界を優先しつつ、`max_tokens` を超えない範囲で結合。どうしても超える場合はトークン境界でハード分割。
-- `token_count` は gigatoken のエンコード結果から実測して記録。
+- `token_count` は `tokenizers` のエンコード結果から実測して記録する。
 
 ### 5.2 埋め込み（BAAI/bge-m3）
 
@@ -265,6 +267,7 @@ LLM 抽出は `EntityExtractor` トレイトの差し替え実装として将来
 
 1. `0 < overlap_tokens < max_tokens ≤ max_input_tokens` を検証。違反時は `E_VALIDATION`。
 2. `meta` テーブルに記録された `embedding_model` / `embedding_dimension` と設定値を比較。**不一致のまま通常操作は行わず** `E_MODEL_MISMATCH` を返し、再構築（`reindex`）を案内する。これにより、異なる次元・語彙のベクトルが同一インデックスに混在することを防ぐ。
+3. `embedding.tokenizer` は明示パスと `"auto"`（`embedding.model` に対応する tokenizer.json の解決）のどちらでも、同じ tokenizer 識別子契約を適用する。tokenizer.json の存在と形式を検証し、取得元（モデル ID と revision、または明示パス）、`tokenizers` のアルゴリズム/バージョン、vocabulary、normalizer、pre-tokenizer、post-processor、decoder、その他の構成情報を canonical JSON serialization した上で SHA-256 fingerprint を生成する。fingerprint には schema version を含め、canonicalization 規則と対象フィールドを変更する場合は schema version を更新する。解決した tokenizer の取得元、アルゴリズム/バージョン、fingerprint schema version、fingerprint を `meta` に保存し、既存値と不一致の場合は `E_MODEL_MISMATCH` を返して再構築（`reindex`）を案内する。新規作成時・reindex 完了時には、明示パスと `auto` の両方を含むすべての解決経路で同じ tokenizer metadata を保存する。
 
 #### 変更手順（reindex）
 
@@ -333,18 +336,15 @@ impl KnowledgeBase {
 
 ```toml
 [storage]
-mode = "embedded"                    # embedded | remote
+mode = "embedded"                    # v1 は embedded（SurrealKV）のみ
 path = "~/.local/share/skb/db"       # embedded: SurrealKV データディレクトリ
-# url = "ws://127.0.0.1:8000"        # remote 時
-# username = "root"
-# password = "root"
 namespace = "skb"
 database = "knowledge"
 
 [embedding]
 model = "BAAI/bge-m3"                # Embedding モデル（HF ID or ローカルパス）。変更はこのキーを編集（§5.4）
 onnx_path = "auto"                   # "auto"=HFキャッシュ / 明示パス可
-tokenizer = "auto"                   # "auto"=モデルに追随（gigatoken でロード）/ 明示指定も可
+tokenizer = "auto"                   # "auto"=モデルに追随（tokenizers でロード）/ 明示指定も可
 dimension = 0                        # 埋め込み次元数。0=モデルから自動検出（bge-m3 は 1024）
 max_input_tokens = 0                 # モデルのコンテキスト長上限。0=モデル設定から自動検出（bge-m3 は 8192）
 device = "cpu"
@@ -373,10 +373,12 @@ allowed_dirs = []                    # MCP経由の path アップロード許�
 | 項目 | 内容 |
 |---|---|
 | 実装 | Rust バイナリ `skb-mcp`（`rmcp` 使用） |
-| トランスポート | stdio（既定） |
+| トランスポート | stdio（唯一。HTTP は将来拡張） |
 | 起動方法 | `npx surreal-knowledge-base` / `bunx surreal-knowledge-base` / バイナリ直接実行 |
 | ログ | **stderr のみ**（stdio 運用時に stdout を汚染しない） |
 | 終了コード | 0 正常 / 1 起動失敗 |
+
+v1 では stdio トランスポートのみを提供する。HTTP トランスポートは将来拡張とし、v1 の機能パリティおよび配布検証の対象外とする。
 
 ### 8.2 ツール一覧
 
@@ -450,6 +452,7 @@ skb delete <id> [--yes]
 skb graph query --from <entity-or-doc> [--relation R] [--depth N]
 skb graph entity add <name> --kind K [--description S]
 skb graph link <from> <to> [--relation R] [--weight F]
+skb query <surql>                    # 上級者向け。MCP では非公開
 skb stats
 skb reindex [--dry-run]             # モデル/チャンク設定変更の全件反映（§5.4）
 skb config init | show | set <key> <value>
@@ -594,26 +597,31 @@ esbuild / Biome と同様の **プラットフォーム別バイナリ + optiona
 
 - `ort` 2.0-rc の `download-binaries` 戦略により ONNX Runtime は静的リンクされる。共有ライブラリの同梱は不要。
 - TLS は全経路で rustls（ring / aws-lc-rs）を使用。OpenSSL は実行時に一切不要。
-- libstdc++ / libgcc_s もビルド時に静的リンク（`-static-libstdc++ -static-libgcc`）。
+- libstdc++ はビルド時に静的リンクし、libgcc_s は動的依存とする（Linux CI では `CXXSTDLIB=""` と `-C link-arg=-l:libstdc++.a` を使用）。
 - モデル（bge-m3 ONNX ~2GB）は **npm には同梱せず** 初回起動時に HF から DL。
 
 **Linux ランタイム要件**:
 
 | 依存 | 理由 |
 |---|---|
-| glibc ≥ 2.35 | ビルドランナー（ubuntu-22.04）のABIフロア |
+| glibc ≥ 2.38 | ビルドランナー（ubuntu-24.04）と ORT prebuilt の ABI フロア |
 | libz | ORT prebuilt 静的ライブラリの動的依存 |
 | libzstd | 同上 |
+| libgcc_s | Rust の unwinding / GCC runtime（Linux ビルドで動的リンク） |
 | ca-certificates | hf-hub の TLS 証明書検証（ureq 側は webpki-roots 埋め込み済み） |
 
-macOS / Windows は OS 付属以外の動的依存なし（Windows は CRT 静的化で standalone .exe）。
+macOS は OS 付属以外の動的依存なし。Windows の `/MD` バイナリは、実際のビルドで
+`MSVCP140.dll`、`MSVCP140_1.dll`、`VCRUNTIME140.dll`、`VCRUNTIME140_1.dll`
+を import する。これらは Microsoft Visual C++ Redistributable for Visual Studio 2015--2022
+(x64) に含まれるため、npm パッケージには DLL を同梱せず、利用者が実行前に Redistributable
+をインストールする責任を負う。リリース手順と実行時エラーメッセージでは、この前提と
+Microsoft の公式インストーラを明示する。
 
 ### 13.5 実行方法
 
 ```bash
 npx  surreal-knowledge-base          # npm 経由で MCP サーバー起動（stdio）
 bunx surreal-knowledge-base          # bun 経由
-bunx surreal-knowledge-base --http --port 8787   # HTTP モード
 ```
 
 ---
@@ -648,7 +656,7 @@ bunx surreal-knowledge-base --http --port 8787   # HTTP モード
 - MCP 経由の `path` アップロードは `upload.allowed_dirs` 設定時にディレクトリ外参照を拒否（パストラバーサル対策）。
 - 生 SurrealQL は MCP には公開しない（CLI のみ・明示コマンド）。
 - URL 取得は HTTP(S) のみ許可、リダイレクト上限・サイズ上限を設定。`file://` 等のスキームは拒否（SSRF 緩和）。
-- 認証情報（リモート SurrealDB のパスワード等）は設定ファイルのパーミッション 600 を推奨し、環境変数での上書きを可能にする。
+- 将来リモート接続を追加する場合は、認証情報を設定ファイルのパーミッション 600 と環境変数で保護する。
 
 ---
 
@@ -656,11 +664,11 @@ bunx surreal-knowledge-base --http --port 8787   # HTTP モード
 
 | 層 | 内容 | ツール |
 |---|---|---|
-| 単体 | チャンク化（トークン数が gigatoken 実測と一致、overlap 正しい）、RRF、スキーマ CRUD | `cargo test` |
+| 単体 | チャンク化（`tokenizers` 実測 token_count と overlap の正しさ）、RRF、スキーマ CRUD | `cargo test` |
 | 統合 | 組込み SurrealDB で upload → search → delete の一連動作。bge-m3 は小型ダミー or 実モデルの量子化版で CI 実行 | `cargo test --features it` |
 | 契約（パリティ） | §11.2-3。同一 JSON リクエストを MCP/CLI 両経路で実行し応答を比較 | ゴールデンファイル |
 | E2E | `npm pack` したパッケージを `npx` / `bunx` で起動し、initialize→tools/list→skb_upload→skb_search が通ることを検証 | シェルスクリプト + CI |
-| ベンチ | トークナイズ速度（gigatoken、SentencePiece 系の実測）、Embedding スループット、検索レイテンシ | `criterion` |
+| ベンチ | `tokenizers` のトークナイズ速度、Embedding スループット、検索レイテンシ | `criterion` |
 
 ### 16.1 性能目標（初版目標・要検証）
 
@@ -721,8 +729,8 @@ surreal-knowledge-base/
 
 | # | 項目 | 影響 | 対応方針 |
 |---|---|---|---|
-| 1 | gigatoken の SentencePiece（XLM-R）系の実測性能・互換性 | チャンク化の速度 | M1 早期にベンチ。問題時は `tokenizers` クレートへ feature flag 切替（トレイト抽象化済み） |
-| 2 | onnxruntime 同梱による npm パッケージサイズ増 | 配布 | CPU 版最小構成で同梱。超過時は postinstall ダウンロード方式へ変更 |
+| 1 | `tokenizers` と bge-m3 tokenizer.json の互換性・実測性能 | チャンク化の速度と token_count の正確性 | M1 でベンチと互換性テストを実施。問題時は Tokenize トレイトの差し替え実装を検討 |
+| 2 | ORT 静的リンクによる npm パッケージサイズ増 | 配布 | CPU 版最小構成で静的リンク。超過時は postinstall ダウンロード方式を検討 |
 | 3 | SurrealDB FTS の日本語品質 | keyword/hybrid 精度 | `class` + lowercase を採用。ngram は BM25 の単語・複合語精度を低下させるため不使用 |
 | 4 | bge-m3 初回 DL のサイズ（約 2GB 級） | 初回 UX | `skb doctor` で進捗表示付き事前 DL を案内。量子化版 ONNX の採用も検討 |
 | 5 | PDF 抽出クレートの選定 | v1 スコープ | M1 で `pdf-extract` を検証し不十分なら代替選定 |
