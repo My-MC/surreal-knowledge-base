@@ -205,8 +205,8 @@ Phase 3 (CLI) ──► Phase 4 (MCP) ──► Phase 5 (契約テスト+npm) �
    - Windows の `/MD` バイナリは `MSVCP140.dll`、`MSVCP140_1.dll`、`VCRUNTIME140.dll`、`VCRUNTIME140_1.dll` を必要とする。これらは npm パッケージへ同梱せず、Visual C++ Redistributable for Visual Studio 2015--2022 (x64) の事前インストールをリリース手順と実行時エラーで案内する。
    - ビルド: `cargo build --release -p skb-mcp --features ort --target ...`
    - ~/.cache/ort.pyke.io の actions/cache キャッシュ
-    - スモークテスト（linux-x64 ネイティブ）: ldd/objdump 検証 + npm pack/install + mock config で MCP initialize ハンドシェイク
-    - 対象別検証: Linux x64/arm64 は `ldd`、macOS arm64 は `otool -L`、Windows x64 は依存DLL検査で `libonnxruntime.so`/`.dylib`/`.dll` の要否を確認し、各artifactをクリーン環境で起動する。Linuxではglibc >= 2.38、ca-certificates、WindowsではVisual C++ Redistributableを検証する。
+   - スモークテスト（linux-x64 ネイティブ）: ldd/objdump 検証 + npm pack/install + mock config で MCP initialize ハンドシェイク
+   - 対象別検証: Linux x64/arm64 は `ldd`、macOS arm64 は `otool -L`、Windows x64 は依存DLL検査で `libonnxruntime.so`/`.dylib`/`.dll` の要否を確認し、各artifactをクリーン環境で起動する。Linuxではglibc >= 2.38、ca-certificates、WindowsではVisual C++ Redistributableを検証する。
 
 6. **ドキュメント更新**
    - SPECIFICATION.md §3.1/§13.1/§13.4: ort 静的リンクの実態に合わせて書き換え + ランタイム要件表
@@ -217,9 +217,9 @@ Phase 3 (CLI) ──► Phase 4 (MCP) ──► Phase 5 (契約テスト+npm) �
 - `cargo test --workspace -- --test-threads=1` はCIで実行済み。Phase 9変更時もシリアル実行を継続する。
 - `cargo build --release -p skb-mcp --features ort` 成功
 - `ldd target/release/skb-mcp`: libonnxruntime / libssl / libstdc++ 非含有
-- CI 全 4 ターゲットビルド + smoke test 通過
+- CI run [31079912794](https://github.com/My-MC/surreal-knowledge-base/actions/runs/31079912794)（commit `50d83d9`）で、4ターゲットのbuild matrix（`npm-linux-x64`、`npm-linux-arm64`、`npm-darwin-arm64`、`npm-win32-x64`）を実行する。生成artifact名は各`pkg`に対応する`npm-<pkg>`である。
+- 現行CIのsmokeは生成artifactのうち`npm-linux-x64`だけを使用し、`ldd`、`objdump`、npm pack/install、MCP `initialize`を検証する。他のtargetの`otool -L`、依存DLL、クリーン環境起動、`tools/list → upload → search`、bunx、Windows runtime prerequisiteはPhase 9-7で追加する。
 - `cargo tree -i openssl-sys | grep "did not match"` 成功
-- 現在のsmoke testはlinux-x64のinitialize handshakeまでであり、`tools/list → upload → search`、bunx、Windows runtime prerequisiteの検証はPhase 9-7で追加する。
 - CIで生成される4ターゲットartifactと、リポジトリに存在するpackage.jsonテンプレートを区別して記録する。
 
 ---
