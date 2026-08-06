@@ -65,7 +65,7 @@ SurrealDB を **Vector DB / Graph DB / Document DB** の 3 用途に用いたロ
 │   AIエージェント等     │      │   AIエージェント      │
 │  (MCPクライアント)     │      │  (opencode等) + Skill │
 └──────────┬───────────┘      └──────────┬───────────┘
-           │ MCP (stdio/HTTP)            │ シェル実行
+           │ MCP (stdio)                 │ シェル実行
            ▼                             ▼
 ┌──────────────────────┐      ┌──────────────────────┐
 │  skb-mcp (Rust)      │      │  skb CLI (Rust)      │
@@ -376,6 +376,8 @@ allowed_dirs = []                    # MCP経由の path アップロード許�
 | ログ | **stderr のみ**（stdio 運用時に stdout を汚染しない） |
 | 終了コード | 0 正常 / 1 起動失敗 |
 
+v1 では stdio トランスポートのみを提供する。HTTP トランスポートは将来拡張とし、v1 の機能パリティおよび配布検証の対象外とする。
+
 ### 8.2 ツール一覧
 
 全ツールの入出力は `skb-core` の型から生成した JSON Schema に従う。
@@ -448,6 +450,7 @@ skb delete <id> [--yes]
 skb graph query --from <entity-or-doc> [--relation R] [--depth N]
 skb graph entity add <name> --kind K [--description S]
 skb graph link <from> <to> [--relation R] [--weight F]
+skb query <surql>                    # 上級者向け。MCP では非公開
 skb stats
 skb reindex [--dry-run]             # モデル/チャンク設定変更の全件反映（§5.4）
 skb config init | show | set <key> <value>

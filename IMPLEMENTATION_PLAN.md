@@ -217,6 +217,7 @@ Phase 0〜8 で確定した方針（`tokenizers`、SurrealKV 組込み、ORT 静
 - `skb_upload` の入力経路 one-of、graph query の `from` など必須条件を schema と実行時の双方で検証する。
 - list/delete の chunk 件数、削除対象不存在時の `E_DOCUMENT_NOT_FOUND` を実装する。
 - CLI の複数パス、glob、`graph entity add`、`query`、doctor JSON、進捗表示を仕様へ合わせる。
+- `skb query` は CLI の上級者向け機能として実装し、MCP には公開しない。v1 の MCP トランスポートは stdio のみとする。
 - resource URI の不存在を MCP の resource-not-found として返す。
 - **完了条件**: CLI/MCP の同一 JSON 入出力、エラー形式、件数、進捗に関する契約テストが緑。
 
