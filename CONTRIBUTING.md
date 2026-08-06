@@ -42,7 +42,8 @@
 - glibc >= 2.38 (build runner: ubuntu-24.04)
 - libz, libzstd (from ONNX Runtime prebuilt static lib)
 - ca-certificates (for hf-hub model download; ureq uses embedded webpki-roots)
-- libstdc++ is statically linked on Linux (`CXXSTDLIB=""` and `-C link-arg=-l:libstdc++.a`); libgcc_s remains dynamic. Windows uses dynamic CRT (the ORT prebuilt uses `/MD` and requires the VC++ runtime DLLs).
+- libstdc++ is statically linked on Linux (`CXXSTDLIB=""` and `-C link-arg=-l:libstdc++.a`); `libgcc_s` remains dynamic.
+- Windows uses dynamic CRT (`/MD`). The binary imports `MSVCP140.dll`, `MSVCP140_1.dll`, `VCRUNTIME140.dll`, and `VCRUNTIME140_1.dll`; users must install the Microsoft Visual C++ Redistributable for Visual Studio 2015-2022 (x64). These DLLs are not bundled in the npm package.
 
 ## SurrealDB Versions
 

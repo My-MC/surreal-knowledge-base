@@ -371,7 +371,7 @@ allowed_dirs = []                    # MCP経由の path アップロード許�
 | 項目 | 内容 |
 |---|---|
 | 実装 | Rust バイナリ `skb-mcp`（`rmcp` 使用） |
-| トランスポート | stdio（既定） |
+| トランスポート | stdio（唯一。HTTP は将来拡張） |
 | 起動方法 | `npx surreal-knowledge-base` / `bunx surreal-knowledge-base` / バイナリ直接実行 |
 | ログ | **stderr のみ**（stdio 運用時に stdout を汚染しない） |
 | 終了コード | 0 正常 / 1 起動失敗 |
@@ -605,9 +605,15 @@ esbuild / Biome と同様の **プラットフォーム別バイナリ + optiona
 | glibc ≥ 2.38 | ビルドランナー（ubuntu-24.04）と ORT prebuilt の ABI フロア |
 | libz | ORT prebuilt 静的ライブラリの動的依存 |
 | libzstd | 同上 |
+| libgcc_s | Rust の unwinding / GCC runtime（Linux ビルドで動的リンク） |
 | ca-certificates | hf-hub の TLS 証明書検証（ureq 側は webpki-roots 埋め込み済み） |
 
-macOS / Windows は OS 付属以外の動的依存なし（Windows は ORT の要件に合わせて CRT を動的リンクする）。
+macOS は OS 付属以外の動的依存なし。Windows の `/MD` バイナリは、実際のビルドで
+`MSVCP140.dll`、`MSVCP140_1.dll`、`VCRUNTIME140.dll`、`VCRUNTIME140_1.dll`
+を import する。これらは Microsoft Visual C++ Redistributable for Visual Studio 2015--2022
+(x64) に含まれるため、npm パッケージには DLL を同梱せず、利用者が実行前に Redistributable
+をインストールする責任を負う。リリース手順と実行時エラーメッセージでは、この前提と
+Microsoft の公式インストーラを明示する。
 
 ### 13.5 実行方法
 

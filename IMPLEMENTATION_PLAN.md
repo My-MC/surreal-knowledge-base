@@ -161,6 +161,7 @@ Phase 3 (CLI) ──► Phase 4 (MCP) ──► Phase 5 (契約テスト+npm) �
 5. **CI 更新**
    - ランナー: ubuntu-24.04 (x64), ubuntu-24.04-arm (arm64), macos-latest (arm64), windows-2022 (x64)
    - Linux: `CXXSTDLIB=""` と `-C link-arg=-l:libstdc++.a` で libstdc++ を静的リンク。libgcc_s は動的依存とする。Windows は ORT の要件に合わせて CRT を動的リンクする。
+   - Windows の `/MD` バイナリは `MSVCP140.dll`、`MSVCP140_1.dll`、`VCRUNTIME140.dll`、`VCRUNTIME140_1.dll` を必要とする。これらは npm パッケージへ同梱せず、Visual C++ Redistributable for Visual Studio 2015--2022 (x64) の事前インストールをリリース手順と実行時エラーで案内する。
    - ビルド: `cargo build --release -p skb-mcp --features ort --target ...`
    - ~/.cache/ort.pyke.io の actions/cache キャッシュ
    - スモークテスト（linux-x64 ネイティブ）: ldd/objdump 検証 + npm pack/install + mock config で MCP initialize ハンドシェイク
