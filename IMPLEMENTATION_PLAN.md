@@ -25,6 +25,44 @@
 - **契約テスト基盤は CLI/MCP 実装と同時** に構築しパリティを保証
 - 各 Phase に Exit Criteria を設け、満たさない限り次へ進まない
 
+## 実装状況の基準
+
+この文書の状態は、`main` ブランチのコード、テスト、CI、生成物を確認した結果で更新する。`SPECIFICATION.md` は目標仕様を定義し、本書は実装済み範囲と未実装要件を区別する。
+
+| 状態 | 意味 |
+|---|---|
+| 完了 | Exit Criteria、対応テスト、必要な配布/CI検証をすべて満たす |
+| 部分完了 | 基本機能はあるが、仕様の一部または検証が不足している |
+| 進行中 | 実装または検証を開始しているが、利用可能な完了条件を満たしていない |
+| 未着手 | 実装・検証の成果物がない |
+| 保留 | 技術判断または外部要因により着手を保留している |
+
+### Phase 状態一覧
+
+| Phase | 内容 | 状態 | 主な不足 |
+|---|---|---|---|
+| 0 | 技術検証スパイク | 部分完了 | 0-2/0-3の検証証跡を成果物として整理する |
+| 1 | `skb-core` 基盤 | 部分完了 | 設定検証、入力安全性、DTO、CRUD件数、検索応答の不足 |
+| 2 | グラフ + reindex | 部分完了 | N-hop、再ランク、dimension/HNSW/meta整合性の不足 |
+| 3 | CLI | 部分完了 | 仕様上の入力形式、glob、JSON doctor、query、progressの不足 |
+| 4 | MCP | 部分完了 | 共通JSON Schema、必須条件、progressの不足 |
+| 5 | 契約テスト + npm | 部分完了 | MCP/CLI比較、全ターゲットE2E、upload/search smokeの不足 |
+| 6 | Skill | 部分完了 | 実装済みレスポンスとSkillの引用・エラー説明の同期が必要 |
+| 7 | 仕上げ | 進行中 | ベンチ結果の判定、日本語FTS評価、公開手順の整理が必要 |
+| 8 | ort有効バイナリ + 依存最小化 | 部分完了 | CI証跡と生成artifactの扱い、Windows runtime案内のE2Eが必要 |
+| 9 | 仕様適合化と未実施機能 | 未着手 | 本書のPhase 9-1〜9-7を順に実装する。既存の部分実装は完了条件を満たすまで未完了とする |
+
+### 現状検証マトリクス
+
+| 領域 | 現在確認できる実装 | 不足する検証/実装 | 次のPhase |
+|---|---|---|---|
+| 設定・モデル | `./skb.toml`/ユーザー設定探索、model名のmeta照合、tokenizer auto/明示解決 | validation、環境変数、dimension/max input、fingerprint、再起動検証 | 9-1 |
+| Upload | path/url/content/base64の基本処理、PDF抽出、allowed_dirs | 全経路の上限、SSRF、任意バイナリ、原子性、部分失敗 | 9-3 |
+| Chunk/Graph/Search | token分割、基本抽出、vector/keyword/hybrid、単純graph expansion | heading、frontmatter/WikiLink、N-hop/re-rank、検索応答拡張 | 9-4 |
+| Reindex | ドキュメント単位のchunk置換transaction | mismatch時の起動、dimension/HNSW/meta、全体rollback、progress | 9-5 |
+| CLI/MCP | stdio MCP、主要CLI/MCP操作、resource-not-found | 共通schema、CLI parity、件数、query、JSON、progress、golden test | 9-2/9-6 |
+| 配布/CI | 4ターゲットbuild matrix、linux smoke initialize | upload/search E2E、bunx、runtime依存、リリースゲート | 9-7 |
+
 ---
 
 ## Phase 0: 技術検証スパイク（目安: 1〜2 人日）
@@ -130,6 +168,9 @@ Phase 1 (skb-core) ──► Phase 2 (graph/reindex)
    │                        │
    ▼                        ▼
 Phase 3 (CLI) ──► Phase 4 (MCP) ──► Phase 5 (契約テスト+npm) ──► Phase 6 (Skill) ──► Phase 7 ──► Phase 8
+                                                                                                  │
+                                                                                                  ▼
+                                                                                         Phase 9 (仕様適合化)
 ```
 
 ---
@@ -138,7 +179,7 @@ Phase 3 (CLI) ──► Phase 4 (MCP) ──► Phase 5 (契約テスト+npm) �
 
 ### 目標
 - ort feature を有効にした self-contained バイナリを全 4 プラットフォームでビルドし npm 配布可能にする
-- 外部動的依存（OpenSSL, libstdc++）を排除し、Linux ランタイム要件を glibc + libz + libzstd のみに
+- 外部動的依存（OpenSSL, libstdc++）を排除し、Linux ランタイム要件を glibc + libz + libzstd + libgcc_s に限定する。Windows は `/MD` のVisual C++ Redistributableを前提とする。
 
 ### 実施内容
 
@@ -171,61 +212,74 @@ Phase 3 (CLI) ──► Phase 4 (MCP) ──► Phase 5 (契約テスト+npm) �
    - CONTRIBUTING.md: OpenSSL 不要の明記、ort ビルド手順、ランタイム要件
    - IMPLEMENTATION_PLAN.md: 本フェーズ追記
 
-### 終了条件
-- `cargo test --workspace` 全 9 テスト通過（surrealdb スリム化後も影響なし）
+### 検証状況と残条件
+- `cargo test --workspace -- --test-threads=1` はCIで実行済み。Phase 9変更時もシリアル実行を継続する。
 - `cargo build --release -p skb-mcp --features ort` 成功
 - `ldd target/release/skb-mcp`: libonnxruntime / libssl / libstdc++ 非含有
 - CI 全 4 ターゲットビルド + smoke test 通過
 - `cargo tree -i openssl-sys | grep "did not match"` 成功
+- 現在のsmoke testはlinux-x64のinitialize handshakeまでであり、`tools/list → upload → search`、bunx、Windows runtime prerequisiteの検証はPhase 9-7で追加する。
+- CIで生成される4ターゲットartifactと、リポジトリに存在するpackage.jsonテンプレートを区別して記録する。
 
 ---
 
-## Phase 9: 仕様適合化と未実施機能（次フェーズ）
+## Phase 9: 仕様適合化と未実施機能
 
-Phase 0〜8 で確定した方針（`tokenizers`、SurrealKV 組込み、ORT 静的リンク）を前提に、仕様書の未実装項目を実装する。各項目は独立した変更として実装し、対応する回帰テストを同じ変更に含める。
+Phase 0〜8 で確定した方針（`tokenizers`、SurrealKV 組込み、ORT 静的リンク）を前提に、仕様書の未実装項目を依存順に実装する。各変更は専用ブランチで行い、対応する回帰テストと仕様更新を同じPRに含める。各項目には基本実装が存在する場合もあるが、ここに記載する完了条件を満たすまで **未完了** とする。
 
-### 9-1: 設定・モデル整合性
+### 9-1: 設定・モデル・tokenizer整合性（部分完了）
 
-- `Config::validate()` を追加し、`0 < overlap_tokens < max_tokens <= max_input_tokens` を検証する。
-- CLI 引数、`SKB_*` 環境変数、`./skb.toml`、ユーザー設定の優先順位を実装する。
-- モデル設定から dimension と最大入力トークン数を検出し、明示設定との不一致を `E_VALIDATION` にする。
-- `KnowledgeBase::open` で model、dimension、max input tokens、tokenizer の `meta` を比較する。
-- `embedding.tokenizer` の明示パスと `"auto"` の両方を解決し、tokenizer.json の vocabulary、normalizer、pre-tokenizer、post-processor、decoder、取得元（モデル ID/revision または明示パス）、`tokenizers` のアルゴリズム/バージョン、その他の構成情報を canonical JSON serialization して決定的な SHA-256 metadata fingerprint を作成する。
-- fingerprint schema version、canonicalization 規則、取得元、アルゴリズム/バージョン、fingerprint を `meta` に保存し、`KnowledgeBase::open` と `reindex` で全解決経路の metadata を比較する。不一致時は `E_MODEL_MISMATCH` とし、reindex 完了まで通常操作を拒否する。
-- **完了条件**: 不正設定、環境変数上書き、モデル不一致、dimension 不一致、明示 tokenizer と `auto` tokenizer の fingerprint 不一致、metadata の保存と再起動後の検証テストが緑。
+- `Config::validate()` で `0 < overlap_tokens < max_tokens <= max_input_tokens` を検証する。
+- CLI引数、`SKB_*`環境変数、`./skb.toml`、ユーザー設定の優先順位を実装する。
+- モデル設定からdimensionと最大入力トークン数を検出し、明示設定との不一致を`E_VALIDATION`にする。
+- `embedding.tokenizer` の明示パスと`"auto"`を同じ解決経路として扱い、取得元、`tokenizers`のアルゴリズム/バージョン、対象構成をcanonical JSON serializationしてSHA-256 fingerprintを作成する。
+- fingerprint schema version、canonicalization規則、取得元、アルゴリズム/バージョン、fingerprintを`meta`に保存し、`KnowledgeBase::open`と`reindex`で比較する。
+- **完了条件**: 不正設定、環境変数上書き、model/dimension/max input mismatch、tokenizer fingerprint不一致、保存後の再起動検証が緑。
 
-### 9-2: Upload の安全性・原子性
+### 9-2: 共通DTO・JSON Schema基盤（未着手）
 
-- ファイル、stdin、base64、URL の全入力に `upload.max_file_mb` を適用する。
-- base64 はデコード前の入力長とデコード後のバイト数、ファイルは読み込み前のファイルサイズ、インライン本文は受信サイズ、URL は受信ストリームと抽出後の本文サイズを検査する。PDF 等の展開・抽出処理にも同じ上限を適用し、可能な箇所は上限超過前に停止する。
-- URL は HTTP(S) のみ許可し、リダイレクト数と応答サイズを制限する。DNS 解決後の private/reserved、loopback、link-local、multicast、クラウドメタデータ範囲を拒否し、各リダイレクトで URL と IP を再検証して DNS rebinding を防止する。プロキシを使用する場合も許可する宛先を明示的に制御する。
-- base64 は任意バイナリとして保持し、形式に応じて PDF 等を抽出する。
-- document、chunk、entity、mentions と force 更新時の旧データ削除を一つのトランザクションで処理する。
-- 複数入力時は成功結果と `errors[]` を集約する。
-- **完了条件**: デコード爆弾、圧縮・展開爆弾、各入力段階のサイズ超過、SSRF 相当 URL、リダイレクト先の再検証、部分失敗、トランザクションロールバックのテストが緑。
+- Request/Response型へ`Serialize`、`Deserialize`、`JsonSchema`をderiveし、CLIとMCPが同じ型を利用する。
+- MCPの手書きschemaを廃止し、必須項目、one-of、enum、範囲制約をschemaと実行時の双方で検証する。
+- 公開APIと実装APIの引数・戻り値・エラー形式を統一する。
+- **完了条件**: MCP `tools/list`のschema検証、upload one-of、graph queryの`from`必須検証、CLI/MCP同一DTOのコンパイル・契約テストが緑。
 
-### 9-3: Tokenize・Graph・Search
+### 9-3: Upload安全性・原子性（部分完了）
 
-- `EntityExtractor` トレイトを追加し、WikiLink、Markdown リンク先、frontmatter の tags/aliases、見出し階層を抽出する。
-- Markdown の段落・文・見出し境界を優先した chunking と `Chunk.heading` 保存を実装する。
-- 検索結果に `title`、`source`、keyword の `highlights`、グラフ拡張時の `matched_entities` を追加する。
-- chunk → entity → related entity → chunk の N ホップ探索と、元スコア・距離を使った再ランクを実装する。
-- **完了条件**: 抽出、heading、N ホップ、再ランク、検索レスポンスの契約テストが緑。
+- ファイル、stdin、base64、inline、URLの全入力に`upload.max_file_mb`を適用し、decode/extract前後のサイズを検査する。
+- base64は任意バイナリとして保持し、MIME/拡張子に応じてPDF等を抽出する。未対応形式は`E_UNSUPPORTED_FORMAT`で拒否する。
+- URLはHTTP(S)のみ許可し、redirect数、受信ストリーム、DNS解決後のprivate/reserved、loopback、link-local、multicast、metadata IPを検証する。各redirectでURL/IPを再検証する。
+- document、chunk、entity、mentions、force更新時の旧データ削除を一つのトランザクションで処理する。
+- 複数入力時は成功結果と`errors[]`を集約し、一件の失敗で全体を中断しない。
+- **完了条件**: サイズ超過、decode/extract爆弾、SSRF、redirect再検証、未対応形式、部分失敗、rollbackのテストが緑。
 
-### 9-4: 共通 DTO・CRUD・CLI・MCP
+### 9-4: Chunk・Graph・Search（部分完了）
 
-- Request/Response 型へ `JsonSchema` を derive し、MCP の手書き schema を共通型から生成する。
-- `skb_upload` の入力経路 one-of、graph query の `from` など必須条件を schema と実行時の双方で検証する。
-- list/delete の chunk 件数、削除対象不存在時の `E_DOCUMENT_NOT_FOUND` を実装する。
-- CLI の複数パス、glob、`graph entity add`、`query`、doctor JSON、進捗表示を仕様へ合わせる。
-- `skb query` は CLI の上級者向け機能として実装し、MCP には公開しない。v1 の MCP トランスポートは stdio のみとする。
-- resource URI の不存在を MCP の resource-not-found として返す。
-- **完了条件**: CLI/MCP の同一 JSON 入出力、エラー形式、件数、進捗に関する契約テストが緑。
+- `EntityExtractor`トレイトを追加し、WikiLink、Markdownリンク先、frontmatterのtags/aliases、見出し階層を抽出する。
+- Markdownの段落・文・見出し境界を優先してchunk化し、`Chunk.heading`を保存する。
+- 検索結果に`title`、`source`、keywordの`highlights`、graph拡張時の`matched_entities`を追加する。
+- chunk → entity → related entity → chunk のN-hop探索と、元スコア・距離による再ランクを実装する。
+- **完了条件**: 抽出、heading、N-hop、再ランク、検索レスポンスの契約テストが緑。
 
-### 9-5: Reindex・配布・E2E
+### 9-5: Reindex・進捗（部分完了）
 
-- reindex のトランザクション内でモデル関連 `meta` を更新し、モデル変更後に再起動できるようにする。
-- dimension 変更時は `chunk.embedding` フィールドと HNSW インデックスを新しい dimension で再定義する。インデックス再構築、旧チャンク・旧 mentions 削除、新チャンク作成、entity 索引、モデル metadata 更新は単一トランザクションで完了させ、中断時はロールバックする。
-- MCP progress notification と CLI progress bar を実装する。
-- 4 ターゲットの npm package 生成、`npm pack`、npx/bunx 起動、initialize → tools/list → upload → search の E2E を CI に追加する。
-- **完了条件**: dimension 変更後に新しい `chunk.embedding` と HNSW インデックスが使用され、再起動後も維持されること、更新処理を中断した場合に旧状態へロールバックされることを確認する。加えて `cargo check`、`cargo clippy`、`cargo fmt --check`、シリアルテスト、4 ターゲット build、Linux smoke、契約テストがすべて緑。
+- reindexを起動時のmodel mismatch状態から実行できる管理経路を用意する。
+- dimension変更時に`chunk.embedding`フィールドとHNSWインデックスを再定義し、旧chunk/mentions削除、新chunk/entity索引、model metadata更新を同一transaction境界で処理する。
+- 中断時は旧schema、旧chunk、旧metaを維持し、再起動後も整合性を検証する。
+- MCP progress notificationとCLI progress barを実装する。
+- **完了条件**: dimension変更、HNSW再構築、metadata更新、途中失敗rollback、再起動復旧、progressのテストが緑。
+
+### 9-6: CLI・MCP parity（部分完了）
+
+- CLIの複数パス、glob、`graph entity add`、`skb query`、doctor JSON、progress表示を仕様へ合わせる。
+- listの`chunk_count`、deleteの`chunks_deleted`、不存在documentの`E_DOCUMENT_NOT_FOUND`を実装する。
+- resource-not-foundなどMCPエラー形式を共通DTOに合わせる。
+- CLI/MCPへ同一JSONを投入し、レスポンスの意味とエラーを比較するゴールデン契約テストを追加する。
+- **完了条件**: 全CLIコマンド、MCP tools/resources、JSON/table出力、件数、エラー、progressの契約テストが緑。
+
+### 9-7: 配布・E2E・CI（部分完了）
+
+- 4ターゲットのnpm package生成、`npm pack`、npx/bunx起動を検証する。
+- `initialize → tools/list → skb_upload → skb_search`をlinux-x64 smokeと各ターゲットE2Eで検証する。
+- WindowsのVisual C++ Redistributable prerequisiteと、Linuxの動的依存をartifactごとに検証する。
+- `cargo check`、`cargo clippy`、`cargo fmt --check`、シリアルテスト、契約テストをCIのリリースゲートに追加する。
+- **完了条件**: 4ターゲットbuild、npm pack/install、npx/bunx、MCP upload/search、runtime dependency検証がすべて緑。
