@@ -194,7 +194,9 @@ DEFINE FIELD key   ON meta TYPE string;
 DEFINE FIELD meta_value ON meta TYPE string;
 DEFINE INDEX meta_key_unique ON meta FIELDS key UNIQUE;
 -- 記録キー: schema_version / embedding_model / embedding_dimension /
---          embedding_max_input_tokens / tokenizer
+ --          embedding_max_input_tokens / tokenizer / tokenizer_source /
+ --          tokenizer_algorithm / tokenizer_fingerprint_schema /
+ --          tokenizer_fingerprint
 ```
 
 ### 4.2 冪等性・重複排除
@@ -265,7 +267,7 @@ LLM 抽出は `EntityExtractor` トレイトの差し替え実装として将来
 
 1. `0 < overlap_tokens < max_tokens ≤ max_input_tokens` を検証。違反時は `E_VALIDATION`。
 2. `meta` テーブルに記録された `embedding_model` / `embedding_dimension` と設定値を比較。**不一致のまま通常操作は行わず** `E_MODEL_MISMATCH` を返し、再構築（`reindex`）を案内する。これにより、異なる次元・語彙のベクトルが同一インデックスに混在することを防ぐ。
-3. `embedding.tokenizer` が明示パスの場合は tokenizer.json の存在と形式を検証し、vocabulary、normalizer、pre-tokenizer、model revision、その他の構成情報から決定的な metadata fingerprint を生成する。`meta` に保存された fingerprint と不一致の場合は `E_MODEL_MISMATCH` を返し、再構築（`reindex`）を案内する。新規作成時・reindex 完了時には、使用した tokenizer metadata を同じ `meta` に保存する。
+3. `embedding.tokenizer` は明示パスと `"auto"`（`embedding.model` に対応する tokenizer.json の解決）のどちらでも、同じ tokenizer 識別子契約を適用する。tokenizer.json の存在と形式を検証し、取得元（モデル ID と revision、または明示パス）、`tokenizers` のアルゴリズム/バージョン、vocabulary、normalizer、pre-tokenizer、post-processor、decoder、その他の構成情報を canonical JSON serialization した上で SHA-256 fingerprint を生成する。fingerprint には schema version を含め、canonicalization 規則と対象フィールドを変更する場合は schema version を更新する。解決した tokenizer の取得元、アルゴリズム/バージョン、fingerprint schema version、fingerprint を `meta` に保存し、既存値と不一致の場合は `E_MODEL_MISMATCH` を返して再構築（`reindex`）を案内する。新規作成時・reindex 完了時には、明示パスと `auto` の両方を含むすべての解決経路で同じ tokenizer metadata を保存する。
 
 #### 変更手順（reindex）
 

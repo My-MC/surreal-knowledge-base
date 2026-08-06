@@ -190,9 +190,9 @@ Phase 0〜8 で確定した方針（`tokenizers`、SurrealKV 組込み、ORT 静
 - CLI 引数、`SKB_*` 環境変数、`./skb.toml`、ユーザー設定の優先順位を実装する。
 - モデル設定から dimension と最大入力トークン数を検出し、明示設定との不一致を `E_VALIDATION` にする。
 - `KnowledgeBase::open` で model、dimension、max input tokens、tokenizer の `meta` を比較する。
-- `embedding.tokenizer` の明示パスを検証し、tokenizer.json の vocabulary、normalizer、pre-tokenizer、model revision、その他の構成情報から決定的な metadata fingerprint を作成する。
-- tokenizer metadata fingerprint を `meta` に保存し、既存値と一致しない場合は `E_MODEL_MISMATCH` とする。tokenizer の変更も reindex 完了まで通常操作を拒否する。
-- **完了条件**: 不正設定、環境変数上書き、モデル不一致、dimension 不一致、明示 tokenizer の fingerprint 不一致と再起動後の検証テストが緑。
+- `embedding.tokenizer` の明示パスと `"auto"` の両方を解決し、tokenizer.json の vocabulary、normalizer、pre-tokenizer、post-processor、decoder、取得元（モデル ID/revision または明示パス）、`tokenizers` のアルゴリズム/バージョン、その他の構成情報を canonical JSON serialization して決定的な SHA-256 metadata fingerprint を作成する。
+- fingerprint schema version、canonicalization 規則、取得元、アルゴリズム/バージョン、fingerprint を `meta` に保存し、`KnowledgeBase::open` と `reindex` で全解決経路の metadata を比較する。不一致時は `E_MODEL_MISMATCH` とし、reindex 完了まで通常操作を拒否する。
+- **完了条件**: 不正設定、環境変数上書き、モデル不一致、dimension 不一致、明示 tokenizer と `auto` tokenizer の fingerprint 不一致、metadata の保存と再起動後の検証テストが緑。
 
 ### 9-2: Upload の安全性・原子性
 
