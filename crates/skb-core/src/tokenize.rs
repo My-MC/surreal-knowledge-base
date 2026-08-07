@@ -6,6 +6,11 @@ pub trait Tokenize: Send + Sync {
     fn decode(&self, ids: &[u32]) -> Result<String, SkbError>;
     fn vocab_size(&self) -> usize;
     fn chunk(&self, text: &str, max_tokens: usize, overlap: usize) -> Result<Vec<Chunk>, SkbError>;
+    /// Canonical JSON serialization of the tokenizer configuration: model
+    /// (vocabulary), normalizer, pre-tokenizer, post-processor, decoder and
+    /// other fields as loaded from `tokenizer.json`. Deterministic for a given
+    /// file; used for fingerprinting (§5.4).
+    fn config_json(&self) -> Result<serde_json::Value, SkbError>;
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +58,15 @@ impl Tokenize for TokenizersImpl {
 
     fn vocab_size(&self) -> usize {
         self.tokenizer.get_vocab_size(true)
+    }
+
+    fn config_json(&self) -> Result<serde_json::Value, SkbError> {
+        serde_json::to_value(&self.tokenizer).map_err(|e| {
+            SkbError::new(
+                ErrorCode::Tokenize,
+                format!("serialize tokenizer config: {e}"),
+            )
+        })
     }
 
     fn chunk(&self, text: &str, max_tokens: usize, overlap: usize) -> Result<Vec<Chunk>, SkbError> {

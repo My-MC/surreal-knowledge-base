@@ -214,6 +214,20 @@ fn contract_config_set_updates_existing_config() {
 }
 
 #[test]
+fn contract_config_env_override() {
+    setup_config();
+    let output = Command::new(skb_binary())
+        .args(["config", "show"])
+        .env("SKB_SEARCH_TOP_K", "42")
+        .current_dir(test_dir())
+        .output()
+        .expect("failed to run skb config show");
+    assert!(output.status.success());
+    let val: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(val["search"]["top_k"], 42);
+}
+
+#[test]
 fn contract_pipeline() {
     setup_config();
 

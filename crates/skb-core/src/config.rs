@@ -1,3 +1,4 @@
+use crate::error::{ErrorCode, SkbError};
 use anyhow::Context;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -112,7 +113,7 @@ impl Default for SearchConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum SearchMode {
     Hybrid,
@@ -163,14 +164,212 @@ impl Default for UploadConfig {
 }
 
 impl Config {
+    /// Load configuration with the precedence:
+    /// environment variables (`SKB_*`) > `./skb.toml` > `~/.config/skb/config.toml`.
+    /// When no config file exists, defaults are used (environment overrides still apply).
     pub fn load() -> anyhow::Result<Self> {
-        let path = Self::find_config_path()
-            .context("config file not found (skb.toml or ~/.config/skb/config.toml)")?;
-        let content = std::fs::read_to_string(&path)
-            .with_context(|| format!("failed to read config: {}", path.display()))?;
-        let config: Config = toml::from_str(&content)
-            .with_context(|| format!("failed to parse config: {}", path.display()))?;
+        let mut config = match Self::find_config_path() {
+            Some(path) => {
+                let content = std::fs::read_to_string(&path)
+                    .with_context(|| format!("failed to read config: {}", path.display()))?;
+                toml::from_str(&content)
+                    .with_context(|| format!("failed to parse config: {}", path.display()))?
+            }
+            None => Config::default(),
+        };
+        config.apply_env_overrides()?;
         Ok(config)
+    }
+
+    /// Overlay `SKB_*` environment variables on top of the file-based config.
+    /// Variable names follow the dotted key with underscores, e.g.
+    /// `SKB_STORAGE_PATH`, `SKB_EMBEDDING_MODEL`, `SKB_CHUNKING_MAX_TOKENS`.
+    pub fn apply_env_overrides(&mut self) -> anyhow::Result<()> {
+        if let Some(v) = env_opt("SKB_STORAGE_PATH")? {
+            self.storage.path = PathBuf::from(v);
+        }
+        if let Some(v) = env_opt("SKB_STORAGE_NAMESPACE")? {
+            self.storage.namespace = v;
+        }
+        if let Some(v) = env_opt("SKB_STORAGE_DATABASE")? {
+            self.storage.database = v;
+        }
+        if let Some(v) = env_opt("SKB_EMBEDDING_MODEL")? {
+            self.embedding.model = v;
+        }
+        if let Some(v) = env_opt("SKB_EMBEDDING_ONNX_PATH")? {
+            self.embedding.onnx_path = v;
+        }
+        if let Some(v) = env_opt("SKB_EMBEDDING_TOKENIZER")? {
+            self.embedding.tokenizer = v;
+        }
+        if let Some(v) = env_opt("SKB_EMBEDDING_DIMENSION")? {
+            self.embedding.dimension = v
+                .parse()
+                .with_context(|| format!("SKB_EMBEDDING_DIMENSION must be a number, got '{v}'"))?;
+        }
+        if let Some(v) = env_opt("SKB_EMBEDDING_MAX_INPUT_TOKENS")? {
+            self.embedding.max_input_tokens = v.parse().with_context(|| {
+                format!("SKB_EMBEDDING_MAX_INPUT_TOKENS must be a number, got '{v}'")
+            })?;
+        }
+        if let Some(v) = env_opt("SKB_EMBEDDING_DEVICE")? {
+            self.embedding.device = v;
+        }
+        if let Some(v) = env_opt("SKB_EMBEDDING_BATCH_SIZE")? {
+            self.embedding.batch_size = v
+                .parse()
+                .with_context(|| format!("SKB_EMBEDDING_BATCH_SIZE must be a number, got '{v}'"))?;
+        }
+        if let Some(v) = env_opt("SKB_CHUNKING_MAX_TOKENS")? {
+            self.chunking.max_tokens = v
+                .parse()
+                .with_context(|| format!("SKB_CHUNKING_MAX_TOKENS must be a number, got '{v}'"))?;
+        }
+        if let Some(v) = env_opt("SKB_CHUNKING_OVERLAP_TOKENS")? {
+            self.chunking.overlap_tokens = v.parse().with_context(|| {
+                format!("SKB_CHUNKING_OVERLAP_TOKENS must be a number, got '{v}'")
+            })?;
+        }
+        if let Some(v) = env_opt("SKB_SEARCH_DEFAULT_MODE")? {
+            self.search.default_mode = v.parse().map_err(|e: SkbError| e)?;
+        }
+        if let Some(v) = env_opt("SKB_SEARCH_TOP_K")? {
+            self.search.top_k = v
+                .parse()
+                .with_context(|| format!("SKB_SEARCH_TOP_K must be a number, got '{v}'"))?;
+        }
+        if let Some(v) = env_opt("SKB_SEARCH_RRF_K")? {
+            self.search.rrf_k = v
+                .parse()
+                .with_context(|| format!("SKB_SEARCH_RRF_K must be a number, got '{v}'"))?;
+        }
+        if let Some(v) = env_opt("SKB_UPLOAD_MAX_FILE_MB")? {
+            self.upload.max_file_mb = v
+                .parse()
+                .with_context(|| format!("SKB_UPLOAD_MAX_FILE_MB must be a number, got '{v}'"))?;
+        }
+        if let Some(v) = env_opt("SKB_UPLOAD_ALLOWED_DIRS")? {
+            self.upload.allowed_dirs = v
+                .split(',')
+                .map(|part| PathBuf::from(part.trim()))
+                .filter(|p| !p.as_os_str().is_empty())
+                .collect();
+        }
+        Ok(())
+    }
+
+    /// Validate static config rules. Dynamic values (`dimension`, `max_input_tokens`)
+    /// must be resolved against the model first via
+    /// [`Config::resolve_embedding_settings`].
+    pub fn validate(&self) -> Result<(), SkbError> {
+        if self.embedding.dimension == 0 {
+            return Err(SkbError::new(
+                ErrorCode::Validation,
+                "embedding.dimension must be resolved before validation",
+            ));
+        }
+        if self.embedding.max_input_tokens == 0 {
+            return Err(SkbError::new(
+                ErrorCode::Validation,
+                "embedding.max_input_tokens must be resolved before validation",
+            ));
+        }
+        if self.embedding.batch_size == 0 {
+            return Err(SkbError::new(
+                ErrorCode::Validation,
+                "embedding.batch_size must be at least 1",
+            ));
+        }
+        if self.chunking.max_tokens == 0 {
+            return Err(SkbError::new(
+                ErrorCode::Validation,
+                "chunking.max_tokens must be at least 1",
+            ));
+        }
+        if self.chunking.overlap_tokens == 0 {
+            return Err(SkbError::new(
+                ErrorCode::Validation,
+                "chunking.overlap_tokens must be at least 1",
+            ));
+        }
+        if self.chunking.overlap_tokens >= self.chunking.max_tokens {
+            return Err(SkbError::new(
+                ErrorCode::Validation,
+                format!(
+                    "chunking.overlap_tokens ({}) must be less than chunking.max_tokens ({})",
+                    self.chunking.overlap_tokens, self.chunking.max_tokens
+                ),
+            ));
+        }
+        if self.chunking.max_tokens > self.embedding.max_input_tokens {
+            return Err(SkbError::new(
+                ErrorCode::Validation,
+                format!(
+                    "chunking.max_tokens ({}) must not exceed embedding.max_input_tokens ({})",
+                    self.chunking.max_tokens, self.embedding.max_input_tokens
+                ),
+            ));
+        }
+        if self.search.top_k == 0 {
+            return Err(SkbError::new(
+                ErrorCode::Validation,
+                "search.top_k must be at least 1",
+            ));
+        }
+        if self.search.rrf_k == 0 {
+            return Err(SkbError::new(
+                ErrorCode::Validation,
+                "search.rrf_k must be at least 1",
+            ));
+        }
+        if self.upload.max_file_mb == 0 {
+            return Err(SkbError::new(
+                ErrorCode::Validation,
+                "upload.max_file_mb must be at least 1",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Resolve `embedding.dimension` / `embedding.max_input_tokens` from the
+    /// model's detected values and validate the result. Explicit config values
+    /// that disagree with the model produce `E_VALIDATION`.
+    ///
+    /// Returns a normalized copy with detected values filled in (when the
+    /// config value is 0 = auto-detect).
+    pub fn resolve_embedding_settings(
+        &self,
+        detected_dimension: usize,
+        detected_max_input_tokens: usize,
+    ) -> Result<Config, SkbError> {
+        let mut resolved = self.clone();
+        let cfg_dim = self.embedding.dimension;
+        let cfg_max = self.embedding.max_input_tokens;
+        if cfg_dim != 0 && cfg_dim != detected_dimension {
+            return Err(SkbError::new(
+                ErrorCode::Validation,
+                format!(
+                    "embedding.dimension ({cfg_dim}) does not match model dimension ({detected_dimension})"
+                ),
+            ));
+        }
+        if cfg_max != 0 && cfg_max != detected_max_input_tokens {
+            return Err(SkbError::new(
+                ErrorCode::Validation,
+                format!(
+                    "embedding.max_input_tokens ({cfg_max}) does not match model max input ({detected_max_input_tokens})"
+                ),
+            ));
+        }
+        if cfg_dim == 0 {
+            resolved.embedding.dimension = detected_dimension;
+        }
+        if cfg_max == 0 {
+            resolved.embedding.max_input_tokens = detected_max_input_tokens;
+        }
+        resolved.validate()?;
+        Ok(resolved)
     }
 
     fn find_config_path() -> Option<PathBuf> {
@@ -188,6 +387,14 @@ impl Config {
     }
 }
 
+fn env_opt(key: &str) -> anyhow::Result<Option<String>> {
+    match std::env::var(key) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(anyhow::anyhow!("{key} must be unicode")),
+    }
+}
+
 fn home_dir() -> PathBuf {
     if let Ok(home) = std::env::var("HOME") {
         return PathBuf::from(home);
@@ -198,4 +405,166 @@ fn home_dir() -> PathBuf {
         }
     }
     PathBuf::from(".")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn resolved_default() -> Config {
+        Config::default()
+            .resolve_embedding_settings(8, 8192)
+            .unwrap()
+    }
+
+    #[test]
+    fn validate_accepts_defaults() {
+        resolved_default().validate().unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_zero_overlap() {
+        let mut c = resolved_default();
+        c.chunking.overlap_tokens = 0;
+        assert!(matches!(
+            c.validate(),
+            Err(SkbError {
+                code: ErrorCode::Validation,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_overlap_gte_max() {
+        let mut c = resolved_default();
+        c.chunking.overlap_tokens = 512;
+        c.chunking.max_tokens = 512;
+        assert!(matches!(
+            c.validate(),
+            Err(SkbError {
+                code: ErrorCode::Validation,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_max_tokens_above_model_input() {
+        let mut c = resolved_default();
+        c.chunking.max_tokens = 9000;
+        assert!(matches!(
+            c.validate(),
+            Err(SkbError {
+                code: ErrorCode::Validation,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn resolve_rejects_explicit_dimension_mismatch() {
+        let mut c = Config::default();
+        c.embedding.dimension = 16; // explicit value disagrees with detected 8
+        assert!(matches!(
+            c.resolve_embedding_settings(8, 8192),
+            Err(SkbError {
+                code: ErrorCode::Validation,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn resolve_rejects_explicit_max_input_mismatch() {
+        let mut c = Config::default();
+        c.embedding.max_input_tokens = 4096;
+        assert!(matches!(
+            c.resolve_embedding_settings(8, 8192),
+            Err(SkbError {
+                code: ErrorCode::Validation,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn resolve_fills_detected_values() {
+        let c = Config::default()
+            .resolve_embedding_settings(8, 8192)
+            .unwrap();
+        assert_eq!(c.embedding.dimension, 8);
+        assert_eq!(c.embedding.max_input_tokens, 8192);
+    }
+
+    #[test]
+    fn resolve_accepts_matching_explicit_values() {
+        let mut c = Config::default();
+        c.embedding.dimension = 8;
+        c.embedding.max_input_tokens = 8192;
+        let resolved = c.resolve_embedding_settings(8, 8192).unwrap();
+        assert_eq!(resolved.embedding.dimension, 8);
+        assert_eq!(resolved.embedding.max_input_tokens, 8192);
+    }
+
+    struct EnvGuard(Vec<(&'static str, Option<String>)>);
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let old = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            EnvGuard(vec![(key, old)])
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, old) in &self.0 {
+                match old {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    // Env mutation must not race between tests in this module.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn env_overrides_apply_with_precedence() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _model = EnvGuard::set("SKB_EMBEDDING_MODEL", "env-model");
+        let _tokens = EnvGuard::set("SKB_CHUNKING_MAX_TOKENS", "256");
+        let _top_k = EnvGuard::set("SKB_SEARCH_TOP_K", "42");
+        let _dirs = EnvGuard::set("SKB_UPLOAD_ALLOWED_DIRS", "/a,/b");
+
+        let mut config = Config::default();
+        config.apply_env_overrides().unwrap();
+        assert_eq!(config.embedding.model, "env-model");
+        assert_eq!(config.chunking.max_tokens, 256);
+        assert_eq!(config.search.top_k, 42);
+        assert_eq!(
+            config.upload.allowed_dirs,
+            vec![PathBuf::from("/a"), PathBuf::from("/b")]
+        );
+    }
+
+    #[test]
+    fn env_overrides_reject_invalid_numbers() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _tokens = EnvGuard::set("SKB_CHUNKING_MAX_TOKENS", "not-a-number");
+        let mut config = Config::default();
+        assert!(config.apply_env_overrides().is_err());
+    }
+
+    #[test]
+    fn load_works_without_config_file_when_env_set() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _model = EnvGuard::set("SKB_EMBEDDING_MODEL", "env-only-model");
+        // No config file exists for this process cwd in CI; load() must fall
+        // back to defaults + env instead of failing.
+        let config = Config::load().unwrap();
+        assert_eq!(config.embedding.model, "env-only-model");
+    }
 }

@@ -106,6 +106,25 @@ pub async fn reindex(
         result.tokens_total += chunks.iter().map(|c| c.token_count).sum::<usize>();
     }
 
+    if !dry_run {
+        // Record the resolved model/tokenizer metadata (spec §5.4). The
+        // fingerprint comparison already happened in `KnowledgeBase::open`;
+        // after a successful rebuild the stored values are refreshed.
+        db.set_meta("embedding_model", &config.embedding.model)
+            .await?;
+        db.set_meta("embedding_dimension", &embedder.dimension().to_string())
+            .await?;
+        db.set_meta(
+            "embedding_max_input_tokens",
+            &config.embedding.max_input_tokens.to_string(),
+        )
+        .await?;
+        db.set_meta("schema_version", "1").await?;
+        let source = crate::tokenizer_source_for(config);
+        let meta = crate::tokenizer_fingerprint(&source, &tokenizer.config_json()?)?;
+        crate::save_tokenizer_meta(db, config, &source, &meta).await?;
+    }
+
     Ok(result)
 }
 
