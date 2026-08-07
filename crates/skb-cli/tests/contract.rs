@@ -228,6 +228,42 @@ fn contract_config_env_override() {
 }
 
 #[test]
+fn contract_upload_partial_failure() {
+    setup_config();
+    let dir = test_dir();
+    let docs_dir = dir.join("docs");
+    std::fs::create_dir_all(&docs_dir).unwrap();
+    std::fs::write(docs_dir.join("good.md"), "# Good\n\ncontent").unwrap();
+    // PNG magic bytes: not UTF-8, not a supported format.
+    std::fs::write(
+        docs_dir.join("blob.bin"),
+        [0x89u8, 0x50, 0x4e, 0x47, 0x0d, 0x0a],
+    )
+    .unwrap();
+
+    let val = run_skb(
+        &[
+            "upload",
+            "--path",
+            docs_dir.to_str().unwrap(),
+            "--recursive",
+        ],
+        None,
+    );
+
+    let results = val["results"].as_array().unwrap();
+    let errors = val["errors"].as_array().unwrap();
+    assert_eq!(results.len(), 1, "good file must be committed");
+    assert_eq!(errors.len(), 1, "bad file must be reported");
+    assert_eq!(results[0]["status"], "created");
+    assert_eq!(errors[0]["error"], "E_UNSUPPORTED_FORMAT");
+    assert_eq!(
+        errors[0]["input"],
+        docs_dir.join("blob.bin").display().to_string()
+    );
+}
+
+#[test]
 fn contract_pipeline() {
     setup_config();
 

@@ -325,24 +325,53 @@ async fn run(cli: &Cli) -> Result<()> {
             };
 
             if *stdin {
-                let mut content = String::new();
+                // Bound stdin reads by upload.max_file_mb (spec §12.3).
+                let max = kb.config().upload.max_file_mb.saturating_mul(1024 * 1024);
                 if *base64 {
                     let mut raw = Vec::new();
-                    std::io::stdin().read_to_end(&mut raw)?;
-                    content = String::from_utf8(raw)?;
+                    std::io::stdin().take(max + 1).read_to_end(&mut raw)?;
+                    if raw.len() as u64 > max {
+                        anyhow::bail!("stdin exceeds upload.max_file_mb");
+                    }
+                    let content = String::from_utf8(raw)?;
                     let result = kb.upload(build(None, None, Some(content))).await?;
                     output(&result, &fmt)?;
                 } else {
-                    std::io::stdin().read_to_string(&mut content)?;
+                    let mut content = String::new();
+                    std::io::stdin()
+                        .take(max + 1)
+                        .read_to_string(&mut content)?;
+                    if content.len() as u64 > max {
+                        anyhow::bail!("stdin exceeds upload.max_file_mb");
+                    }
                     let result = kb.upload(build(None, Some(content), None)).await?;
                     output(&result, &fmt)?;
                 }
             } else if !paths.is_empty() {
-                let mut results = Vec::new();
+                // Partial failure: successful uploads are committed and returned
+                // in `results`, failures are aggregated in `errors` (spec §12.3).
+                let mut results: Vec<serde_json::Value> = Vec::new();
+                let mut errors: Vec<serde_json::Value> = Vec::new();
                 for p in paths {
-                    results.push(kb.upload(build(Some(p), None, None)).await?);
+                    match kb.upload(build(Some(p.clone()), None, None)).await {
+                        Ok(result) => results.push(serde_json::to_value(result)?),
+                        Err(e) => errors.push(serde_json::json!({
+                            "input": p,
+                            "error": skb_core::error::ErrorCode::from_std(&e)
+                                .map(|c| c.code_str().to_string())
+                                .unwrap_or_else(|| "E_INTERNAL".to_string()),
+                            "message": format!("{e:#}"),
+                        })),
+                    }
                 }
-                output(&results, &fmt)?;
+                if errors.is_empty() {
+                    output(&results, &fmt)?;
+                } else {
+                    output(
+                        &serde_json::json!({ "results": results, "errors": errors }),
+                        &fmt,
+                    )?;
+                }
             } else {
                 let result = kb.upload(build(path.clone(), None, None)).await?;
                 output(&result, &fmt)?;

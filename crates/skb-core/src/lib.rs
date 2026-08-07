@@ -377,6 +377,65 @@ mod tests {
         KnowledgeBase::open(config).await.unwrap()
     }
 
+    /// Build a config with a small `max_file_mb` for upload-safety tests.
+    fn small_limit_config(max_file_mb: u64) -> Config {
+        let mut config = mock_config();
+        config.upload.max_file_mb = max_file_mb;
+        config
+    }
+
+    /// Minimal valid PDF with `page_count` empty pages, hand-crafted with a
+    /// classic xref table (lopdf 0.42's writer produces inline streams its own
+    /// parser rejects, so files are generated directly).
+    fn make_pdf(page_count: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut offsets = vec![0usize];
+        let obj = |out: &mut Vec<u8>, offsets: &mut Vec<usize>, body: String| {
+            let id = offsets.len();
+            offsets.push(out.len());
+            out.extend_from_slice(format!("{id} 0 obj\n{body}\nendobj\n").as_bytes());
+        };
+        out.extend_from_slice(b"%PDF-1.4\n");
+        obj(
+            &mut out,
+            &mut offsets,
+            "<< /Type /Catalog /Pages 2 0 R >>".into(),
+        );
+        let kids: Vec<String> = (3..3 + page_count).map(|i| format!("{i} 0 R")).collect();
+        obj(
+            &mut out,
+            &mut offsets,
+            format!(
+                "<< /Type /Pages /Kids [{}] /Count {page_count} >>",
+                kids.join(" ")
+            ),
+        );
+        for _ in 0..page_count {
+            obj(
+                &mut out,
+                &mut offsets,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".into(),
+            );
+        }
+        let xref_start = out.len();
+        out.extend_from_slice(format!("xref\n0 {}\n", offsets.len()).as_bytes());
+        out.extend_from_slice(b"0000000000 65535 f \n");
+        for off in offsets.iter().skip(1) {
+            out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        let size = offsets.len();
+        out.extend_from_slice(
+            format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        out
+    }
+
+    fn base64_of(bytes: &[u8]) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
     fn cleanup(kb: &KnowledgeBase) {
         let _ = std::fs::remove_dir_all(&kb.config().storage.path);
     }
@@ -483,6 +542,270 @@ mod tests {
         let kb = setup().await;
         assert_eq!(kb.embedder().dimension(), 8);
         cleanup(&kb);
+    }
+
+    #[tokio::test]
+    async fn test_upload_rejects_oversized_base64() {
+        let n = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let mut config = small_limit_config(1);
+        config.storage.path = std::path::PathBuf::from(format!("./target/skb-test-b64-{n}"));
+        let _ = std::fs::remove_dir_all(&config.storage.path);
+        let kb = KnowledgeBase::open(config).await.unwrap();
+        let path = kb.config().storage.path.clone();
+
+        let big = vec![b'x'; 2 * 1024 * 1024];
+        let err = kb
+            .upload(UploadRequest {
+                path: None,
+                url: None,
+                content: None,
+                content_base64: Some(base64_of(&big)),
+                title: None,
+                tags: None,
+                metadata: None,
+                force: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err.code, ErrorCode::Validation));
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[tokio::test]
+    async fn test_upload_rejects_oversized_inline_content() {
+        let n = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let mut config = small_limit_config(1);
+        config.storage.path = std::path::PathBuf::from(format!("./target/skb-test-ct-{n}"));
+        let _ = std::fs::remove_dir_all(&config.storage.path);
+        let kb = KnowledgeBase::open(config).await.unwrap();
+        let path = kb.config().storage.path.clone();
+
+        let big = "x".repeat(2 * 1024 * 1024);
+        let err = kb
+            .upload(UploadRequest {
+                path: None,
+                url: None,
+                content: Some(big),
+                content_base64: None,
+                title: None,
+                tags: None,
+                metadata: None,
+                force: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err.code, ErrorCode::Validation));
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[tokio::test]
+    async fn test_upload_rejects_unsupported_binary() {
+        let kb = setup().await;
+        let path = kb.config().storage.path.clone();
+
+        // PNG magic bytes, not UTF-8 text.
+        let png = [0x89u8, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00];
+        let err = kb
+            .upload(UploadRequest {
+                path: None,
+                url: None,
+                content: None,
+                content_base64: Some(base64_of(&png)),
+                title: Some("image.png".into()),
+                tags: None,
+                metadata: None,
+                force: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err.code, ErrorCode::UnsupportedFormat));
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[tokio::test]
+    async fn test_upload_rejects_private_ip_url() {
+        let kb = setup().await;
+        let path = kb.config().storage.path.clone();
+
+        let err = kb
+            .upload(UploadRequest {
+                path: None,
+                url: Some("http://127.0.0.1:9/x.md".into()),
+                content: None,
+                content_base64: None,
+                title: None,
+                tags: None,
+                metadata: None,
+                force: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err.code, ErrorCode::Validation));
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[tokio::test]
+    async fn test_upload_rejects_pdf_page_bomb() {
+        let kb = setup().await;
+        let path = kb.config().storage.path.clone();
+
+        let bomb = make_pdf(crate::ingest::MAX_PDF_PAGES + 1);
+        let err = kb
+            .upload(UploadRequest {
+                path: None,
+                url: None,
+                content: None,
+                content_base64: Some(base64_of(&bomb)),
+                title: Some("bomb.pdf".into()),
+                tags: None,
+                metadata: None,
+                force: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err.code, ErrorCode::Validation));
+        assert!(err.message.contains("pages"));
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[tokio::test]
+    async fn test_upload_accepts_small_pdf() {
+        let kb = setup().await;
+        let path = kb.config().storage.path.clone();
+
+        let pdf = make_pdf(1);
+        let result = kb
+            .upload(UploadRequest {
+                path: None,
+                url: None,
+                content: None,
+                content_base64: Some(base64_of(&pdf)),
+                title: Some("small.pdf".into()),
+                tags: None,
+                metadata: None,
+                force: None,
+            })
+            .await
+            .unwrap();
+        // Empty page text extracts to nothing -> no chunks.
+        assert_eq!(result.status, "empty");
+        assert_eq!(result.sha256.len(), 64);
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[tokio::test]
+    async fn test_upload_force_replaces_chunks() {
+        let kb = setup().await;
+        let path = kb.config().storage.path.clone();
+        let content = "SurrealDB is a multi-model database. ".repeat(200);
+
+        let first = kb
+            .upload(UploadRequest {
+                path: None,
+                url: None,
+                content: Some(content.clone()),
+                content_base64: None,
+                title: Some("force-test".into()),
+                tags: None,
+                metadata: None,
+                force: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(first.status, "created");
+        assert!(first.chunks > 0);
+
+        // Same content without force: skipped.
+        let skipped = kb
+            .upload(UploadRequest {
+                path: None,
+                url: None,
+                content: Some(content.clone()),
+                content_base64: None,
+                title: Some("force-test".into()),
+                tags: None,
+                metadata: None,
+                force: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(skipped.status, "skipped");
+
+        // Same content with force: replaced (updated).
+        let updated = kb
+            .upload(UploadRequest {
+                path: None,
+                url: None,
+                content: Some(content.clone()),
+                content_base64: None,
+                title: Some("force-test".into()),
+                tags: None,
+                metadata: None,
+                force: Some(true),
+            })
+            .await
+            .unwrap();
+        assert_eq!(updated.status, "updated");
+        assert_eq!(updated.chunks, first.chunks);
+
+        let docs = kb
+            .list_documents(&ListQuery {
+                limit: Some(10),
+                offset: Some(0),
+                order: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(docs.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[tokio::test]
+    async fn test_upload_rolls_back_on_store_failure() {
+        let kb = setup().await;
+        let path = kb.config().storage.path.clone();
+
+        // An embedder with the wrong dimension makes the chunk write fail
+        // inside the transaction; the document must not survive.
+        let bad_embedder = MockEmbedder { dimension: 3 };
+        let err = ingest::upload(
+            kb.db(),
+            &bad_embedder,
+            kb.tokenizer().as_ref(),
+            kb.config(),
+            UploadRequest {
+                path: None,
+                url: None,
+                content: Some("some text that will fail to store".into()),
+                content_base64: None,
+                title: Some("rollback-test".into()),
+                tags: None,
+                metadata: None,
+                force: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err.code, ErrorCode::Db));
+
+        let docs = kb
+            .list_documents(&ListQuery {
+                limit: Some(10),
+                offset: Some(0),
+                order: None,
+            })
+            .await
+            .unwrap();
+        assert!(docs.is_empty());
+
+        let _ = std::fs::remove_dir_all(&path);
     }
 
     #[tokio::test]

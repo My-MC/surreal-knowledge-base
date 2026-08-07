@@ -50,14 +50,14 @@
 | 6 | Skill | 部分完了 | 実装済みレスポンスとSkillの引用・エラー説明の同期が必要 |
 | 7 | 仕上げ | 進行中 | ベンチ結果の判定、日本語FTS評価、公開手順の整理が必要 |
 | 8 | ort有効バイナリ + 依存最小化 | 部分完了 | CI証跡と生成artifactの扱い、Windows runtime案内のE2Eが必要 |
-| 9 | 仕様適合化と未実施機能 | 部分完了 | 9-1/9-2は完了。9-3〜9-7を順に実装する。既存の部分実装は完了条件を満たすまで未完了とする |
+| 9 | 仕様適合化と未実施機能 | 部分完了 | 9-1/9-2/9-3は完了。9-4〜9-7を順に実装する。既存の部分実装は完了条件を満たすまで未完了とする |
 
 ### 現状検証マトリクス
 
 | 領域 | 現在確認できる実装 | 不足する検証/実装 | 次のPhase |
 |---|---|---|---|
 | 設定・モデル | `./skb.toml`/ユーザー設定探索、`SKB_*`環境変数オーバーライド、model名のmeta照合、dimension/max_inputのモデル解決と`E_VALIDATION`、tokenizer fingerprintの生成・meta保存・`E_MODEL_MISMATCH`、再起動検証（9-1完了） | なし | — |
-| Upload | path/url/content/base64の基本処理、PDF抽出、allowed_dirs | 全経路の上限、SSRF、任意バイナリ、原子性、部分失敗 | 9-3 |
+| Upload | 全経路のサイズ上限、SSRF（手動redirect各hop検証・IPブロック）、base64任意バイナリ分類、単一トランザクション+rollback、CLI部分失敗errors[]（9-3完了） | なし | — |
 | Chunk/Graph/Search | token分割、基本抽出、vector/keyword/hybrid、単純graph expansion | heading、frontmatter/WikiLink、N-hop/re-rank、検索応答拡張 | 9-4 |
 | Reindex | ドキュメント単位のchunk置換transaction | mismatch時の起動、dimension/HNSW/meta、全体rollback、progress | 9-5 |
 | CLI/MCP | stdio MCP、主要CLI/MCP操作、resource-not-found、共通DTO/JSON Schema（9-2完了） | CLI parity、件数、query、JSON、progress、golden test | 9-6 |
@@ -248,7 +248,7 @@ Phase 0〜8 で確定した方針（`tokenizers`、SurrealKV 組込み、ORT 静
 
 ✅ 実装済み: 全DTOにJsonSchema derive、MCPの`tool_with_required`を`schema_for!`ベースに置換、`UploadRequest::validate`（one-of）、`SearchRequest`（query必須・mode enum・top_k/graph_expand範囲）、`GraphQueryRequest`（from必須・depth 1..=5・limit≥1）、`EntityInfo`/`LinkInfo`、`ListQuery`/`OrderBy`/`GetDocumentRequest`/`DeleteDocumentRequest`（公開APIの引数をDTO化）、`ReindexRequest`。CLIは同一DTOを構築。`skb list --limit 0`は`E_VALIDATION`に変更。
 
-### 9-3: Upload安全性・原子性（部分完了）
+### 9-3: Upload安全性・原子性（完了）
 
 - ファイル、stdin、base64、inline、URLの全入力に`upload.max_file_mb`を適用し、decode/extract前後のサイズを検査する。
 - base64は任意バイナリとして保持し、MIME/拡張子に応じてPDF等を抽出する。未対応形式は`E_UNSUPPORTED_FORMAT`で拒否する。
@@ -257,6 +257,10 @@ Phase 0〜8 で確定した方針（`tokenizers`、SurrealKV 組込み、ORT 静
 - document、chunk、entity、mentions、force更新時の旧データ削除を一つのトランザクションで処理する。
 - 複数入力時は成功結果と`errors[]`を集約し、一件の失敗で全体を中断しない。
 - **完了条件**: サイズ超過base64、圧縮爆弾、PDF爆弾、decode/extractの時間・メモリ・ページ・ネスト上限、DNS rebinding、redirect再検証、未対応形式、部分失敗、rollbackのテストが緑。
+
+✅ 実装済み: 全入力経路（file/stdin/base64/inline/URL）に `upload.max_file_mb` を decode/extract 前後で適用（stdin は `Read::take`、URL は `limit()` ストリーミング読み、base64 は `decoded_len_estimate` 事前検査 + 実長検査）。base64 を任意バイナリとして保持し、PDF マジック/MIME で分類、未対応バイナリは `E_UNSUPPORTED_FORMAT`。URL は http/https のみ、手動リダイレクトループ（上限5）で各 hop に scheme + DNS 事前解決・IP 検証（private/loopback/link-local/multicast/unspecified/broadcast/documentation/CGNAT/benchmarking/reserved/metadata 169.254.169.254）、connect/global タイムアウト。PDF はページ数上限200・処理時間上限30秒。document+chunk+mentions+force 時の旧データ削除を単一トランザクション化（失敗時 rollback）。CLI 複数入力（--recursive 等）は `{results, errors[]}` 集約で部分失敗を許容。
+
+※ DNS rebinding（TOCTOU）は接続直前の解決・検証で緩和。ureq 3.3 が resolver/connector 差し替えを公開していないため検証済みIPへの接続固定は未適用（残余リスクとして記録）。
 
 ### 9-4: Chunk・Graph・Search（部分完了）
 
