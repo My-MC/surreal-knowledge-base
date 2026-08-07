@@ -1,19 +1,51 @@
+use crate::config::SearchMode;
 use crate::db::Db;
 use crate::embed::Embed;
 use crate::error::{ErrorCode, SkbError};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SearchRequest {
     pub query: String,
-    pub mode: Option<String>,
+    pub mode: Option<SearchMode>,
+    #[schemars(range(min = 1))]
     pub top_k: Option<usize>,
+    #[schemars(range(min = 0, max = 5))]
     pub graph_expand: Option<usize>,
     pub filter: Option<HashMap<String, String>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl SearchRequest {
+    pub fn validate(&self) -> Result<(), SkbError> {
+        if self.query.trim().is_empty() {
+            return Err(SkbError::new(
+                ErrorCode::Validation,
+                "query must not be empty",
+            ));
+        }
+        if let Some(top_k) = self.top_k {
+            if top_k == 0 {
+                return Err(SkbError::new(
+                    ErrorCode::Validation,
+                    "top_k must be at least 1",
+                ));
+            }
+        }
+        if let Some(depth) = self.graph_expand {
+            if depth > 5 {
+                return Err(SkbError::new(
+                    ErrorCode::Validation,
+                    "graph_expand must be at most 5",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SearchHit {
     pub document_id: String,
     pub chunk_idx: usize,
@@ -21,7 +53,7 @@ pub struct SearchHit {
     pub score: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SearchResponse {
     pub hits: Vec<SearchHit>,
     pub mode: String,
@@ -34,20 +66,15 @@ pub async fn search(
     rrf_k: usize,
     req: SearchRequest,
 ) -> Result<SearchResponse, SkbError> {
-    let mode = req.mode.as_deref().unwrap_or("hybrid");
+    req.validate()?;
+    let mode = req.mode.unwrap_or(SearchMode::Hybrid);
     let top_k = req.top_k.unwrap_or(10);
     let start = std::time::Instant::now();
 
     let hits = match mode {
-        "vector" => vector_search(db, embedder, &req.query, top_k).await?,
-        "keyword" => keyword_search(db, &req.query, top_k).await?,
-        "hybrid" => hybrid_search(db, embedder, &req.query, top_k, rrf_k).await?,
-        _ => {
-            return Err(SkbError::new(
-                ErrorCode::Validation,
-                format!("unknown mode: {mode}"),
-            ))
-        }
+        SearchMode::Vector => vector_search(db, embedder, &req.query, top_k).await?,
+        SearchMode::Keyword => keyword_search(db, &req.query, top_k).await?,
+        SearchMode::Hybrid => hybrid_search(db, embedder, &req.query, top_k, rrf_k).await?,
     };
 
     let hits = if let Some(filter) = &req.filter {
@@ -58,7 +85,7 @@ pub async fn search(
 
     Ok(SearchResponse {
         hits,
-        mode: mode.to_string(),
+        mode: mode.as_str().to_string(),
         elapsed_ms: start.elapsed().as_millis() as u64,
     })
 }
@@ -305,6 +332,16 @@ fn validate_filter_fields(filter: &HashMap<String, String>) -> Result<(), SkbErr
 mod tests {
     use super::*;
 
+    fn request(query: &str) -> SearchRequest {
+        SearchRequest {
+            query: query.into(),
+            mode: None,
+            top_k: None,
+            graph_expand: None,
+            filter: None,
+        }
+    }
+
     #[test]
     fn validates_unsupported_filter_even_when_hits_are_empty() {
         let filter = HashMap::from([(String::from("unsupported"), String::from("value"))]);
@@ -316,5 +353,56 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn rejects_empty_query() {
+        let result = request("  ").validate();
+        assert!(matches!(
+            result,
+            Err(SkbError {
+                code: ErrorCode::Validation,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_zero_top_k() {
+        let mut req = request("hello");
+        req.top_k = Some(0);
+        assert!(matches!(
+            req.validate(),
+            Err(SkbError {
+                code: ErrorCode::Validation,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_graph_expand_beyond_five() {
+        let mut req = request("hello");
+        req.graph_expand = Some(6);
+        assert!(matches!(
+            req.validate(),
+            Err(SkbError {
+                code: ErrorCode::Validation,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn search_schema_marks_query_required_and_mode_enum() {
+        let schema = schemars::schema_for!(SearchRequest);
+        let value = serde_json::to_value(&schema).unwrap();
+        assert_eq!(value["required"], serde_json::json!(["query"]));
+        assert_eq!(
+            value["$defs"]["SearchMode"]["enum"],
+            serde_json::json!(["hybrid", "vector", "keyword"])
+        );
+        assert_eq!(value["properties"]["top_k"]["minimum"], 1);
+        assert_eq!(value["properties"]["graph_expand"]["maximum"], 5);
     }
 }

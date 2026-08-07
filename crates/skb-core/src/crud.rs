@@ -2,9 +2,10 @@ use crate::db::Db;
 use crate::embed::Embed;
 use crate::error::{ErrorCode, SkbError};
 use crate::tokenize::Tokenize;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DocumentSummary {
     pub id: String,
     pub title: String,
@@ -14,7 +15,7 @@ pub struct DocumentSummary {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DocumentDetail {
     pub id: String,
     pub title: String,
@@ -26,20 +27,20 @@ pub struct DocumentDetail {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ChunkInfo {
     pub idx: usize,
     pub content: String,
     pub token_count: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DeleteResult {
     pub document_id: String,
     pub chunks_deleted: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Stats {
     pub document_count: usize,
     pub chunk_count: usize,
@@ -48,24 +49,99 @@ pub struct Stats {
     pub embedding_dimension: usize,
 }
 
-pub async fn list_documents(
-    db: &Db,
-    limit: usize,
-    offset: usize,
-    order: Option<String>,
-) -> Result<Vec<DocumentSummary>, SkbError> {
-    let order_by = match order.as_deref() {
-        Some("created_asc") => "created_at ASC",
-        Some("title_asc") => "title ASC",
-        Some("title_desc") => "title DESC",
-        Some("created_desc") | None => "created_at DESC",
-        _ => {
-            return Err(SkbError::new(
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OrderBy {
+    CreatedDesc,
+    CreatedAsc,
+    TitleAsc,
+    TitleDesc,
+}
+
+impl std::str::FromStr for OrderBy {
+    type Err = SkbError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "created_desc" => Ok(OrderBy::CreatedDesc),
+            "created_asc" => Ok(OrderBy::CreatedAsc),
+            "title_asc" => Ok(OrderBy::TitleAsc),
+            "title_desc" => Ok(OrderBy::TitleDesc),
+            _ => Err(SkbError::new(
                 ErrorCode::Validation,
                 "order must be created_desc, created_asc, title_asc, or title_desc",
-            ))
+            )),
         }
-    };
+    }
+}
+
+impl OrderBy {
+    fn to_surql(self) -> &'static str {
+        match self {
+            OrderBy::CreatedDesc => "created_at DESC",
+            OrderBy::CreatedAsc => "created_at ASC",
+            OrderBy::TitleAsc => "title ASC",
+            OrderBy::TitleDesc => "title DESC",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct ListQuery {
+    #[schemars(range(min = 1))]
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+    pub order: Option<OrderBy>,
+}
+
+impl ListQuery {
+    pub fn validate(&self) -> Result<(), SkbError> {
+        if let Some(limit) = self.limit {
+            if limit == 0 {
+                return Err(SkbError::new(
+                    ErrorCode::Validation,
+                    "limit must be at least 1",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct GetDocumentRequest {
+    pub id: String,
+    pub include_chunks: Option<bool>,
+}
+
+impl GetDocumentRequest {
+    pub fn validate(&self) -> Result<(), SkbError> {
+        if self.id.trim().is_empty() {
+            return Err(SkbError::new(ErrorCode::Validation, "id must not be empty"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DeleteDocumentRequest {
+    pub id: String,
+}
+
+impl DeleteDocumentRequest {
+    pub fn validate(&self) -> Result<(), SkbError> {
+        if self.id.trim().is_empty() {
+            return Err(SkbError::new(ErrorCode::Validation, "id must not be empty"));
+        }
+        Ok(())
+    }
+}
+
+pub async fn list_documents(db: &Db, q: &ListQuery) -> Result<Vec<DocumentSummary>, SkbError> {
+    q.validate()?;
+    let limit = q.limit.unwrap_or(50);
+    let offset = q.offset.unwrap_or(0);
+    let order_by = q.order.map_or("created_at DESC", OrderBy::to_surql);
     let query = format!(
         "SELECT string::concat('document:', meta::id(id)) AS id, \
          title, source, sha256, created_at \
@@ -93,11 +169,9 @@ pub async fn list_documents(
         .collect())
 }
 
-pub async fn get_document(
-    db: &Db,
-    id: &str,
-    include_chunks: bool,
-) -> Result<DocumentDetail, SkbError> {
+pub async fn get_document(db: &Db, req: &GetDocumentRequest) -> Result<DocumentDetail, SkbError> {
+    req.validate()?;
+    let id = &req.id;
     let query = format!("SELECT title, source, source_type, sha256, content, created_at FROM {id}");
     let mut r = db
         .db
@@ -116,7 +190,7 @@ pub async fn get_document(
     }
     let row = &rows[0];
 
-    let chunks = if include_chunks {
+    let chunks = if req.include_chunks.unwrap_or(false) {
         let cq = format!(
             "SELECT idx, content, token_count FROM chunk WHERE document = {id} ORDER BY idx"
         );
@@ -154,7 +228,12 @@ pub async fn get_document(
     })
 }
 
-pub async fn delete_document(db: &Db, id: &str) -> Result<DeleteResult, SkbError> {
+pub async fn delete_document(
+    db: &Db,
+    req: &DeleteDocumentRequest,
+) -> Result<DeleteResult, SkbError> {
+    req.validate()?;
+    let id = &req.id;
     let query = format!("DELETE FROM chunk WHERE document = {id}; DELETE FROM {id};");
     db.db
         .query(&query)
@@ -237,4 +316,81 @@ fn val_str(row: &serde_json::Value, key: &str) -> String {
 
 fn val_u64(row: &serde_json::Value, key: &str) -> u64 {
     row[key].as_u64().unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn order_by_parses_known_values() {
+        assert_eq!(
+            OrderBy::from_str("created_desc").unwrap(),
+            OrderBy::CreatedDesc
+        );
+        assert_eq!(
+            OrderBy::from_str("created_asc").unwrap(),
+            OrderBy::CreatedAsc
+        );
+        assert_eq!(OrderBy::from_str("title_asc").unwrap(), OrderBy::TitleAsc);
+        assert_eq!(OrderBy::from_str("title_desc").unwrap(), OrderBy::TitleDesc);
+    }
+
+    #[test]
+    fn order_by_rejects_unknown_values() {
+        assert!(matches!(
+            OrderBy::from_str("bogus"),
+            Err(SkbError {
+                code: ErrorCode::Validation,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn list_query_rejects_zero_limit() {
+        let q = ListQuery {
+            limit: Some(0),
+            ..Default::default()
+        };
+        assert!(matches!(
+            q.validate(),
+            Err(SkbError {
+                code: ErrorCode::Validation,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn document_requests_reject_empty_id() {
+        for result in [
+            GetDocumentRequest {
+                id: String::new(),
+                include_chunks: None,
+            }
+            .validate(),
+            DeleteDocumentRequest { id: "  ".into() }.validate(),
+        ] {
+            assert!(matches!(
+                result,
+                Err(SkbError {
+                    code: ErrorCode::Validation,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn list_query_schema_marks_no_required_and_limit_min() {
+        let schema = schemars::schema_for!(ListQuery);
+        let value = serde_json::to_value(&schema).unwrap();
+        assert!(
+            value["required"].is_null() || value["required"] == serde_json::json!([]),
+            "no field may be required in ListQuery"
+        );
+        assert_eq!(value["properties"]["limit"]["minimum"], 1);
+    }
 }

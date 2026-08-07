@@ -10,7 +10,10 @@ pub mod search;
 pub mod tokenize;
 
 use crate::config::Config;
-use crate::crud::{DocumentDetail, DocumentSummary, Stats as CrudStats};
+use crate::crud::{
+    DeleteDocumentRequest, DeleteResult, DocumentDetail, DocumentSummary, GetDocumentRequest,
+    ListQuery, Stats as CrudStats,
+};
 use crate::db::Db;
 use crate::embed::{Embed, MockEmbedder};
 use crate::error::{ErrorCode, SkbError};
@@ -123,25 +126,19 @@ impl KnowledgeBase {
     }
 
     // ── CRUD ──
-    pub async fn list_documents(
-        &self,
-        limit: usize,
-        offset: usize,
-        order: Option<String>,
-    ) -> Result<Vec<DocumentSummary>, SkbError> {
-        crud::list_documents(&self.db, limit, offset, order).await
+    pub async fn list_documents(&self, q: &ListQuery) -> Result<Vec<DocumentSummary>, SkbError> {
+        crud::list_documents(&self.db, q).await
     }
 
-    pub async fn get_document(
-        &self,
-        id: &str,
-        include_chunks: bool,
-    ) -> Result<DocumentDetail, SkbError> {
-        crud::get_document(&self.db, id, include_chunks).await
+    pub async fn get_document(&self, req: &GetDocumentRequest) -> Result<DocumentDetail, SkbError> {
+        crud::get_document(&self.db, req).await
     }
 
-    pub async fn delete_document(&self, id: &str) -> Result<crate::crud::DeleteResult, SkbError> {
-        crud::delete_document(&self.db, id).await
+    pub async fn delete_document(
+        &self,
+        req: &DeleteDocumentRequest,
+    ) -> Result<DeleteResult, SkbError> {
+        crud::delete_document(&self.db, req).await
     }
 
     pub async fn stats(&self) -> Result<CrudStats, SkbError> {
@@ -169,7 +166,14 @@ impl KnowledgeBase {
         &self,
         doc_id: &str,
     ) -> Result<Vec<EntityInfo>, SkbError> {
-        let doc = crud::get_document(&self.db, doc_id, false).await?;
+        let doc = crud::get_document(
+            &self.db,
+            &crate::crud::GetDocumentRequest {
+                id: doc_id.to_string(),
+                include_chunks: Some(false),
+            },
+        )
+        .await?;
         let entities = graph::extract_entities(&doc.content);
 
         for entity in entities.iter() {
@@ -231,6 +235,7 @@ fn parse_hf_model(model: &str) -> (&str, &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::SearchMode;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -277,7 +282,7 @@ mod tests {
         let sres = kb
             .search(SearchRequest {
                 query: "database".into(),
-                mode: Some("vector".into()),
+                mode: Some(SearchMode::Vector),
                 top_k: Some(5),
                 graph_expand: None,
                 filter: None,
@@ -286,7 +291,14 @@ mod tests {
             .unwrap();
         assert!(!sres.hits.is_empty());
 
-        let docs = kb.list_documents(10, 0, None).await.unwrap();
+        let docs = kb
+            .list_documents(&ListQuery {
+                limit: Some(10),
+                offset: Some(0),
+                order: None,
+            })
+            .await
+            .unwrap();
         assert!(!docs.is_empty());
 
         let stats = kb.stats().await.unwrap();
@@ -331,7 +343,7 @@ mod tests {
         let sres = kb
             .search(SearchRequest {
                 query: "vector search".into(),
-                mode: Some("hybrid".into()),
+                mode: Some(SearchMode::Hybrid),
                 top_k: Some(5),
                 graph_expand: None,
                 filter: None,
@@ -342,6 +354,66 @@ mod tests {
         assert!(!sres.hits.is_empty());
 
         let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[tokio::test]
+    async fn test_upload_rejects_multiple_sources() {
+        let kb = setup().await;
+        let path = kb.config().storage.path.clone();
+
+        let err = kb
+            .upload(UploadRequest {
+                path: Some("a.md".into()),
+                url: Some("https://example.com/a.md".into()),
+                content: None,
+                content_base64: None,
+                title: None,
+                tags: None,
+                metadata: None,
+                force: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err.code, ErrorCode::Validation));
+        assert!(err.message.contains("only one"));
+
+        let err = kb
+            .upload(UploadRequest {
+                path: None,
+                url: None,
+                content: None,
+                content_base64: None,
+                title: Some("empty".into()),
+                tags: None,
+                metadata: None,
+                force: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err.code, ErrorCode::Validation));
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn upload_request_schema_has_one_of() {
+        let schema = schemars::schema_for!(UploadRequest);
+        let value = serde_json::to_value(&schema).unwrap();
+        let one_of = value["oneOf"].as_array().expect("oneOf missing");
+        assert_eq!(one_of.len(), 4);
+        assert!(one_of
+            .iter()
+            .any(|e| e["required"] == serde_json::json!(["path"])));
+        assert!(one_of
+            .iter()
+            .any(|e| e["required"] == serde_json::json!(["content_base64"])));
+    }
+
+    #[test]
+    fn graph_query_schema_marks_from_required() {
+        let schema = schemars::schema_for!(GraphQueryRequest);
+        let value = serde_json::to_value(&schema).unwrap();
+        assert_eq!(value["required"], serde_json::json!(["from"]));
     }
 
     #[tokio::test]
@@ -365,11 +437,24 @@ mod tests {
         .unwrap();
 
         // Verify document was created
-        let docs = kb.list_documents(10, 0, None).await.unwrap();
+        let docs = kb
+            .list_documents(&ListQuery {
+                limit: Some(10),
+                offset: Some(0),
+                order: None,
+            })
+            .await
+            .unwrap();
         assert!(!docs.is_empty());
 
         // Verify content is stored
-        let doc = kb.get_document(&docs[0].id, false).await.unwrap();
+        let doc = kb
+            .get_document(&GetDocumentRequest {
+                id: docs[0].id.clone(),
+                include_chunks: Some(false),
+            })
+            .await
+            .unwrap();
         assert!(doc.content.contains("SurrealDB"));
 
         let graph = kb

@@ -4,11 +4,18 @@ use crate::embed::Embed;
 use crate::error::{ErrorCode, SkbError};
 use crate::graph;
 use crate::tokenize::{Chunk, Tokenize};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(extend("oneOf" = [
+    {"required": ["path"]},
+    {"required": ["url"]},
+    {"required": ["content"]},
+    {"required": ["content_base64"]},
+]))]
 pub struct UploadRequest {
     pub path: Option<String>,
     pub url: Option<String>,
@@ -20,7 +27,33 @@ pub struct UploadRequest {
     pub force: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl UploadRequest {
+    /// Exactly one of `path`, `url`, `content`, `content_base64` must be set.
+    pub fn validate(&self) -> Result<(), SkbError> {
+        let sources = [
+            self.path.is_some(),
+            self.url.is_some(),
+            self.content.is_some(),
+            self.content_base64.is_some(),
+        ]
+        .into_iter()
+        .filter(|present| *present)
+        .count();
+        match sources {
+            0 => Err(SkbError::new(
+                ErrorCode::Validation,
+                "one of path, url, content, content_base64 is required",
+            )),
+            1 => Ok(()),
+            _ => Err(SkbError::new(
+                ErrorCode::Validation,
+                "only one of path, url, content, content_base64 may be specified",
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct UploadResult {
     pub document_id: Option<String>,
     pub title: String,
@@ -51,6 +84,7 @@ pub async fn upload(
     config: &Config,
     req: UploadRequest,
 ) -> Result<UploadResult, SkbError> {
+    req.validate()?;
     let force = req.force.unwrap_or(false);
     let doc = extract_document_data(req, config)?;
     let existed = doc_exists(db, &doc.sha256).await?;

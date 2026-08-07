@@ -1,4 +1,5 @@
 use anyhow::Context;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -111,12 +112,38 @@ impl Default for SearchConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum SearchMode {
     Hybrid,
     Vector,
     Keyword,
+}
+
+impl SearchMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SearchMode::Hybrid => "hybrid",
+            SearchMode::Vector => "vector",
+            SearchMode::Keyword => "keyword",
+        }
+    }
+}
+
+impl std::str::FromStr for SearchMode {
+    type Err = crate::error::SkbError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "hybrid" => Ok(SearchMode::Hybrid),
+            "vector" => Ok(SearchMode::Vector),
+            "keyword" => Ok(SearchMode::Keyword),
+            other => Err(crate::error::SkbError::new(
+                crate::error::ErrorCode::Validation,
+                format!("unknown mode: {other}"),
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
