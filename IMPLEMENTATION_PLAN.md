@@ -50,7 +50,7 @@
 | 6 | Skill | 部分完了 | 実装済みレスポンスとSkillの引用・エラー説明の同期が必要 |
 | 7 | 仕上げ | 進行中 | ベンチ結果の判定、日本語FTS評価、公開手順の整理が必要 |
 | 8 | ort有効バイナリ + 依存最小化 | 部分完了 | CI証跡と生成artifactの扱い、Windows runtime案内のE2Eが必要 |
-| 9 | 仕様適合化と未実施機能 | 部分完了 | 9-1〜9-5は完了。9-6〜9-7を順に実装する。既存の部分実装は完了条件を満たすまで未完了とする |
+| 9 | 仕様適合化と未実施機能 | 部分完了 | 9-1〜9-4は完了。9-5〜9-7を順に実装する。既存の部分実装は完了条件を満たすまで未完了とする |
 
 ### 現状検証マトリクス
 
@@ -59,7 +59,7 @@
 | 設定・モデル | `./skb.toml`/ユーザー設定探索、`SKB_*`環境変数オーバーライド、model名のmeta照合、dimension/max_inputのモデル解決と`E_VALIDATION`、tokenizer fingerprintの生成・meta保存・`E_MODEL_MISMATCH`、再起動検証（9-1完了） | なし | — |
 | Upload | 全経路のサイズ上限、SSRF（手動redirect各hop検証・IPブロック）、base64任意バイナリ分類、単一トランザクション+rollback、CLI部分失敗errors[]（9-3完了） | なし | — |
 | Chunk/Graph/Search | 見出し境界チャンキング+heading永続化、EntityExtractor（WikiLink/frontmatter/見出し階層part-of）、N-hop+再ランク、検索応答title/source/highlights/matched_entities（9-4完了） | なし | — |
-| Reindex | migrate前のmodel/dimension比較（新規DBは初期化パス）、open_for_reindex管理経路、dimension変更のwipe+フィールド再定義→HNSW再構築→meta更新、中断検出+再実行復旧、MCP/CLI progress（9-5完了） | なし | — |
+| Reindex | ドキュメント単位のchunk置換transaction | mismatch時の起動、dimension/HNSW/meta、全体rollback、progress | 9-5 |
 | CLI/MCP | stdio MCP、主要CLI/MCP操作、resource-not-found、共通DTO/JSON Schema（9-2完了） | CLI parity、件数、query、JSON、progress、golden test | 9-6 |
 | 配布/CI | 4ターゲットbuild matrix、linux smoke initialize | upload/search E2E、bunx、runtime依存、リリースゲート | 9-7 |
 
@@ -272,7 +272,7 @@ Phase 0〜8 で確定した方針（`tokenizers`、SurrealKV 組込み、ORT 静
 
 ✅ 実装済み: `EntityExtractor`トレイト + `RuleBasedExtractor`（WikiLink `[[target|alias]]`、frontmatter tags/aliases、Markdownリンク、inline tag、見出し、重複排除）。見出し境界優先のチャンキング（窓内の次見出し直前で分割、`Chunk.heading`を保存・永続化）、見出し階層の`related_to("part-of")`リンク（stack 方式で祖先と接続）。`SearchHit`に`title`/`source`/`highlights`(keyword)/`matched_entities`(graph拡張)を追加。N-hop拡張（`related_to`をホップ数分追跡）と再ランク（元スコア×ホップ減衰で統合ソート）。あわせて hybrid RRF の既存バグ（`row["id"]`参照で全行が空キーに集約）を修正。
 
-### 9-5: Reindex・進捗（完了）
+### 9-5: Reindex・進捗（部分完了）
 
 - `KnowledgeBase::open` は `Db::migrate` より前に保存済みの `embedding_model` と `embedding_dimension` を現在値と比較し、mismatch時は `E_MODEL_MISMATCH` を返してschema、field、index、metaを変更しない。dimension変更はreindex経路でのみ実施し、migrateはモデル一致時または本当に不足している定義への適用に限る。
 - reindexを起動時のmodel mismatch状態から実行できる管理経路を用意する。
@@ -280,10 +280,6 @@ Phase 0〜8 で確定した方針（`tokenizers`、SurrealKV 組込み、ORT 静
 - 中断時は旧schema、旧chunk、旧metaを維持し、再起動後も整合性を検証する。
 - MCP progress notificationとCLI progress barを実装する。
 - **完了条件**: dimension変更、HNSW再構築、metadata更新、途中失敗rollback、再起動復旧、progressのテストが緑。
-
-✅ 実装済み: `open` を `migrate` 前にモデル/次元比較（新規DBは `INFO FOR DB` で判定し初期化パス）、`open_for_reindex`（mismatch 状態から開く管理経路、CLI/MCP の reindex は `E_MODEL_MISMATCH` 時に自動フォールバック）。dimension 変更は (1) 単一トランザクションで旧chunk/mentions削除 + embeddingフィールド再定義 → (2) ドキュメント単位再構築 → (3) HNSWインデックス再定義 → (4) meta更新 の順で実行し、遷移直後に次元metaを更新して中断状態を常に検出可能に（再実行で完了）。`reindex` は進捗コールバック `(done, total)` を受け、MCP は progress notification（`notifications/progress`）、CLI は stderr に `reindexed n/total` を出力。
-
-※ SurrealDB 3.2.3 の制約: `DEFINE INDEX` の再構築は同一トランザクション内の未コミット DELETE を参照できないため、wipe+再定義と HNSW 再構築を分割した。中断・失敗時は必ず `E_MODEL_MISMATCH` で検出され、`reindex` 再実行で復旧する（完全 rollback は遷移トランザクション内のみ）。
 
 ### 9-6: CLI・MCP parity（部分完了）
 
