@@ -60,7 +60,7 @@ impl ServerHandler for SkbServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, rmcp::ErrorData> {
-        Ok(ListToolsResult::with_all_items(all_tools()))
+        Ok(ListToolsResult::with_all_items(all_tools()?))
     }
 
     async fn list_resources(
@@ -94,14 +94,25 @@ impl ServerHandler for SkbServer {
         let kb = self.kb.lock().await;
         let uri = request.uri.clone();
         let contents: Vec<ResourceContents> = if uri == "skb://documents" {
-            let docs = kb
-                .list_documents(&ListQuery {
-                    limit: Some(100),
-                    offset: None,
-                    order: None,
-                })
-                .await
-                .map_err(err_data)?;
+            // Fetch every document (the resource must not silently truncate).
+            let mut docs: Vec<skb_core::crud::DocumentSummary> = Vec::new();
+            let mut offset = 0;
+            loop {
+                let page = kb
+                    .list_documents(&ListQuery {
+                        limit: Some(100),
+                        offset: Some(offset),
+                        order: None,
+                    })
+                    .await
+                    .map_err(err_data)?;
+                let page_len = page.len();
+                docs.extend(page);
+                if page_len < 100 {
+                    break;
+                }
+                offset += 100;
+            }
             let body = serde_json::to_string_pretty(&docs)
                 .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
             vec![ResourceContents::text(body, uri)]
@@ -202,69 +213,78 @@ fn valid_err(msg: &str) -> String {
     skb_core::error::SkbError::new(skb_core::error::ErrorCode::Validation, msg.to_string())
         .to_string()
 }
-
 /// Build a tool definition whose input schema is generated from a shared
 /// `skb-core` DTO (the same type the CLI serializes). Hand-written schemas are
-/// intentionally avoided so CLI and MCP can never drift apart.
-fn tool_def(name: &'static str, desc: &'static str, schema: schemars::Schema) -> ToolDef {
+/// intentionally avoided so CLI and MCP can never drift apart. A conversion
+/// failure is a programmer error and is surfaced as an MCP protocol error.
+fn tool_def(
+    name: &'static str,
+    desc: &'static str,
+    schema: schemars::Schema,
+) -> Result<ToolDef, rmcp::ErrorData> {
     let value = schema.to_value();
-    let input_schema = serde_json::from_value::<rmcp::model::JsonObject>(value).unwrap_or_default();
-    ToolDef::new(name, desc, input_schema)
+    let input_schema = serde_json::from_value::<rmcp::model::JsonObject>(value).map_err(|e| {
+        rmcp::ErrorData::internal_error(
+            format!("internal error: generated schema for '{name}' is not an object: {e}"),
+            None,
+        )
+    })?;
+    Ok(ToolDef::new(name, desc, input_schema))
 }
 
-fn all_tools() -> Vec<ToolDef> {
-    vec![
+fn all_tools() -> Result<Vec<ToolDef>, rmcp::ErrorData> {
+    Ok(vec![
         tool_def(
             "skb_upload",
             "Upload a document. Exactly one of path, url, content, content_base64 is required",
             schemars::schema_for!(UploadRequest),
-        ),
+        )?,
         tool_def(
             "skb_search",
             "Search documents (hybrid, vector, or keyword)",
             schemars::schema_for!(SearchRequest),
-        ),
+        )?,
         tool_def(
             "skb_list_documents",
             "List all documents",
             schemars::schema_for!(ListQuery),
-        ),
+        )?,
         tool_def(
             "skb_get_document",
             "Get document details",
             schemars::schema_for!(GetDocumentRequest),
-        ),
+        )?,
         tool_def(
             "skb_delete_document",
             "Delete a document",
             schemars::schema_for!(DeleteDocumentRequest),
-        ),
+        )?,
         tool_def(
             "skb_stats",
             "Show statistics",
             schemars::schema_for!(NoParams),
-        ),
+        )?,
         tool_def(
             "skb_graph_query",
             "Query knowledge graph",
             schemars::schema_for!(GraphQueryRequest),
-        ),
+        )?,
         tool_def(
             "skb_graph_upsert_entity",
             "Create or update entity",
             schemars::schema_for!(EntityInfo),
-        ),
+        )?,
         tool_def(
             "skb_graph_link",
             "Link two entities",
             schemars::schema_for!(LinkInfo),
-        ),
+        )?,
         tool_def(
             "skb_reindex",
             "Reindex all documents",
             schemars::schema_for!(ReindexRequest),
-        ),
-    ]
+        )?,
+    ])
 }
 
 /// Degenerate request type for tools without parameters (`skb_stats`).
@@ -383,7 +403,7 @@ mod tests {
     use super::*;
 
     fn tool_schema(name: &str) -> Value {
-        let tools = all_tools();
+        let tools = all_tools().unwrap();
         let tool = tools
             .iter()
             .find(|t| t.name == name)
@@ -393,7 +413,7 @@ mod tests {
 
     #[test]
     fn every_tool_schema_is_a_valid_object() {
-        for tool in all_tools() {
+        for tool in all_tools().unwrap() {
             let value = serde_json::to_value(&tool.input_schema).unwrap();
             assert_eq!(value["type"], json!("object"), "tool: {}", tool.name);
             assert!(

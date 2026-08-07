@@ -116,10 +116,7 @@ pub struct GetDocumentRequest {
 
 impl GetDocumentRequest {
     pub fn validate(&self) -> Result<(), SkbError> {
-        if self.id.trim().is_empty() {
-            return Err(SkbError::new(ErrorCode::Validation, "id must not be empty"));
-        }
-        Ok(())
+        validate_document_id(&self.id)
     }
 }
 
@@ -130,11 +127,45 @@ pub struct DeleteDocumentRequest {
 
 impl DeleteDocumentRequest {
     pub fn validate(&self) -> Result<(), SkbError> {
-        if self.id.trim().is_empty() {
-            return Err(SkbError::new(ErrorCode::Validation, "id must not be empty"));
-        }
-        Ok(())
+        validate_document_id(&self.id)
     }
+}
+
+/// Validate that `id` is a `document:<key>` record id and reject inputs that
+/// could alter the query when interpolated (the query itself is parameterized
+/// as a second layer of defense).
+fn validate_document_id(id: &str) -> Result<(), SkbError> {
+    if id.trim().is_empty() {
+        return Err(SkbError::new(ErrorCode::Validation, "id must not be empty"));
+    }
+    let (table, key) = id.split_once(':').ok_or_else(|| {
+        SkbError::new(
+            ErrorCode::Validation,
+            format!("id must be a document record id (document:<key>), got '{id}'"),
+        )
+    })?;
+    if table != "document" {
+        return Err(SkbError::new(
+            ErrorCode::Validation,
+            format!("id must reference the document table, got '{table}'"),
+        ));
+    }
+    if key.is_empty() {
+        return Err(SkbError::new(
+            ErrorCode::Validation,
+            format!("id must not be empty: '{id}'"),
+        ));
+    }
+    if key
+        .chars()
+        .any(|c| matches!(c, '\'' | '"' | ';' | '`' | '\\' | '\n' | '\r'))
+    {
+        return Err(SkbError::new(
+            ErrorCode::Validation,
+            format!("invalid document id: '{id}'"),
+        ));
+    }
+    Ok(())
 }
 
 pub async fn list_documents(db: &Db, q: &ListQuery) -> Result<Vec<DocumentSummary>, SkbError> {
@@ -171,11 +202,12 @@ pub async fn list_documents(db: &Db, q: &ListQuery) -> Result<Vec<DocumentSummar
 
 pub async fn get_document(db: &Db, req: &GetDocumentRequest) -> Result<DocumentDetail, SkbError> {
     req.validate()?;
-    let id = &req.id;
-    let query = format!("SELECT title, source, source_type, sha256, content, created_at FROM {id}");
+    let record_id = document_record_id(&req.id)?;
+    let query = "SELECT title, source, source_type, sha256, content, created_at FROM $id";
     let mut r = db
         .db
-        .query(&query)
+        .query(query)
+        .bind(("id", record_id.clone()))
         .await
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("get: {e}")))?;
     let rows: Vec<serde_json::Value> = r
@@ -185,18 +217,17 @@ pub async fn get_document(db: &Db, req: &GetDocumentRequest) -> Result<DocumentD
     if rows.is_empty() {
         return Err(SkbError::new(
             ErrorCode::DocumentNotFound,
-            format!("not found: {id}"),
+            format!("not found: {}", req.id),
         ));
     }
     let row = &rows[0];
 
     let chunks = if req.include_chunks.unwrap_or(false) {
-        let cq = format!(
-            "SELECT idx, content, token_count FROM chunk WHERE document = {id} ORDER BY idx"
-        );
+        let cq = "SELECT idx, content, token_count FROM chunk WHERE document = $id ORDER BY idx";
         let mut r = db
             .db
-            .query(&cq)
+            .query(cq)
+            .bind(("id", record_id.clone()))
             .await
             .map_err(|e| SkbError::new(ErrorCode::Db, format!("get chunks: {e}")))?;
         let crows: Vec<serde_json::Value> = r
@@ -217,7 +248,7 @@ pub async fn get_document(db: &Db, req: &GetDocumentRequest) -> Result<DocumentD
     };
 
     Ok(DocumentDetail {
-        id: id.to_string(),
+        id: req.id.clone(),
         title: val_str(row, "title"),
         source: val_str(row, "source"),
         source_type: val_str(row, "source_type"),
@@ -233,15 +264,16 @@ pub async fn delete_document(
     req: &DeleteDocumentRequest,
 ) -> Result<DeleteResult, SkbError> {
     req.validate()?;
-    let id = &req.id;
-    let query = format!("DELETE FROM chunk WHERE document = {id}; DELETE FROM {id};");
+    let record_id = document_record_id(&req.id)?;
+    let query = "DELETE FROM chunk WHERE document = $id; DELETE $id;";
     db.db
-        .query(&query)
+        .query(query)
+        .bind(("id", record_id))
         .await
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete: {e}")))?;
 
     Ok(DeleteResult {
-        document_id: id.to_string(),
+        document_id: req.id.clone(),
         chunks_deleted: 0,
     })
 }
@@ -318,6 +350,15 @@ fn val_u64(row: &serde_json::Value, key: &str) -> u64 {
     row[key].as_u64().unwrap_or(0)
 }
 
+/// Convert a validated document id string into a typed `RecordId` for query
+/// parameter binding (never interpolated into SurrealQL).
+fn document_record_id(id: &str) -> Result<surrealdb::types::RecordId, SkbError> {
+    let (table, key) = id
+        .split_once(':')
+        .expect("validated document id must contain ':'");
+    Ok(surrealdb::types::RecordId::new(table, key))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,6 +422,53 @@ mod tests {
                 })
             ));
         }
+    }
+
+    #[test]
+    fn document_ids_require_document_table() {
+        for id in ["abc", "foo:bar", "document:", "entity:abc"] {
+            let result = GetDocumentRequest {
+                id: id.into(),
+                include_chunks: None,
+            }
+            .validate();
+            assert!(
+                matches!(
+                    result,
+                    Err(SkbError {
+                        code: ErrorCode::Validation,
+                        ..
+                    })
+                ),
+                "expected '{id}' to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn document_ids_reject_injection_characters() {
+        let malicious = "document:abc'; DELETE FROM document; --";
+        let result = DeleteDocumentRequest {
+            id: malicious.into(),
+        }
+        .validate();
+        assert!(matches!(
+            result,
+            Err(SkbError {
+                code: ErrorCode::Validation,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn document_ids_accept_normal_ids() {
+        GetDocumentRequest {
+            id: "document:01jhfabc123".into(),
+            include_chunks: None,
+        }
+        .validate()
+        .unwrap();
     }
 
     #[test]
