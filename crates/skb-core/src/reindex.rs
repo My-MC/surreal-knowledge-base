@@ -7,7 +7,7 @@ use crate::tokenize::Tokenize;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ReindexResult {
     pub documents_processed: usize,
     pub chunks_created: usize,
