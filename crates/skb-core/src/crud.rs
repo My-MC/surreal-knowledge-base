@@ -270,7 +270,9 @@ pub async fn delete_document(
         .query(query)
         .bind(("id", record_id))
         .await
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete: {e}")))?;
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete: {e}")))?
+        .check()
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete check: {e}")))?;
 
     Ok(DeleteResult {
         document_id: req.id.clone(),
