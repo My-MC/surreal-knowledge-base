@@ -229,8 +229,39 @@ impl KnowledgeBase {
         crud::stats(&self.db, self.embedder.as_ref()).await
     }
 
-    pub async fn doctor(&self) -> Result<String, SkbError> {
+    pub async fn doctor(&self) -> Result<crate::crud::DoctorReport, SkbError> {
         crud::doctor(&self.db, self.embedder.as_ref(), self.tokenizer.as_ref()).await
+    }
+
+    /// Execute raw SurrealQL (CLI-only escape hatch; never exposed via MCP,
+    /// spec §11.1). Returns the JSON result of every statement.
+    pub async fn query_surql(&self, surql: &str) -> Result<serde_json::Value, SkbError> {
+        if surql.trim().is_empty() {
+            return Err(SkbError::new(
+                ErrorCode::Validation,
+                "query must not be empty",
+            ));
+        }
+        let mut r = self
+            .db
+            .db
+            .query(surql)
+            .await
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("query: {e}")))?;
+        // Each statement's result is exposed as its own JSON value; a missing
+        // index (Value::None) marks the end of the statement list.
+        let mut statements: Vec<serde_json::Value> = Vec::new();
+        let mut idx = 0usize;
+        loop {
+            match r.take::<surrealdb::types::Value>(idx) {
+                Ok(value) if value != surrealdb::types::Value::None => {
+                    statements.push(value.into_json_value());
+                }
+                Ok(_) | Err(_) => break,
+            }
+            idx += 1;
+        }
+        Ok(serde_json::json!({ "statements": statements }))
     }
 
     // ── Graph ──

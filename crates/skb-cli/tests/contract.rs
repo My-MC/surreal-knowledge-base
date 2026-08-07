@@ -241,15 +241,7 @@ fn contract_upload_partial_failure() {
     )
     .unwrap();
 
-    let val = run_skb(
-        &[
-            "upload",
-            "--path",
-            docs_dir.to_str().unwrap(),
-            "--recursive",
-        ],
-        None,
-    );
+    let val = run_skb(&["upload", docs_dir.to_str().unwrap(), "--recursive"], None);
 
     let results = val["results"].as_array().unwrap();
     let errors = val["errors"].as_array().unwrap();
@@ -281,6 +273,95 @@ fn contract_search_response_fields() {
     let vec = run_skb(&["search", "zzzkw", "--mode", "vector"], None);
     assert!(vec["hits"][0]["title"].is_string());
     assert!(vec["hits"][0]["highlights"].is_null());
+}
+
+#[test]
+fn contract_list_chunk_count_and_delete_counts() {
+    setup_config();
+    run_skb(
+        &["upload", "--stdin", "--title", "counts-test"],
+        Some(TEST_DATA),
+    );
+
+    let list = run_skb(&["list"], None);
+    assert_eq!(list[0]["title"], "counts-test");
+    assert!(
+        list[0]["chunk_count"].as_u64().unwrap() >= 1,
+        "chunk_count must be populated"
+    );
+    let doc_id = list[0]["id"].as_str().unwrap().to_string();
+
+    let del = run_skb(&["delete", &doc_id, "--yes"], None);
+    assert_eq!(del["document_id"], doc_id);
+    assert!(
+        del["chunks_deleted"].as_u64().unwrap() >= 1,
+        "chunks_deleted must be populated"
+    );
+
+    // Deleting again: E_DOCUMENT_NOT_FOUND with exit code 6.
+    let output = Command::new(skb_binary())
+        .args(["delete", &doc_id, "--yes"])
+        .current_dir(test_dir())
+        .output()
+        .expect("failed to run skb delete");
+    assert_eq!(output.status.code(), Some(6));
+    let val: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(val["error"], "E_DOCUMENT_NOT_FOUND");
+}
+
+#[test]
+fn contract_query_command() {
+    setup_config();
+    run_skb(
+        &["upload", "--stdin", "--title", "query-test"],
+        Some(TEST_DATA),
+    );
+
+    let val = run_skb(
+        &["query", "SELECT count() AS c FROM document GROUP ALL"],
+        None,
+    );
+    let statements = val["statements"].as_array().unwrap();
+    assert_eq!(statements.len(), 1);
+    assert!(statements[0][0]["c"].as_u64().unwrap() >= 1);
+}
+
+#[test]
+fn contract_doctor_json() {
+    setup_config();
+    let val = run_skb(&["doctor"], None);
+    assert_eq!(val["db_connected"], true);
+    assert_eq!(val["embedding_dimension"], 8);
+    assert!(val["errors"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn contract_upload_glob_and_multiple_paths() {
+    setup_config();
+    let dir = test_dir();
+    let docs = dir.join("globdocs");
+    std::fs::create_dir_all(&docs).unwrap();
+    std::fs::write(docs.join("a.md"), "# A\n\ncontent a").unwrap();
+    std::fs::write(docs.join("b.md"), "# B\n\ncontent b").unwrap();
+    std::fs::write(docs.join("c.txt"), "plain c").unwrap();
+
+    let pattern = format!("{}/*.md", docs.display());
+    let val = run_skb(&["upload", &pattern], None);
+    assert_eq!(
+        val.as_array().unwrap().len(),
+        2,
+        "glob must match both md files"
+    );
+
+    let val = run_skb(&["upload", docs.join("c.txt").to_str().unwrap()], None);
+    assert_eq!(
+        val.as_array().unwrap().len(),
+        1,
+        "multiple/positional paths"
+    );
+
+    let list = run_skb(&["list"], None);
+    assert_eq!(list.as_array().unwrap().len(), 3);
 }
 
 #[test]

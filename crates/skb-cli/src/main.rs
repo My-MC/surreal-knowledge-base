@@ -22,10 +22,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Upload a document
+    /// Upload documents (multiple paths, glob patterns, --recursive for dirs)
     Upload {
-        #[arg(long)]
-        path: Option<String>,
+        #[arg(help = "files or glob patterns to upload")]
+        paths: Vec<String>,
         #[arg(long)]
         url: Option<String>,
         #[arg(long)]
@@ -88,6 +88,8 @@ enum Commands {
         #[arg(long, help = "report what a reindex would do without mutating")]
         dry_run: bool,
     },
+    /// Execute raw SurrealQL (advanced; not available via MCP)
+    Query { surql: String },
     /// Configuration management
     Config {
         #[command(subcommand)]
@@ -274,10 +276,39 @@ async fn run(cli: &Cli) -> Result<()> {
         Commands::Doctor => {
             let kb = KnowledgeBase::open(cfg()?).await?;
             let report = kb.doctor().await?;
-            println!("{report}");
+            if fmt == "json" {
+                output(&report, &fmt)?;
+            } else {
+                println!("=== SKB Doctor ===");
+                println!(
+                    "DB connection: {}",
+                    if report.db_connected {
+                        "[OK]"
+                    } else {
+                        "[FAIL]"
+                    }
+                );
+                println!("Embedding dim: {}", report.embedding_dimension);
+                println!("Tokenizer vocab: {}", report.tokenizer_vocab);
+                println!("Model: {}", report.model);
+                println!("Schema ver: {}", report.schema_version);
+                for error in &report.errors {
+                    println!("[ERROR] {error}");
+                }
+                if report.is_healthy() {
+                    println!("Status: healthy");
+                } else {
+                    println!("Status: {} problem(s) found", report.errors.len());
+                }
+            }
+        }
+        Commands::Query { surql } => {
+            let kb = KnowledgeBase::open(cfg()?).await?;
+            let result = kb.query_surql(surql).await?;
+            output(&result, &fmt)?;
         }
         Commands::Upload {
-            path,
+            paths,
             url,
             stdin,
             title,
@@ -294,23 +325,38 @@ async fn run(cli: &Cli) -> Result<()> {
                 .transpose()?
                 .unwrap_or_default();
 
-            // Expand a directory path into individual files when --recursive.
-            let mut paths: Vec<String> = Vec::new();
-            if *recursive {
-                if let Some(p) = path {
-                    let p = std::path::Path::new(p);
-                    if p.is_dir() {
-                        for entry in collect_files(p)? {
-                            paths.push(entry.display().to_string());
+            // Expand positional paths: glob patterns, and directories when
+            // --recursive (spec §12.2: 複数・glob・--recursive).
+            let mut expanded: Vec<String> = Vec::new();
+            for pattern in paths {
+                if pattern.contains(['*', '?', '[']) {
+                    let entries = glob::glob(pattern)
+                        .map_err(|e| anyhow::anyhow!("invalid glob '{pattern}': {e}"))?;
+                    let mut matched = false;
+                    for entry in entries {
+                        let path = entry.map_err(|e| anyhow::anyhow!("glob '{pattern}': {e}"))?;
+                        matched = true;
+                        if *recursive && path.is_dir() {
+                            for file in collect_files(&path)? {
+                                expanded.push(file.display().to_string());
+                            }
+                        } else if path.is_file() {
+                            expanded.push(path.display().to_string());
                         }
-                    } else {
-                        paths.push(p.display().to_string());
+                    }
+                    if !matched {
+                        anyhow::bail!("no files match '{pattern}'");
                     }
                 } else {
-                    anyhow::bail!("--recursive requires --path to a directory");
+                    let path = std::path::Path::new(pattern);
+                    if *recursive && path.is_dir() {
+                        for file in collect_files(path)? {
+                            expanded.push(file.display().to_string());
+                        }
+                    } else {
+                        expanded.push(pattern.clone());
+                    }
                 }
-            } else if let Some(p) = path {
-                paths.push(p.clone());
             }
 
             let build = |p: Option<String>, c: Option<String>, b64: Option<String>| UploadRequest {
@@ -347,12 +393,12 @@ async fn run(cli: &Cli) -> Result<()> {
                     let result = kb.upload(build(None, Some(content), None)).await?;
                     output(&result, &fmt)?;
                 }
-            } else if !paths.is_empty() {
+            } else if !expanded.is_empty() {
                 // Partial failure: successful uploads are committed and returned
                 // in `results`, failures are aggregated in `errors` (spec §12.3).
                 let mut results: Vec<serde_json::Value> = Vec::new();
                 let mut errors: Vec<serde_json::Value> = Vec::new();
-                for p in paths {
+                for p in expanded {
                     match kb.upload(build(Some(p.clone()), None, None)).await {
                         Ok(result) => results.push(serde_json::to_value(result)?),
                         Err(e) => errors.push(serde_json::json!({
@@ -373,8 +419,7 @@ async fn run(cli: &Cli) -> Result<()> {
                     )?;
                 }
             } else {
-                let result = kb.upload(build(path.clone(), None, None)).await?;
-                output(&result, &fmt)?;
+                anyhow::bail!("no input: provide paths, --url, or --stdin");
             }
         }
         Commands::Search {

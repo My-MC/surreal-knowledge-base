@@ -50,7 +50,7 @@
 | 6 | Skill | 部分完了 | 実装済みレスポンスとSkillの引用・エラー説明の同期が必要 |
 | 7 | 仕上げ | 進行中 | ベンチ結果の判定、日本語FTS評価、公開手順の整理が必要 |
 | 8 | ort有効バイナリ + 依存最小化 | 部分完了 | CI証跡と生成artifactの扱い、Windows runtime案内のE2Eが必要 |
-| 9 | 仕様適合化と未実施機能 | 部分完了 | 9-1〜9-5は完了。9-6〜9-7を順に実装する。既存の部分実装は完了条件を満たすまで未完了とする |
+| 9 | 仕様適合化と未実施機能 | 部分完了 | 9-1〜9-6は完了。9-7を実装する。既存の部分実装は完了条件を満たすまで未完了とする |
 
 ### 現状検証マトリクス
 
@@ -60,7 +60,7 @@
 | Upload | 全経路のサイズ上限、SSRF（手動redirect各hop検証・IPブロック）、base64任意バイナリ分類、単一トランザクション+rollback、CLI部分失敗errors[]（9-3完了） | なし | — |
 | Chunk/Graph/Search | 見出し境界チャンキング+heading永続化、EntityExtractor（WikiLink/frontmatter/見出し階層part-of）、N-hop+再ランク、検索応答title/source/highlights/matched_entities（9-4完了） | なし | — |
 | Reindex | migrate前のmodel/dimension比較（新規DBは初期化パス）、open_for_reindex管理経路、dimension変更のwipe+フィールド再定義→HNSW再構築→meta更新、中断検出+再実行復旧、MCP/CLI progress（9-5完了） | なし | — |
-| CLI/MCP | stdio MCP、主要CLI/MCP操作、resource-not-found、共通DTO/JSON Schema（9-2完了） | CLI parity、件数、query、JSON、progress、golden test | 9-6 |
+| CLI/MCP | 全CLIコマンド（複数パス/glob/`skb query`/doctor JSON/reindex progress）、chunk_count/chunks_deleted/E_DOCUMENT_NOT_FOUND、MCP resource-not-found、ゴールデン契約テスト（9-6完了） | なし | — |
 | 配布/CI | 4ターゲットbuild matrix、linux smoke initialize | upload/search E2E、bunx、runtime依存、リリースゲート | 9-7 |
 
 ---
@@ -281,17 +281,20 @@ Phase 0〜8 で確定した方針（`tokenizers`、SurrealKV 組込み、ORT 静
 - MCP progress notificationとCLI progress barを実装する。
 - **完了条件**: dimension変更、HNSW再構築、metadata更新、途中失敗rollback、再起動復旧、progressのテストが緑。
 
-✅ 実装済み: `open` を `migrate` 前にモデル/次元比較（新規DBは `INFO FOR DB` で判定し初期化パス）、`open_for_reindex`（mismatch 状態から開く管理経路、CLI/MCP の reindex は `E_MODEL_MISMATCH` 時に自動フォールバック）。dimension 変更は (1) 単一トランザクションで旧chunk/mentions削除 + embeddingフィールド再定義 → (2) ドキュメント単位再構築 → (3) HNSWインデックス再定義 → (4) meta更新 の順で実行し、遷移直後に次元metaを更新して中断状態を常に検出可能に（再実行で完了）。`reindex` は進捗コールバック `(done, total)` を受け、MCP は progress notification（`notifications/progress`）、CLI は stderr に `reindexed n/total` を出力。
+✅ 実装済み: `open` を `migrate` 前にモデル/次元比較（新規DBは `INFO FOR DB` で判定し初期化パス）、`open_for_reindex`（mismatch 状態から開く管理経路、CLI/MCP の reindex は `E_MODEL_MISMATCH` 時に自動フォールバック）。dimension 変更は (1) 単一トランザクションで旧chunk/mentions削除 + embeddingフィールド再定義 → (2) ドキュメント単位再構築 → (3) HNSWインデックス再定義 → (4) meta更新 の順で実行し、遷移直後に次元metaを更新して中断状態を常に検出可能に（再実行で完了）。`reindex` は進捗コールバック `(done, total)` を受け、MCP は progress notification（`notifications/progress`）、CLI は stderr に `
+reindexed n/total` を出力。
 
 ※ SurrealDB 3.2.3 の制約: `DEFINE INDEX` の再構築は同一トランザクション内の未コミット DELETE を参照できないため、wipe+再定義と HNSW 再構築を分割した。中断・失敗時は必ず `E_MODEL_MISMATCH` で検出され、`reindex` 再実行で復旧する（完全 rollback は遷移トランザクション内のみ）。
 
-### 9-6: CLI・MCP parity（部分完了）
+### 9-6: CLI・MCP parity（完了）
 
 - CLIの複数パス、glob、`graph entity add`、`skb query`、doctor JSON、progress表示を仕様へ合わせる。
 - listの`chunk_count`、deleteの`chunks_deleted`、不存在documentの`E_DOCUMENT_NOT_FOUND`を実装する。
 - resource-not-foundなどMCPエラー形式を共通DTOに合わせる。
 - CLI/MCPへ同一JSONを投入し、レスポンスの意味とエラーを比較するゴールデン契約テストを追加する。
 - **完了条件**: 全CLIコマンド、MCP tools/resources、JSON/table出力、件数、エラー、progressの契約テストが緑。
+
+✅ 実装済み: `skb upload <paths...>`（位置引数複数 + glob パターン + `--recursive`）、`skb query <surql>`（CLI 限定、全ステートメントを JSON で返却）、`skb doctor` の構造化 JSON（`DoctorReport`、table は人間可読）。list の `chunk_count`（GROUP BY で集計）、delete の `chunks_deleted` 実測値と不存在時の `E_DOCUMENT_NOT_FOUND`（終了コード 6）、MCP resource `skb://documents/{id}` の不存在は resource-not-found。ゴールデン契約テスト（`crates/skb-mcp/tests/golden.rs`）: 同一 JSON リクエストを stdio MCP と CLI の両経路に投入し、upload/search/list/stats/get/delete のレスポンスと `E_DOCUMENT_NOT_FOUND` エラーを正規化（id/時刻除去）して比較。
 
 ### 9-7: 配布・E2E・CI（部分完了）
 

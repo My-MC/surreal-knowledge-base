@@ -128,7 +128,12 @@ impl ServerHandler for SkbServer {
                     include_chunks: Some(true),
                 })
                 .await
-                .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+                .map_err(|e| match e.code {
+                    skb_core::error::ErrorCode::DocumentNotFound => {
+                        rmcp::ErrorData::resource_not_found(e.to_string(), None)
+                    }
+                    _ => rmcp::ErrorData::internal_error(e.to_string(), None),
+                })?;
             let body = serde_json::to_string_pretty(&doc)
                 .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
             vec![ResourceContents::text(body, uri)]

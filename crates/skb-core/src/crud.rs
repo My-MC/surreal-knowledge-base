@@ -4,6 +4,7 @@ use crate::error::{ErrorCode, SkbError};
 use crate::tokenize::Tokenize;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DocumentSummary {
@@ -188,15 +189,39 @@ pub async fn list_documents(db: &Db, q: &ListQuery) -> Result<Vec<DocumentSummar
         .take(0)
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("list take: {e}")))?;
 
+    // Per-document chunk counts in one grouped query (spec §9-6).
+    let mut r = db
+        .db
+        .query(
+            "SELECT string::concat('document:', meta::id(document)) AS document, \
+             count() AS c FROM chunk GROUP BY document",
+        )
+        .await
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("list chunks: {e}")))?;
+    let count_rows: Vec<serde_json::Value> = r
+        .take(0)
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("list chunks take: {e}")))?;
+    let counts: HashMap<String, usize> = count_rows
+        .iter()
+        .filter_map(|row| {
+            let doc = row["document"].as_str()?;
+            let count = row["c"].as_u64()? as usize;
+            Some((doc.to_string(), count))
+        })
+        .collect();
+
     Ok(rows
         .iter()
-        .map(|row| DocumentSummary {
-            id: val_str(row, "id"),
-            title: val_str(row, "title"),
-            source: val_str(row, "source"),
-            sha256: val_str(row, "sha256"),
-            chunk_count: 0,
-            created_at: val_str(row, "created_at"),
+        .map(|row| {
+            let id = val_str(row, "id");
+            DocumentSummary {
+                chunk_count: counts.get(&id).copied().unwrap_or(0),
+                id: id.clone(),
+                title: val_str(row, "title"),
+                source: val_str(row, "source"),
+                sha256: val_str(row, "sha256"),
+                created_at: val_str(row, "created_at"),
+            }
         })
         .collect())
 }
@@ -267,7 +292,37 @@ pub async fn delete_document(
 ) -> Result<DeleteResult, SkbError> {
     req.validate()?;
     let record_id = document_record_id(&req.id)?;
-    let query = "DELETE FROM chunk WHERE document = $id; DELETE $id;";
+
+    // A missing document is an explicit error (spec §9-6).
+    let mut r = db
+        .db
+        .query("SELECT id FROM $id LIMIT 1")
+        .bind(("id", record_id.clone()))
+        .await
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete lookup: {e}")))?;
+    let rows: Vec<serde_json::Value> = r
+        .take(0)
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete lookup take: {e}")))?;
+    if rows.is_empty() {
+        return Err(SkbError::new(
+            ErrorCode::DocumentNotFound,
+            format!("not found: {}", req.id),
+        ));
+    }
+
+    // Count the chunks that will be removed (spec §9-6).
+    let mut r = db
+        .db
+        .query("SELECT count() AS c FROM chunk WHERE document = $id GROUP ALL")
+        .bind(("id", record_id.clone()))
+        .await
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete count: {e}")))?;
+    let rows: Vec<serde_json::Value> = r
+        .take(0)
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete count take: {e}")))?;
+    let chunks_deleted = rows.first().and_then(|v| v["c"].as_u64()).unwrap_or(0) as usize;
+
+    let query = "DELETE FROM mentions WHERE in.document = $id; DELETE FROM chunk WHERE document = $id; DELETE $id;";
     db.db
         .query(query)
         .bind(("id", record_id))
@@ -278,7 +333,7 @@ pub async fn delete_document(
 
     Ok(DeleteResult {
         document_id: req.id.clone(),
-        chunks_deleted: 0,
+        chunks_deleted,
     })
 }
 
@@ -324,26 +379,57 @@ pub async fn stats(db: &Db, embedder: &dyn Embed) -> Result<Stats, SkbError> {
     })
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DoctorReport {
+    /// SurrealDB connectivity check.
+    pub db_connected: bool,
+    pub embedding_dimension: usize,
+    pub tokenizer_vocab: usize,
+    pub model: String,
+    pub schema_version: String,
+    /// Environment/connectivity problems detected (empty when healthy).
+    pub errors: Vec<String>,
+}
+
+impl DoctorReport {
+    pub fn is_healthy(&self) -> bool {
+        self.errors.is_empty()
+    }
+}
+
 pub async fn doctor(
     db: &Db,
     embedder: &dyn Embed,
     tokenizer: &dyn Tokenize,
-) -> Result<String, SkbError> {
-    let mut lines = vec!["=== SKB Doctor ===".to_string(), String::new()];
-    match db.db.query("SELECT 1").await {
-        Ok(_) => lines.push("[OK] SurrealDB connection".into()),
-        Err(e) => lines.push(format!("[FAIL] DB: {e}")),
+) -> Result<DoctorReport, SkbError> {
+    let mut report = DoctorReport {
+        db_connected: false,
+        embedding_dimension: embedder.dimension(),
+        tokenizer_vocab: tokenizer.vocab_size(),
+        model: db.get_meta("embedding_model").await?.unwrap_or_default(),
+        schema_version: db.get_meta("schema_version").await?.unwrap_or_default(),
+        errors: Vec::new(),
+    };
+    match db.db.query("RETURN 1").await {
+        Ok(_) => report.db_connected = true,
+        Err(e) => report.errors.push(format!("SurrealDB connection: {e}")),
     }
-    lines.push(format!("[INFO] Embedding dim: {}", embedder.dimension()));
-    lines.push(format!(
-        "[INFO] Tokenizer vocab: {}",
-        tokenizer.vocab_size()
-    ));
-    let m = db.get_meta("embedding_model").await?;
-    lines.push(format!("[INFO] Model: {}", m.unwrap_or_default()));
-    let v = db.get_meta("schema_version").await?;
-    lines.push(format!("[INFO] Schema ver: {}", v.unwrap_or_default()));
-    Ok(lines.join("\n"))
+    if report.embedding_dimension == 0 {
+        report
+            .errors
+            .push("embedding dimension is 0 (model not loaded?)".to_string());
+    }
+    if report.tokenizer_vocab == 0 {
+        report
+            .errors
+            .push("tokenizer vocab is 0 (tokenizer not loaded?)".to_string());
+    }
+    if report.model.is_empty() {
+        report
+            .errors
+            .push("embedding model is not recorded in meta".to_string());
+    }
+    Ok(report)
 }
 
 fn val_str(row: &serde_json::Value, key: &str) -> String {
