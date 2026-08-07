@@ -264,6 +264,26 @@ fn contract_upload_partial_failure() {
 }
 
 #[test]
+fn contract_search_response_fields() {
+    setup_config();
+    run_skb(
+        &["upload", "--stdin", "--title", "fields-test"],
+        Some("highlighted query words with zzzkw token"),
+    );
+
+    let search = run_skb(&["search", "zzzkw", "--mode", "keyword"], None);
+    let hit = &search["hits"][0];
+    assert_eq!(hit["title"], "fields-test");
+    assert!(hit["source"].is_string());
+    let hl = hit["highlights"].as_array().unwrap();
+    assert!(hl.iter().any(|v| v == "zzzkw"));
+
+    let vec = run_skb(&["search", "zzzkw", "--mode", "vector"], None);
+    assert!(vec["hits"][0]["title"].is_string());
+    assert!(vec["hits"][0]["highlights"].is_null());
+}
+
+#[test]
 fn contract_pipeline() {
     setup_config();
 

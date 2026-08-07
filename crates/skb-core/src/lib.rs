@@ -136,6 +136,7 @@ impl KnowledgeBase {
         if req.top_k.is_none() {
             req.top_k = Some(self.config.search.top_k);
         }
+        let top_k = req.top_k.unwrap_or(10);
         let mut resp = search::search(
             &self.db,
             self.embedder.as_ref(),
@@ -145,8 +146,26 @@ impl KnowledgeBase {
         .await?;
 
         if graph_expand > 0 && !resp.hits.is_empty() {
-            let expanded = graph::expand_search_hits(&self.db, &resp.hits, graph_expand).await?;
+            // Enrich original hits with their chunk's entities, then merge the
+            // expanded hits and re-rank everything by score (spec §6).
+            let (expanded, origin_entities) =
+                graph::expand_search_hits(&self.db, &resp.hits, graph_expand).await?;
+            for hit in resp.hits.iter_mut() {
+                let entities = origin_entities
+                    .get(&format!("{}/{}", hit.document_id, hit.chunk_idx))
+                    .cloned()
+                    .unwrap_or_default();
+                if !entities.is_empty() {
+                    hit.matched_entities = Some(entities);
+                }
+            }
             resp.hits.extend(expanded);
+            resp.hits.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            resp.hits.truncate(top_k);
         }
 
         Ok(resp)
@@ -463,6 +482,206 @@ mod tests {
             Ok(_) => panic!("expected open to fail"),
             Err(e) => e,
         }
+    }
+
+    #[tokio::test]
+    async fn test_graph_expansion_n_hop_with_rerank() {
+        let kb = setup().await;
+        let path = kb.config().storage.path.clone();
+
+        kb.upload(UploadRequest {
+            path: None,
+            url: None,
+            content: Some(
+                "[[Alpha]] project has unique zzzkeyword content about the alpha engine.".into(),
+            ),
+            content_base64: None,
+            title: Some("doc-a".into()),
+            tags: None,
+            metadata: None,
+            force: None,
+        })
+        .await
+        .unwrap();
+        kb.upload(UploadRequest {
+            path: None,
+            url: None,
+            content: Some(
+                "[[Beta]] project documents the beta engine with related details.".into(),
+            ),
+            content_base64: None,
+            title: Some("doc-b".into()),
+            tags: None,
+            metadata: None,
+            force: None,
+        })
+        .await
+        .unwrap();
+
+        // Alpha mentions in doc A's chunks become entities; relate Alpha -> Beta.
+        kb.link_entities(&LinkInfo {
+            from: "Alpha".into(),
+            to: "Beta".into(),
+            relation: "related".into(),
+            weight: Some(1.0),
+        })
+        .await
+        .unwrap();
+
+        let resp = kb
+            .search(SearchRequest {
+                query: "unique zzzkeyword alpha engine".into(),
+                mode: Some(SearchMode::Hybrid),
+                top_k: Some(10),
+                graph_expand: Some(2),
+                filter: None,
+            })
+            .await
+            .unwrap();
+
+        // Doc A is the direct hit and must rank above the graph-expanded doc B.
+        assert!(!resp.hits.is_empty());
+        assert!(resp.hits[0].title.as_deref() == Some("doc-a"));
+        let doc_a = &resp.hits[0];
+        assert!(
+            doc_a
+                .matched_entities
+                .as_deref()
+                .is_some_and(|e| e.iter().any(|n| n == "Alpha")),
+            "direct hit must carry its chunk's entities"
+        );
+        let doc_b = resp
+            .hits
+            .iter()
+            .find(|h| h.title.as_deref() == Some("doc-b"));
+        let doc_b = doc_b.expect("doc B must be found via 2-hop expansion");
+        assert!(
+            doc_b
+                .matched_entities
+                .as_deref()
+                .is_some_and(|e| e.iter().any(|n| n == "Beta")),
+            "expanded hit must record the connecting entity"
+        );
+        assert!(
+            doc_b.score < resp.hits[0].score,
+            "re-rank must keep direct hits first"
+        );
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[tokio::test]
+    async fn test_chunk_heading_persisted() {
+        let kb = setup().await;
+        let path = kb.config().storage.path.clone();
+        let content = format!(
+            "# Overview\n\n{}\n\n## Details\n\n{}",
+            "intro text for the overview section. ".repeat(60),
+            "detailed body text. ".repeat(60),
+        );
+
+        kb.upload(UploadRequest {
+            path: None,
+            url: None,
+            content: Some(content),
+            content_base64: None,
+            title: Some("headings".into()),
+            tags: None,
+            metadata: None,
+            force: None,
+        })
+        .await
+        .unwrap();
+
+        let docs = kb
+            .list_documents(&ListQuery {
+                limit: Some(10),
+                offset: Some(0),
+                order: None,
+            })
+            .await
+            .unwrap();
+        let doc = kb
+            .get_document(&GetDocumentRequest {
+                id: docs[0].id.clone(),
+                include_chunks: Some(true),
+            })
+            .await
+            .unwrap();
+        let chunks = doc.chunks.unwrap();
+        assert!(chunks.len() >= 2);
+        assert!(
+            chunks
+                .iter()
+                .any(|c| c.heading.as_deref() == Some("Overview")),
+            "overview section must keep its heading"
+        );
+        assert!(
+            chunks
+                .iter()
+                .any(|c| c.heading.as_deref() == Some("Details")),
+            "details section must keep its heading"
+        );
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[tokio::test]
+    async fn test_search_response_has_title_source_and_highlights() {
+        let kb = setup().await;
+        let path = kb.config().storage.path.clone();
+
+        kb.upload(UploadRequest {
+            path: None,
+            url: None,
+            content: Some("full text search highlights the query words here".into()),
+            content_base64: None,
+            title: Some("highlight-doc".into()),
+            tags: None,
+            metadata: None,
+            force: None,
+        })
+        .await
+        .unwrap();
+
+        let kw = kb
+            .search(SearchRequest {
+                query: "highlights query".into(),
+                mode: Some(SearchMode::Keyword),
+                top_k: Some(5),
+                graph_expand: None,
+                filter: None,
+            })
+            .await
+            .unwrap();
+        assert!(!kw.hits.is_empty());
+        let hit = &kw.hits[0];
+        assert_eq!(hit.title.as_deref(), Some("highlight-doc"));
+        assert!(hit.source.is_some());
+        let hl = hit
+            .highlights
+            .as_ref()
+            .expect("keyword hits have highlights");
+        assert!(hl.contains(&"highlights".to_string()));
+        assert!(hl.contains(&"query".to_string()));
+
+        let vec = kb
+            .search(SearchRequest {
+                query: "highlights".into(),
+                mode: Some(SearchMode::Vector),
+                top_k: Some(5),
+                graph_expand: None,
+                filter: None,
+            })
+            .await
+            .unwrap();
+        assert!(vec.hits[0].title.is_some());
+        assert!(
+            vec.hits[0].highlights.is_none(),
+            "vector mode has no highlights"
+        );
+
+        let _ = std::fs::remove_dir_all(&path);
     }
 
     #[tokio::test]
@@ -893,7 +1112,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(sres.mode, SearchMode::Hybrid);
+        // Both documents must surface as distinct hits (regression: hybrid RRF
+        // used to merge every row under an empty chunk id).
         assert!(!sres.hits.is_empty());
+        let titles: Vec<Option<&str>> = sres.hits.iter().map(|h| h.title.as_deref()).collect();
+        assert!(titles.contains(&Some("doc1")), "hits: {titles:?}");
+        assert!(titles.contains(&Some("doc2")), "hits: {titles:?}");
 
         let _ = std::fs::remove_dir_all(&path);
     }

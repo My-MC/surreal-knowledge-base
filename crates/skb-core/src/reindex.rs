@@ -151,7 +151,8 @@ async fn rebuild_document(
     let mut chunk_ids = Vec::with_capacity(chunks.len());
     for (i, (chunk, emb)) in chunks.iter().zip(embeddings.iter()).enumerate() {
         let chunk_sql = "CREATE chunk SET document = $document, idx = $idx, \
-                         content = $content, token_count = $token_count, embedding = $embedding \
+                         content = $content, token_count = $token_count, \
+                         heading = $heading, embedding = $embedding \
                          RETURN string::concat('chunk:', meta::id(id)) AS cid";
         let mut response = tx
             .query(chunk_sql)
@@ -159,6 +160,7 @@ async fn rebuild_document(
             .bind(("idx", i as i64))
             .bind(("content", chunk.content.clone()))
             .bind(("token_count", chunk.token_count as i64))
+            .bind(("heading", chunk.heading.clone()))
             .bind(("embedding", emb.clone()))
             .await
             .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex chunk: {e}")))?

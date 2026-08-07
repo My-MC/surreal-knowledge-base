@@ -51,6 +51,18 @@ pub struct SearchHit {
     pub chunk_idx: usize,
     pub content: String,
     pub score: f64,
+    /// Document title; always present for persisted chunks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Document source (path / url / inline); always present for persisted chunks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Query terms found in the chunk (keyword mode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub highlights: Option<Vec<String>>,
+    /// Entities that led to this hit via graph expansion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_entities: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -105,6 +117,7 @@ async fn vector_search(
     let emb_str = serde_json::to_string(&query_emb).unwrap_or_default();
     let sql = format!(
         "SELECT content, idx, meta::id(document) AS document, \
+         document.title AS title, document.source AS source, \
          vector::similarity::cosine(embedding, {emb_str}) AS score \
          FROM chunk WHERE embedding <|{top_k},40|> {emb_str} \
          ORDER BY score DESC LIMIT {top_k}"
@@ -119,13 +132,14 @@ async fn vector_search(
         .take(0)
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("vector take: {e}")))?;
 
-    rows_to_hits(&rows)
+    rows_to_hits(&rows, None)
 }
 
 async fn keyword_search(db: &Db, query: &str, top_k: usize) -> Result<Vec<SearchHit>, SkbError> {
     let escaped = query.replace('\'', "''");
     let sql = format!(
-        "SELECT content, idx, meta::id(document) AS document, search::score(0) AS score \
+        "SELECT content, idx, meta::id(document) AS document, \
+         document.title AS title, document.source AS source, search::score(0) AS score \
          FROM chunk WHERE content @@ '{escaped}' ORDER BY score DESC LIMIT {top_k}"
     );
 
@@ -138,7 +152,8 @@ async fn keyword_search(db: &Db, query: &str, top_k: usize) -> Result<Vec<Search
         .take(0)
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("keyword take: {e}")))?;
 
-    rows_to_hits(&rows)
+    let highlights = match_terms(query);
+    rows_to_hits(&rows, Some(&highlights))
 }
 
 async fn hybrid_search(
@@ -161,6 +176,7 @@ async fn hybrid_search(
     let vsql = format!(
         "SELECT content, idx, meta::id(id) AS chunk_id, \
          meta::id(document) AS document, \
+         document.title AS title, document.source AS source, \
          vector::similarity::cosine(embedding, {emb_str}) AS score \
          FROM chunk WHERE embedding <|{fetch_k},40|> {emb_str}"
     );
@@ -177,7 +193,8 @@ async fn hybrid_search(
     let escaped = query.replace('\'', "''");
     let ksql = format!(
         "SELECT content, idx, meta::id(id) AS chunk_id, \
-         meta::id(document) AS document, search::score(0) AS score \
+         meta::id(document) AS document, \
+         document.title AS title, document.source AS source, search::score(0) AS score \
          FROM chunk WHERE content @@ '{escaped}' ORDER BY score DESC LIMIT {fetch_k}"
     );
     let mut r = db
@@ -190,31 +207,37 @@ async fn hybrid_search(
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("hybrid kw take: {e}")))?;
 
     // RRF merge
+    type RankedHit = (f64, String, usize, String, Option<String>, Option<String>);
     let rrf_k = rrf_k.max(1) as f64;
-    let mut scores: HashMap<String, (f64, String, usize, String)> = HashMap::new();
+    let mut scores: HashMap<String, RankedHit> = HashMap::new();
 
     for (rank, row) in vrows.iter().enumerate() {
-        let id = row["id"].as_str().unwrap_or("").to_string();
+        let id = row["chunk_id"].as_str().unwrap_or("").to_string();
         let content = row["content"].as_str().unwrap_or("").to_string();
         let idx = row["idx"].as_u64().unwrap_or(0) as usize;
         let doc = row["document"].as_str().unwrap_or("").to_string();
+        let title = row["title"].as_str().map(|s| s.to_string());
+        let source = row["source"].as_str().map(|s| s.to_string());
         let rrf = 1.0 / (rrf_k + (rank as f64 + 1.0));
         scores
             .entry(id)
             .and_modify(|e| e.0 += rrf)
-            .or_insert((rrf, content, idx, doc));
+            .or_insert((rrf, content, idx, doc, title, source));
     }
 
+    let highlights = match_terms(query);
     for (rank, row) in krows.iter().enumerate() {
-        let id = row["id"].as_str().unwrap_or("").to_string();
+        let id = row["chunk_id"].as_str().unwrap_or("").to_string();
         let content = row["content"].as_str().unwrap_or("").to_string();
         let idx = row["idx"].as_u64().unwrap_or(0) as usize;
         let doc = row["document"].as_str().unwrap_or("").to_string();
+        let title = row["title"].as_str().map(|s| s.to_string());
+        let source = row["source"].as_str().map(|s| s.to_string());
         let rrf = 1.0 / (rrf_k + (rank as f64 + 1.0));
         scores
             .entry(id)
             .and_modify(|e| e.0 += rrf)
-            .or_insert((rrf, content, idx, doc));
+            .or_insert((rrf, content, idx, doc, title, source));
     }
 
     let mut sorted: Vec<_> = scores.into_iter().collect();
@@ -227,16 +250,23 @@ async fn hybrid_search(
 
     Ok(sorted
         .into_iter()
-        .map(|(_, (score, content, idx, doc))| SearchHit {
+        .map(|(_, (score, content, idx, doc, title, source))| SearchHit {
             document_id: doc,
             chunk_idx: idx,
             content,
             score,
+            title,
+            source,
+            highlights: Some(highlights.clone()),
+            matched_entities: None,
         })
         .collect())
 }
 
-fn rows_to_hits(rows: &[serde_json::Value]) -> Result<Vec<SearchHit>, SkbError> {
+fn rows_to_hits(
+    rows: &[serde_json::Value],
+    highlights: Option<&Vec<String>>,
+) -> Result<Vec<SearchHit>, SkbError> {
     let mut hits = Vec::new();
     for row in rows {
         hits.push(SearchHit {
@@ -244,9 +274,26 @@ fn rows_to_hits(rows: &[serde_json::Value]) -> Result<Vec<SearchHit>, SkbError> 
             chunk_idx: row["idx"].as_u64().unwrap_or(0) as usize,
             content: row["content"].as_str().unwrap_or("").to_string(),
             score: row["score"].as_f64().unwrap_or(0.0),
+            title: row["title"].as_str().map(|s| s.to_string()),
+            source: row["source"].as_str().map(|s| s.to_string()),
+            highlights: highlights.cloned(),
+            matched_entities: None,
         });
     }
     Ok(hits)
+}
+
+/// The query terms that a keyword search can highlight: whitespace/punctuation
+/// separated words of at least two characters.
+fn match_terms(query: &str) -> Vec<String> {
+    let mut terms: Vec<String> = query
+        .split(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
+        .filter(|t| t.len() >= 2)
+        .map(|t| t.to_lowercase())
+        .collect();
+    terms.sort();
+    terms.dedup();
+    terms
 }
 
 /// Post-filter hits by matching document fields (title/source/source_type/...).

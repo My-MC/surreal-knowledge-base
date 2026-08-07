@@ -32,6 +32,7 @@ pub struct ChunkInfo {
     pub idx: usize,
     pub content: String,
     pub token_count: usize,
+    pub heading: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -223,7 +224,7 @@ pub async fn get_document(db: &Db, req: &GetDocumentRequest) -> Result<DocumentD
     let row = &rows[0];
 
     let chunks = if req.include_chunks.unwrap_or(false) {
-        let cq = "SELECT idx, content, token_count FROM chunk WHERE document = $id ORDER BY idx";
+        let cq = "SELECT idx, content, token_count, heading FROM chunk WHERE document = $id ORDER BY idx";
         let mut r = db
             .db
             .query(cq)
@@ -240,6 +241,7 @@ pub async fn get_document(db: &Db, req: &GetDocumentRequest) -> Result<DocumentD
                     idx: val_u64(c, "idx") as usize,
                     content: val_str(c, "content"),
                     token_count: val_u64(c, "token_count") as usize,
+                    heading: c["heading"].as_str().map(|s| s.to_string()),
                 })
                 .collect(),
         )

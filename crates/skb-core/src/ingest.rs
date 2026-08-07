@@ -261,6 +261,8 @@ async fn store_and_index(
                 .map(|entity| entity.name),
         );
     }
+    // Heading hierarchy: sections become part-of their nearest ancestor.
+    graph::link_section_hierarchy(tx, &doc.content).await?;
     entities.sort();
     entities.dedup();
 
