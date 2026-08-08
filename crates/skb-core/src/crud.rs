@@ -94,6 +94,10 @@ pub struct ListQuery {
     pub order: Option<OrderBy>,
 }
 
+/// Upper bound for list_documents / list_chunks limits: results are materialized
+/// in memory, so unbounded limits would let a single request exhaust memory.
+const MAX_LIST_LIMIT: usize = 10_000;
+
 impl ListQuery {
     pub fn validate(&self) -> Result<(), SkbError> {
         if let Some(limit) = self.limit {
@@ -101,6 +105,12 @@ impl ListQuery {
                 return Err(SkbError::new(
                     ErrorCode::Validation,
                     "limit must be at least 1",
+                ));
+            }
+            if limit > MAX_LIST_LIMIT {
+                return Err(SkbError::new(
+                    ErrorCode::Validation,
+                    format!("limit must be at most {MAX_LIST_LIMIT}"),
                 ));
             }
         }

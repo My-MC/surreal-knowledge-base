@@ -700,4 +700,34 @@ mod tests {
             ));
         }
     }
+
+    #[test]
+    fn rejects_invalid_link_weight() {
+        for weight in [f64::NAN, f64::INFINITY, -1.0] {
+            assert!(matches!(
+                LinkInfo {
+                    from: "a".into(),
+                    to: "b".into(),
+                    relation: "r".into(),
+                    weight: Some(weight),
+                }
+                .validate(),
+                Err(SkbError {
+                    code: ErrorCode::Validation,
+                    ..
+                })
+            ));
+        }
+        // Valid non-negative finite weights are accepted.
+        for weight in [0.0, 1.0, 2.5] {
+            assert!(LinkInfo {
+                from: "a".into(),
+                to: "b".into(),
+                relation: "r".into(),
+                weight: Some(weight),
+            }
+            .validate()
+            .is_ok());
+        }
+    }
 }

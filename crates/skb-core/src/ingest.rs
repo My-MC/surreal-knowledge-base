@@ -317,27 +317,36 @@ async fn extract_document_data(
         Bytes(Vec<u8>),
     }
 
+    // Filesystem and network reads must not block the async runtime; they run
+    // on a blocking thread (spawn_blocking) so the MCP server stays responsive
+    // while a large file or slow URL is being fetched (spec §12.3).
     let (raw, source, source_type, file_title, content_type_hint) = if let Some(path) = &req.path {
-        let path = std::path::Path::new(path);
-        validate_path(path, config)?;
-        let meta = std::fs::metadata(path)
-            .map_err(|e| SkbError::new(ErrorCode::Io, format!("stat file: {e}")))?;
-        check_size(meta.len(), config)?;
-        let bytes = read_file_bytes(path)?;
+        let source = path.clone();
+        let path = std::path::PathBuf::from(path);
         let ft = path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("untitled")
             .to_string();
-        (
-            RawInput::Bytes(bytes),
-            path.display().to_string(),
-            "file".to_string(),
-            ft,
-            None,
-        )
+        let config = config.clone();
+        let raw = tokio::task::spawn_blocking(move || -> Result<RawInput, SkbError> {
+            validate_path(&path, &config)?;
+            let meta = std::fs::metadata(&path)
+                .map_err(|e| SkbError::new(ErrorCode::Io, format!("stat file: {e}")))?;
+            check_size(meta.len(), &config)?;
+            let bytes = read_file_bytes(&path)?;
+            Ok(RawInput::Bytes(bytes))
+        })
+        .await
+        .map_err(|e| SkbError::new(ErrorCode::Io, format!("file read join: {e}")))??;
+        (raw, source, "file".to_string(), ft, None)
     } else if let Some(url) = &req.url {
-        let (bytes, content_type) = fetch_url(url, config)?;
+        let url_fetch = url.clone();
+        let config = config.clone();
+        let (bytes, content_type) =
+            tokio::task::spawn_blocking(move || fetch_url(&url_fetch, &config))
+                .await
+                .map_err(|e| SkbError::new(ErrorCode::Io, format!("url fetch join: {e}")))??;
         (
             RawInput::Bytes(bytes),
             url.clone(),
@@ -439,18 +448,19 @@ fn is_pdf_bytes(bytes: &[u8]) -> bool {
 }
 
 /// Extract PDF text with resource guards: page count, wall-clock time and
-/// output size (PDF bomb mitigation, spec §12.3).
-/// Extract PDF text with resource guards (spec §12.3): page count is checked
-/// synchronously first; the (uninterruptible) extraction runs on a blocking
-/// thread so a wall-clock timeout returns an error instead of hanging the
-/// request. The page-count check is the primary PDF-bomb defense.
+/// output size (PDF bomb mitigation, spec §12.3). The page-count check is the
+/// primary PDF-bomb defense; parsing and extraction run on blocking threads
+/// under a wall-clock timeout so a slow document cannot hang the request.
 async fn extract_pdf_checked(bytes: &[u8]) -> Result<String, SkbError> {
-    let start = Instant::now();
-    let doc = tokio::task::spawn_blocking({
-        let bytes = bytes.to_vec();
-        move || lopdf::Document::load_mem(&bytes)
-    })
+    let doc = tokio::time::timeout(
+        Duration::from_secs(MAX_PROCESS_SECONDS),
+        tokio::task::spawn_blocking({
+            let bytes = bytes.to_vec();
+            move || lopdf::Document::load_mem(&bytes)
+        }),
+    )
     .await
+    .map_err(|_| SkbError::new(ErrorCode::Validation, "pdf parsing exceeded time limit"))?
     .map_err(|e| SkbError::new(ErrorCode::Io, format!("pdf parse join: {e}")))?
     .map_err(|e| SkbError::new(ErrorCode::Io, format!("pdf parse: {e}")))?;
     let pages = doc.get_pages().len();
@@ -458,12 +468,6 @@ async fn extract_pdf_checked(bytes: &[u8]) -> Result<String, SkbError> {
         return Err(SkbError::new(
             ErrorCode::Validation,
             format!("pdf has {pages} pages, limit is {MAX_PDF_PAGES}"),
-        ));
-    }
-    if start.elapsed() > Duration::from_secs(MAX_PROCESS_SECONDS) {
-        return Err(SkbError::new(
-            ErrorCode::Validation,
-            "pdf parsing exceeded time limit",
         ));
     }
     // The extraction itself is synchronous and cannot be cancelled; the
@@ -542,16 +546,10 @@ fn html_to_text(html: &str) -> String {
 }
 
 fn read_file_bytes(path: &std::path::Path) -> Result<Vec<u8>, SkbError> {
-    let start = Instant::now();
-    let bytes =
-        std::fs::read(path).map_err(|e| SkbError::new(ErrorCode::Io, format!("read file: {e}")))?;
-    if start.elapsed() > Duration::from_secs(MAX_PROCESS_SECONDS) {
-        return Err(SkbError::new(
-            ErrorCode::Validation,
-            "file read exceeded time limit",
-        ));
-    }
-    Ok(bytes)
+    // `std::fs::read` is synchronous; a wall-clock check after it completes
+    // cannot interrupt the read, so it is intentionally omitted here. Size
+    // guarding happens before the read in the caller (spec §12.3).
+    std::fs::read(path).map_err(|e| SkbError::new(ErrorCode::Io, format!("read file: {e}")))
 }
 
 fn max_upload_bytes(config: &Config) -> u64 {
@@ -577,23 +575,32 @@ fn check_size(len: u64, config: &Config) -> Result<(), SkbError> {
 /// - DNS resolution validated before every request (private/loopback/
 ///   link-local/multicast/metadata addresses are rejected)
 /// - redirects are followed manually, re-validating each hop
-/// - size-limited streaming read, connect/global timeouts
+/// - size-limited streaming read; the whole fetch (all redirect hops) is
+///   bounded by one MAX_PROCESS_SECONDS deadline
 fn fetch_url(url_str: &str, config: &Config) -> Result<(Vec<u8>, Option<String>), SkbError> {
     let max_bytes = max_upload_bytes(config);
-    let agent = ureq::Agent::config_builder()
-        .max_redirects(0)
-        .http_status_as_error(false)
-        .timeout_connect(Some(Duration::from_secs(10)))
-        .timeout_global(Some(Duration::from_secs(MAX_PROCESS_SECONDS)))
-        .build()
-        .new_agent();
+    let deadline = Instant::now() + Duration::from_secs(MAX_PROCESS_SECONDS);
 
     let mut current = url_str.to_string();
     for _ in 0..=MAX_REDIRECTS {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(SkbError::new(
+                ErrorCode::Validation,
+                "url fetch exceeded time limit",
+            ));
+        }
         let url = Url::parse(&current)
             .map_err(|e| SkbError::new(ErrorCode::Validation, format!("invalid url: {e}")))?;
         validate_url_host(&url)?;
 
+        let agent = ureq::Agent::config_builder()
+            .max_redirects(0)
+            .http_status_as_error(false)
+            .timeout_connect(Some(Duration::from_secs(10)))
+            .timeout_global(Some(remaining))
+            .build()
+            .new_agent();
         let mut resp = agent
             .get(&current)
             .call()
@@ -695,27 +702,46 @@ fn reject_blocked_ip(ip: IpAddr) -> Result<(), SkbError> {
 /// their IPv6 equivalents.
 pub fn is_blocked_ip(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(v4) => {
-            v4.is_private()
-                || v4.is_loopback()
-                || v4.is_link_local()
-                || v4.is_multicast()
-                || v4.is_unspecified()
-                || v4.is_broadcast()
-                || v4.is_documentation()
-                || is_cgnat(v4)
-                || is_benchmarking(v4)
-                || is_reserved_v4(v4)
-                || v4.octets() == [169, 254, 169, 254]
-        }
+        IpAddr::V4(v4) => is_blocked_v4(v4),
         IpAddr::V6(v6) => {
-            v6.is_loopback()
+            // IPv4-mapped (::ffff:0:0/96) and IPv4-compatible (::/96)
+            // addresses must be judged by their IPv4 form, otherwise
+            // ::ffff:127.0.0.1 etc. would bypass the SSRF guard. Native v6
+            // ranges are checked first so ::1 etc. cannot slip through the
+            // v4-compatible conversion (::1 -> 0.0.0.1).
+            if v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
                 || v6.is_unique_local()
                 || v6.is_unicast_link_local()
+                || is_documentation_v6(v6)
+                || is_nat64_v6(v6)
+            {
+                return true;
+            }
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_blocked_v4(v4);
+            }
+            if let Some(v4) = v6.to_ipv4() {
+                return is_blocked_v4(v4);
+            }
+            false
         }
     }
+}
+
+fn is_blocked_v4(v4: std::net::Ipv4Addr) -> bool {
+    v4.is_private()
+        || v4.is_loopback()
+        || v4.is_link_local()
+        || v4.is_multicast()
+        || v4.is_unspecified()
+        || v4.is_broadcast()
+        || v4.is_documentation()
+        || is_cgnat(v4)
+        || is_benchmarking(v4)
+        || is_reserved_v4(v4)
+        || v4.octets() == [169, 254, 169, 254]
 }
 
 /// 100.64.0.0/10 — shared address space (CGNAT).
@@ -733,6 +759,17 @@ fn is_benchmarking(v4: std::net::Ipv4Addr) -> bool {
 /// 240.0.0.0/4 — reserved for future use.
 fn is_reserved_v4(v4: std::net::Ipv4Addr) -> bool {
     v4.octets()[0] >= 240
+}
+
+/// 2001:db8::/32 — documentation range.
+fn is_documentation_v6(v6: std::net::Ipv6Addr) -> bool {
+    v6.segments()[0] == 0x2001 && v6.segments()[1] == 0x0db8
+}
+
+/// 64:ff9b::/96 — NAT64 well-known prefix (maps to IPv4 destinations).
+fn is_nat64_v6(v6: std::net::Ipv6Addr) -> bool {
+    let s = v6.segments();
+    s[0] == 0x64 && s[1] == 0xff9b && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0
 }
 
 fn base64_decode_checked(b64: &str, config: &Config) -> Result<Vec<u8>, SkbError> {
@@ -863,6 +900,32 @@ mod tests {
         for ip in blocked {
             let ip: IpAddr = ip.parse().unwrap();
             assert!(is_blocked_ip(ip), "{ip} should be blocked");
+        }
+        // IPv4-mapped / IPv4-compatible IPv6 must be judged by their IPv4 form.
+        let mapped: Vec<&str> = vec![
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
+            "::ffff:192.168.1.1",
+            "::ffff:169.254.169.254",
+            "::127.0.0.1",
+            "::ffff:100.64.0.1",
+        ];
+        for ip in mapped {
+            let ip: IpAddr = ip.parse().unwrap();
+            assert!(is_blocked_ip(ip), "{ip} should be blocked");
+        }
+        let extra_v6: Vec<&str> = vec!["2001:db8::1", "64:ff9b::c000:0201", "64:ff9b::7f00:1"];
+        for ip in extra_v6 {
+            let ip: IpAddr = ip.parse().unwrap();
+            assert!(is_blocked_ip(ip), "{ip} should be blocked");
+        }
+        // Only the complete 64:ff9b::/96 prefix is NAT64; an address with a
+        // non-zero segment inside the prefix must not match.
+        let not_nat64: Vec<&str> = vec!["64:ff9b:0:0:1::1", "64:ff9b:0:1::c000:0201"];
+        for ip in not_nat64 {
+            let v6: std::net::Ipv6Addr = ip.parse().unwrap();
+            assert!(!is_nat64_v6(v6), "{ip} must not match NAT64 /96");
+            assert!(!is_blocked_ip(v6.into()), "{ip} should be allowed");
         }
         let allowed: Vec<&str> = vec!["8.8.8.8", "1.1.1.1", "93.184.216.34", "2606:4700::1111"];
         for ip in allowed {

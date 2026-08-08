@@ -10,7 +10,12 @@ pub trait Tokenize: Send + Sync {
     /// (vocabulary), normalizer, pre-tokenizer, post-processor, decoder and
     /// other fields as loaded from `tokenizer.json`. Deterministic for a given
     /// file; used for fingerprinting (§5.4).
-    fn config_json(&self) -> Result<serde_json::Value, SkbError>;
+    fn config_json(&self) -> Result<serde_json::Value, SkbError> {
+        Err(SkbError::new(
+            ErrorCode::Tokenize,
+            "config_json is not supported by this tokenizer implementation",
+        ))
+    }
 }
 
 #[derive(Debug, Clone)]

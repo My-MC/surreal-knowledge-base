@@ -116,7 +116,7 @@ pub async fn reindex(
             .await?;
         db.set_meta(
             "embedding_max_input_tokens",
-            &config.embedding.max_input_tokens.to_string(),
+            &embedder.max_input_tokens().to_string(),
         )
         .await?;
         db.set_meta("schema_version", "1").await?;
