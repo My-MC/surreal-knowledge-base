@@ -203,51 +203,35 @@ impl Config {
         if let Some(v) = env_opt("SKB_EMBEDDING_TOKENIZER")? {
             self.embedding.tokenizer = v;
         }
-        if let Some(v) = env_opt("SKB_EMBEDDING_DIMENSION")? {
-            self.embedding.dimension = v
-                .parse()
-                .with_context(|| format!("SKB_EMBEDDING_DIMENSION must be a number, got '{v}'"))?;
+        if let Some(v) = env_parse("SKB_EMBEDDING_DIMENSION")? {
+            self.embedding.dimension = v;
         }
-        if let Some(v) = env_opt("SKB_EMBEDDING_MAX_INPUT_TOKENS")? {
-            self.embedding.max_input_tokens = v.parse().with_context(|| {
-                format!("SKB_EMBEDDING_MAX_INPUT_TOKENS must be a number, got '{v}'")
-            })?;
+        if let Some(v) = env_parse("SKB_EMBEDDING_MAX_INPUT_TOKENS")? {
+            self.embedding.max_input_tokens = v;
         }
         if let Some(v) = env_opt("SKB_EMBEDDING_DEVICE")? {
             self.embedding.device = v;
         }
-        if let Some(v) = env_opt("SKB_EMBEDDING_BATCH_SIZE")? {
-            self.embedding.batch_size = v
-                .parse()
-                .with_context(|| format!("SKB_EMBEDDING_BATCH_SIZE must be a number, got '{v}'"))?;
+        if let Some(v) = env_parse("SKB_EMBEDDING_BATCH_SIZE")? {
+            self.embedding.batch_size = v;
         }
-        if let Some(v) = env_opt("SKB_CHUNKING_MAX_TOKENS")? {
-            self.chunking.max_tokens = v
-                .parse()
-                .with_context(|| format!("SKB_CHUNKING_MAX_TOKENS must be a number, got '{v}'"))?;
+        if let Some(v) = env_parse("SKB_CHUNKING_MAX_TOKENS")? {
+            self.chunking.max_tokens = v;
         }
-        if let Some(v) = env_opt("SKB_CHUNKING_OVERLAP_TOKENS")? {
-            self.chunking.overlap_tokens = v.parse().with_context(|| {
-                format!("SKB_CHUNKING_OVERLAP_TOKENS must be a number, got '{v}'")
-            })?;
+        if let Some(v) = env_parse("SKB_CHUNKING_OVERLAP_TOKENS")? {
+            self.chunking.overlap_tokens = v;
         }
         if let Some(v) = env_opt("SKB_SEARCH_DEFAULT_MODE")? {
             self.search.default_mode = v.parse().map_err(|e: SkbError| e)?;
         }
-        if let Some(v) = env_opt("SKB_SEARCH_TOP_K")? {
-            self.search.top_k = v
-                .parse()
-                .with_context(|| format!("SKB_SEARCH_TOP_K must be a number, got '{v}'"))?;
+        if let Some(v) = env_parse("SKB_SEARCH_TOP_K")? {
+            self.search.top_k = v;
         }
-        if let Some(v) = env_opt("SKB_SEARCH_RRF_K")? {
-            self.search.rrf_k = v
-                .parse()
-                .with_context(|| format!("SKB_SEARCH_RRF_K must be a number, got '{v}'"))?;
+        if let Some(v) = env_parse("SKB_SEARCH_RRF_K")? {
+            self.search.rrf_k = v;
         }
-        if let Some(v) = env_opt("SKB_UPLOAD_MAX_FILE_MB")? {
-            self.upload.max_file_mb = v
-                .parse()
-                .with_context(|| format!("SKB_UPLOAD_MAX_FILE_MB must be a number, got '{v}'"))?;
+        if let Some(v) = env_parse("SKB_UPLOAD_MAX_FILE_MB")? {
+            self.upload.max_file_mb = v;
         }
         if let Some(v) = env_opt("SKB_UPLOAD_ALLOWED_DIRS")? {
             self.upload.allowed_dirs = v
@@ -285,12 +269,6 @@ impl Config {
             return Err(SkbError::new(
                 ErrorCode::Validation,
                 "chunking.max_tokens must be at least 1",
-            ));
-        }
-        if self.chunking.overlap_tokens == 0 {
-            return Err(SkbError::new(
-                ErrorCode::Validation,
-                "chunking.overlap_tokens must be at least 1",
             ));
         }
         if self.chunking.overlap_tokens >= self.chunking.max_tokens {
@@ -395,6 +373,22 @@ fn env_opt(key: &str) -> anyhow::Result<Option<String>> {
     }
 }
 
+/// Parse a numeric `SKB_*` environment variable, keeping a missing variable as
+/// `None` and centralizing the key/value/error context for all numeric fields.
+fn env_parse<T>(key: &str) -> anyhow::Result<Option<T>>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    match env_opt(key)? {
+        Some(v) => v
+            .parse::<T>()
+            .map(Some)
+            .map_err(|e| anyhow::anyhow!("{key} must be a number, got '{v}': {e}")),
+        None => Ok(None),
+    }
+}
+
 fn home_dir() -> PathBuf {
     if let Ok(home) = std::env::var("HOME") {
         return PathBuf::from(home);
@@ -423,16 +417,10 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_zero_overlap() {
+    fn validate_accepts_zero_overlap() {
         let mut c = resolved_default();
         c.chunking.overlap_tokens = 0;
-        assert!(matches!(
-            c.validate(),
-            Err(SkbError {
-                code: ErrorCode::Validation,
-                ..
-            })
-        ));
+        assert!(c.validate().is_ok());
     }
 
     #[test]
@@ -533,7 +521,7 @@ mod tests {
 
     #[test]
     fn env_overrides_apply_with_precedence() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _model = EnvGuard::set("SKB_EMBEDDING_MODEL", "env-model");
         let _tokens = EnvGuard::set("SKB_CHUNKING_MAX_TOKENS", "256");
         let _top_k = EnvGuard::set("SKB_SEARCH_TOP_K", "42");
@@ -552,7 +540,7 @@ mod tests {
 
     #[test]
     fn env_overrides_reject_invalid_numbers() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _tokens = EnvGuard::set("SKB_CHUNKING_MAX_TOKENS", "not-a-number");
         let mut config = Config::default();
         assert!(config.apply_env_overrides().is_err());
@@ -560,7 +548,7 @@ mod tests {
 
     #[test]
     fn load_works_without_config_file_when_env_set() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _model = EnvGuard::set("SKB_EMBEDDING_MODEL", "env-only-model");
         // Config::load() must not require a config file: defaults + env apply.
         // The env override wins over any file the cwd happens to contain, so

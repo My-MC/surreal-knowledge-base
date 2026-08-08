@@ -123,11 +123,23 @@ impl GetDocumentRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DeleteDocumentRequest {
     pub id: String,
+    /// Explicit confirmation that a destructive operation is intended.
+    /// Clients (especially the MCP `skb_delete_document` tool) must set this
+    /// to `true`; requests without confirmation are rejected (§12.3 safety).
+    #[serde(default)]
+    pub confirm: bool,
 }
 
 impl DeleteDocumentRequest {
     pub fn validate(&self) -> Result<(), SkbError> {
-        validate_document_id(&self.id)
+        validate_document_id(&self.id)?;
+        if !self.confirm {
+            return Err(SkbError::new(
+                ErrorCode::Validation,
+                "deletion requires confirm: true",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -414,7 +426,11 @@ mod tests {
                 include_chunks: None,
             }
             .validate(),
-            DeleteDocumentRequest { id: "  ".into() }.validate(),
+            DeleteDocumentRequest {
+                id: "  ".into(),
+                confirm: true,
+            }
+            .validate(),
         ] {
             assert!(matches!(
                 result,
@@ -452,6 +468,7 @@ mod tests {
         let malicious = "document:abc'; DELETE FROM document; --";
         let result = DeleteDocumentRequest {
             id: malicious.into(),
+            confirm: true,
         }
         .validate();
         assert!(matches!(
@@ -471,6 +488,26 @@ mod tests {
         }
         .validate()
         .unwrap();
+    }
+
+    #[test]
+    fn delete_requires_explicit_confirmation() {
+        let req = DeleteDocumentRequest {
+            id: "document:01jhfabc123".into(),
+            confirm: false,
+        };
+        assert!(matches!(
+            req.validate(),
+            Err(SkbError {
+                code: ErrorCode::Validation,
+                ..
+            })
+        ));
+        let confirmed = DeleteDocumentRequest {
+            id: "document:01jhfabc123".into(),
+            confirm: true,
+        };
+        assert!(confirmed.validate().is_ok());
     }
 
     #[test]

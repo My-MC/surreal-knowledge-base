@@ -32,6 +32,12 @@ impl SearchRequest {
                     "top_k must be at least 1",
                 ));
             }
+            if top_k > usize::MAX / 3 {
+                return Err(SkbError::new(
+                    ErrorCode::Validation,
+                    "top_k too large: fetch_k = top_k * 3 must not overflow",
+                ));
+            }
         }
         if let Some(depth) = self.graph_expand {
             if depth > 5 {

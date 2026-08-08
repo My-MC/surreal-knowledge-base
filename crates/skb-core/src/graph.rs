@@ -700,4 +700,21 @@ mod tests {
             ));
         }
     }
+
+    #[test]
+    fn rejects_negative_weight() {
+        assert!(matches!(
+            LinkInfo {
+                from: "a".into(),
+                to: "b".into(),
+                relation: "r".into(),
+                weight: Some(-0.1),
+            }
+            .validate(),
+            Err(SkbError {
+                code: ErrorCode::Validation,
+                ..
+            })
+        ));
+    }
 }

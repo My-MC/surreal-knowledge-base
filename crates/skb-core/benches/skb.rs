@@ -104,7 +104,7 @@ fn bench_tokenize(c: &mut Criterion) {
 }
 
 fn bench_embed(c: &mut Criterion) {
-    let mock = MockEmbedder { dimension: 1024 };
+    let mock = MockEmbedder;
     let texts: Vec<String> = (0..32)
         .map(|i| generate_text(2000).replace("[0]", &format!("[batch_{i}]")))
         .collect();

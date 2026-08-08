@@ -265,7 +265,10 @@ async fn run(cli: &Cli) -> Result<()> {
             }
             let kb = KnowledgeBase::open(cfg()?).await?;
             let result = kb
-                .delete_document(&DeleteDocumentRequest { id: id.clone() })
+                .delete_document(&DeleteDocumentRequest {
+                    id: id.clone(),
+                    confirm: true,
+                })
                 .await?;
             output(&result, &fmt)?;
         }

@@ -45,9 +45,7 @@ impl KnowledgeBase {
         let embedder: Arc<dyn Embed> = if config.embedding.onnx_path == "mock" {
             // MockEmbedder models a fixed 8-dimension embedder; any explicit
             // `embedding.dimension` must agree with it (spec §5.4 rule 2).
-            Arc::new(MockEmbedder {
-                dimension: embed::MOCK_EMBEDDER_DIMENSION,
-            })
+            Arc::new(MockEmbedder)
         } else {
             #[cfg(feature = "ort")]
             {
@@ -400,10 +398,18 @@ mod tests {
     }
 
     async fn open_expecting_error(config: Config) -> SkbError {
-        match KnowledgeBase::open(config).await {
-            Ok(_) => panic!("expected open to fail"),
-            Err(e) => e,
+        // A prior open's file lock may still be releasing; retry on Db errors
+        // until the real validation error surfaces.
+        for _ in 0..20 {
+            match KnowledgeBase::open(config.clone()).await {
+                Ok(_) => panic!("expected open to fail"),
+                Err(e) if matches!(e.code, ErrorCode::Db) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                Err(e) => return e,
+            }
         }
+        panic!("database lock was not released in time");
     }
 
     #[tokio::test]
@@ -456,16 +462,26 @@ mod tests {
 
         // Closing an embedded SurrealKv releases its file lock asynchronously
         // (the connection router task runs the datastore shutdown), so a short
-        // yield is needed before reopening the same path in-process.
+        // retry with backoff is needed before reopening the same path in-process.
+        async fn open_with_retry(config: Config) -> KnowledgeBase {
+            for _ in 0..20 {
+                match KnowledgeBase::open(config.clone()).await {
+                    Ok(kb) => return kb,
+                    Err(e) if matches!(e.code, ErrorCode::Db) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    Err(e) => panic!("unexpected error: {e}"),
+                }
+            }
+            panic!("database lock was not released in time");
+        }
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             // First open: fingerprint persisted.
-            KnowledgeBase::open(config_a.clone()).await.unwrap();
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            open_with_retry(config_a.clone()).await;
 
             // Restart with the same tokenizer: consistent.
-            KnowledgeBase::open(config_a.clone()).await.unwrap();
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            open_with_retry(config_a.clone()).await;
 
             // Different tokenizer file: E_MODEL_MISMATCH (reindex required).
             let mut config_b = config_a;
