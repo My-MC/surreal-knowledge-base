@@ -406,13 +406,24 @@ pub async fn doctor(
         db_connected: false,
         embedding_dimension: embedder.dimension(),
         tokenizer_vocab: tokenizer.vocab_size(),
-        model: db.get_meta("embedding_model").await?.unwrap_or_default(),
-        schema_version: db.get_meta("schema_version").await?.unwrap_or_default(),
+        model: String::new(),
+        schema_version: String::new(),
         errors: Vec::new(),
     };
+    // Connectivity first: the point of doctor is to report problems, so a
+    // broken database must never make the report itself fail.
     match db.db.query("RETURN 1").await {
         Ok(_) => report.db_connected = true,
         Err(e) => report.errors.push(format!("SurrealDB connection: {e}")),
+    }
+    // Meta reads can also fail; record instead of propagating.
+    match db.get_meta("embedding_model").await {
+        Ok(model) => report.model = model.unwrap_or_default(),
+        Err(e) => report.errors.push(format!("read embedding_model meta: {e}")),
+    }
+    match db.get_meta("schema_version").await {
+        Ok(version) => report.schema_version = version.unwrap_or_default(),
+        Err(e) => report.errors.push(format!("read schema_version meta: {e}")),
     }
     if report.embedding_dimension == 0 {
         report
