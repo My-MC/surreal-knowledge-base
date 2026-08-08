@@ -6,11 +6,14 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Practical upper bound for `top_k`; also keeps `fetch_k = top_k * 3` small.
+pub const MAX_TOP_K: usize = 1000;
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SearchRequest {
     pub query: String,
     pub mode: Option<SearchMode>,
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1, max = 1000))]
     pub top_k: Option<usize>,
     #[schemars(range(min = 0, max = 5))]
     pub graph_expand: Option<usize>,
@@ -32,10 +35,10 @@ impl SearchRequest {
                     "top_k must be at least 1",
                 ));
             }
-            if top_k > usize::MAX / 3 {
+            if top_k > MAX_TOP_K {
                 return Err(SkbError::new(
                     ErrorCode::Validation,
-                    "top_k too large: fetch_k = top_k * 3 must not overflow",
+                    format!("top_k must be at most {MAX_TOP_K}"),
                 ));
             }
         }
@@ -389,9 +392,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_top_k_that_overflows_fetch_k() {
+    fn rejects_top_k_above_max() {
         let mut req = request("hello");
-        req.top_k = Some(usize::MAX / 3 + 1);
+        req.top_k = Some(MAX_TOP_K + 1);
         assert!(matches!(
             req.validate(),
             Err(SkbError {
@@ -399,7 +402,7 @@ mod tests {
                 ..
             })
         ));
-        req.top_k = Some(usize::MAX / 3);
+        req.top_k = Some(MAX_TOP_K);
         assert!(req.validate().is_ok());
     }
 

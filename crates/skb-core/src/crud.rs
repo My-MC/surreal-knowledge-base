@@ -88,7 +88,7 @@ impl OrderBy {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
 pub struct ListQuery {
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1, max = 10_000))]
     pub limit: Option<usize>,
     pub offset: Option<usize>,
     pub order: Option<OrderBy>,
@@ -276,17 +276,21 @@ pub async fn delete_document(
     req.validate()?;
     let record_id = document_record_id(&req.id)?;
     let query = "DELETE FROM chunk WHERE document = $id; DELETE $id;";
-    db.db
+    let r = db
+        .db
         .query(query)
         .bind(("id", record_id))
         .await
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete: {e}")))?
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete: {e}")))?;
+    let deleted: Vec<serde_json::Value> = r
         .check()
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete check: {e}")))?;
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete check: {e}")))?
+        .take(0)
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete take: {e}")))?;
 
     Ok(DeleteResult {
         document_id: req.id.clone(),
-        chunks_deleted: 0,
+        chunks_deleted: deleted.len(),
     })
 }
 
@@ -415,6 +419,27 @@ mod tests {
     }
 
     #[test]
+    fn list_query_rejects_limit_above_max() {
+        let q = ListQuery {
+            limit: Some(MAX_LIST_LIMIT + 1),
+            ..Default::default()
+        };
+        assert!(matches!(
+            q.validate(),
+            Err(SkbError {
+                code: ErrorCode::Validation,
+                ..
+            })
+        ));
+
+        let ok = ListQuery {
+            limit: Some(MAX_LIST_LIMIT),
+            ..Default::default()
+        };
+        assert!(ok.validate().is_ok());
+    }
+
+    #[test]
     fn document_requests_reject_empty_id() {
         for result in [
             GetDocumentRequest {
@@ -490,5 +515,9 @@ mod tests {
             "no field may be required in ListQuery"
         );
         assert_eq!(value["properties"]["limit"]["minimum"], 1);
+        assert_eq!(
+            value["properties"]["limit"]["maximum"],
+            MAX_LIST_LIMIT as u64
+        );
     }
 }

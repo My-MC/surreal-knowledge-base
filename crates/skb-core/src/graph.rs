@@ -236,9 +236,8 @@ pub(crate) async fn index_chunk_entities_in_transaction(
     tx: &surrealdb::method::Transaction<surrealdb::engine::local::Db>,
     chunk_id: &str,
     chunk_content: &str,
-) -> Result<usize, SkbError> {
+) -> Result<Vec<String>, SkbError> {
     let entities = extract_entities(chunk_content);
-    let mut linked = 0;
     for entity in entities.iter() {
         tx.query(
             "INSERT INTO entity (id, name, kind, description) \
@@ -269,9 +268,8 @@ pub(crate) async fn index_chunk_entities_in_transaction(
             .map_err(|e| SkbError::new(ErrorCode::Db, format!("link chunk: {e}")))?
             .check()
             .map_err(|e| SkbError::new(ErrorCode::Db, format!("link chunk check: {e}")))?;
-        linked += 1;
     }
-    Ok(linked)
+    Ok(entities.into_iter().map(|e| e.name).collect())
 }
 
 /// Traverse entity relations, optionally starting from a document record.
