@@ -15,6 +15,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Format check
@@ -63,6 +65,8 @@ jobs:
       RUSTFLAGS: ${{ matrix.rustflags }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -98,8 +102,13 @@ jobs:
     name: Smoke test (linux-x64)
     runs-on: ubuntu-24.04
     needs: build
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v7
         with:
           node-version: 22
@@ -172,8 +181,13 @@ jobs:
     name: E2E (linux-arm64)
     runs-on: ubuntu-24.04-arm
     needs: build
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@v8
         with:
           name: npm-linux-arm64
@@ -205,8 +219,13 @@ jobs:
     name: E2E (darwin-arm64)
     runs-on: macos-latest
     needs: build
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@v8
         with:
           name: npm-darwin-arm64
@@ -236,8 +255,13 @@ jobs:
     name: E2E (win32-x64)
     runs-on: windows-2022
     needs: build
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@v8
         with:
           name: npm-win32-x64
