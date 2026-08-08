@@ -454,8 +454,12 @@ async fn extract_from_bytes(
     config: &Config,
 ) -> Result<(String, Option<String>), SkbError> {
     check_size(bytes.len() as u64, config)?;
-    let is_pdf = is_pdf_bytes(bytes) || mime_hint == Some("application/pdf");
-    if is_pdf {
+    // Magic bytes take precedence; the mime hint is only a fallback for
+    // content that cannot be interpreted as UTF-8, so a `.pdf` URL that
+    // actually returns HTML or text is ingested as text instead of failing
+    // PDF parsing.
+    let hint_pdf = mime_hint == Some("application/pdf");
+    if is_pdf_bytes(bytes) || (hint_pdf && std::str::from_utf8(bytes).is_err()) {
         let text = extract_pdf_checked(bytes).await?;
         return Ok((text, Some("application/pdf".to_string())));
     }

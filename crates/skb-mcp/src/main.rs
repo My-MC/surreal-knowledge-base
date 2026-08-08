@@ -193,6 +193,25 @@ impl ServerHandler for SkbServer {
     }
 }
 
+async fn send_progress(
+    peer: rmcp::service::Peer<RoleServer>,
+    token: rmcp::model::ProgressToken,
+    done: usize,
+    total: usize,
+) {
+    let notification = rmcp::model::Notification::new(
+        rmcp::model::ProgressNotificationParam::new(token, done as f64).with_total(total as f64),
+    );
+    if let Err(e) = peer
+        .send_notification(rmcp::model::ServerNotification::ProgressNotification(
+            notification,
+        ))
+        .await
+    {
+        tracing::warn!(error = %e, "progress notification send failed");
+    }
+}
+
 fn err_data(e: skb_core::error::SkbError) -> rmcp::ErrorData {
     match e.code {
         skb_core::error::ErrorCode::Validation => {
@@ -383,28 +402,26 @@ impl SkbServer {
                             tokio::sync::mpsc::channel::<(usize, usize)>(PROGRESS_EVERY * 2);
                         let peer = context.peer.clone();
                         let worker_token = token.clone();
+                        // Holds the latest (done, total) that could not be
+                        // queued because the channel was full. The worker sends
+                        // it after the channel closes so the final notification
+                        // is never dropped under backpressure.
+                        let pending_final: std::sync::Arc<
+                            std::sync::Mutex<Option<(usize, usize)>>,
+                        > = std::sync::Arc::new(std::sync::Mutex::new(None));
+                        let worker_final = pending_final.clone();
                         let handle = tokio::spawn(async move {
                             while let Some((done, total)) = rx.recv().await {
-                                let notification = rmcp::model::Notification::new(
-                                    rmcp::model::ProgressNotificationParam::new(
-                                        worker_token.clone(),
-                                        done as f64,
-                                    )
-                                    .with_total(total as f64),
-                                );
-                                if let Err(e) = peer
-                                    .send_notification(
-                                        rmcp::model::ServerNotification::ProgressNotification(
-                                            notification,
-                                        ),
-                                    )
-                                    .await
-                                {
-                                    tracing::warn!(
-                                        error = %e,
-                                        "progress notification send failed"
-                                    );
-                                }
+                                send_progress(peer.clone(), worker_token.clone(), done, total)
+                                    .await;
+                            }
+                            let last = {
+                                let mut guard = worker_final.lock().unwrap();
+                                guard.take()
+                            };
+                            if let Some((done, total)) = last {
+                                send_progress(peer.clone(), worker_token.clone(), done, total)
+                                    .await;
                             }
                         });
                         let callback: Box<skb_core::reindex::ProgressFn> =
@@ -412,12 +429,9 @@ impl SkbServer {
                                 if done != total && !done.is_multiple_of(PROGRESS_EVERY) {
                                     return;
                                 }
-                                // try_send fails only when the channel is full;
-                                // drop the message then (the worker is drained
-                                // after reindex returns). Never lose the final
-                                // done == total notification: it is retained
-                                // because a full channel keeps the queued tail.
-                                let _ = tx.try_send((done, total));
+                                if tx.try_send((done, total)).is_err() && done == total {
+                                    *pending_final.lock().unwrap() = Some((done, total));
+                                }
                             });
                         (Some(callback), Some(handle))
                     }

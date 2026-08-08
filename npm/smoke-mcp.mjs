@@ -15,6 +15,13 @@ if (!bin) {
 }
 
 const child = spawn(bin, [], { stdio: ["pipe", "pipe", "inherit"] });
+child.on("error", (err) => {
+  for (const [id, { reject, timer }] of pending) {
+    clearTimeout(timer);
+    pending.delete(id);
+    reject(new Error(`cannot start MCP binary '${bin}': ${err.message} (request ${id})`));
+  }
+});
 const rl = createInterface({ input: child.stdout });
 const pending = new Map();
 let nextId = 1;

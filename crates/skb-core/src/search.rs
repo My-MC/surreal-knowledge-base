@@ -147,16 +147,16 @@ async fn vector_search(
 }
 
 async fn keyword_search(db: &Db, query: &str, top_k: usize) -> Result<Vec<SearchHit>, SkbError> {
-    let escaped = query.replace('\'', "''");
     let sql = format!(
         "SELECT content, idx, meta::id(document) AS document, \
          document.title AS title, document.source AS source, search::score(0) AS score \
-         FROM chunk WHERE content @@ '{escaped}' ORDER BY score DESC LIMIT {top_k}"
+         FROM chunk WHERE content @@ $q ORDER BY score DESC LIMIT {top_k}"
     );
 
     let mut r = db
         .db
         .query(&sql)
+        .bind(("q", query.to_string()))
         .await
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("keyword: {e}")))?;
     let rows: Vec<serde_json::Value> = r
@@ -203,16 +203,16 @@ async fn hybrid_search(
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("hybrid vec take: {e}")))?;
 
     // Keyword results
-    let escaped = query.replace('\'', "''");
     let ksql = format!(
         "SELECT content, idx, meta::id(id) AS chunk_id, \
          meta::id(document) AS document, \
          document.title AS title, document.source AS source, search::score(0) AS score \
-         FROM chunk WHERE content @@ '{escaped}' ORDER BY score DESC LIMIT {fetch_k}"
+         FROM chunk WHERE content @@ $q ORDER BY score DESC LIMIT {fetch_k}"
     );
     let mut r = db
         .db
         .query(&ksql)
+        .bind(("q", query.to_string()))
         .await
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("hybrid kw: {e}")))?;
     let krows: Vec<serde_json::Value> = r
@@ -220,7 +220,14 @@ async fn hybrid_search(
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("hybrid kw take: {e}")))?;
 
     // RRF merge
-    type RankedHit = (f64, String, usize, String, Option<String>, Option<String>);
+    struct RankedHit {
+        score: f64,
+        content: String,
+        idx: usize,
+        document: String,
+        title: Option<String>,
+        source: Option<String>,
+    }
     let rrf_k = rrf_k.max(1) as f64;
     let mut scores: HashMap<String, RankedHit> = HashMap::new();
 
@@ -234,8 +241,15 @@ async fn hybrid_search(
         let rrf = 1.0 / (rrf_k + (rank as f64 + 1.0));
         scores
             .entry(id)
-            .and_modify(|e| e.0 += rrf)
-            .or_insert((rrf, content, idx, doc, title, source));
+            .and_modify(|e| e.score += rrf)
+            .or_insert(RankedHit {
+                score: rrf,
+                content,
+                idx,
+                document: doc,
+                title,
+                source,
+            });
     }
 
     let highlights = match_terms(query);
@@ -249,33 +263,41 @@ async fn hybrid_search(
         let rrf = 1.0 / (rrf_k + (rank as f64 + 1.0));
         scores
             .entry(id)
-            .and_modify(|e| e.0 += rrf)
-            .or_insert((rrf, content, idx, doc, title, source));
+            .and_modify(|e| e.score += rrf)
+            .or_insert(RankedHit {
+                score: rrf,
+                content,
+                idx,
+                document: doc,
+                title,
+                source,
+            });
     }
 
     let mut sorted: Vec<_> = scores.into_iter().collect();
     sorted.sort_by(|a, b| {
-        b.1 .0
-            .partial_cmp(&a.1 .0)
+        b.1.score
+            .partial_cmp(&a.1.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     sorted.truncate(top_k);
 
     Ok(sorted
         .into_iter()
-        .map(|(_, (score, content, idx, doc, title, source))| {
+        .map(|(_, hit)| {
+            let lower = hit.content.to_lowercase();
             let hit_highlights = highlights
                 .iter()
-                .filter(|t| content.to_lowercase().contains(t.as_str()))
+                .filter(|t| lower.contains(t.as_str()))
                 .cloned()
                 .collect::<Vec<String>>();
             SearchHit {
-                document_id: doc,
-                chunk_idx: idx,
-                content,
-                score,
-                title,
-                source,
+                document_id: hit.document,
+                chunk_idx: hit.idx,
+                content: hit.content,
+                score: hit.score,
+                title: hit.title,
+                source: hit.source,
                 highlights: (!hit_highlights.is_empty()).then_some(hit_highlights),
                 matched_entities: None,
             }
@@ -293,9 +315,10 @@ fn rows_to_hits(
         // Only terms actually present in this hit's content are highlighted;
         // a keyword row whose content lacks the query terms reports None.
         let hit_highlights = highlights.map(|terms| {
+            let lower = content.to_lowercase();
             let present: Vec<String> = terms
                 .iter()
-                .filter(|t| content.to_lowercase().contains(t.as_str()))
+                .filter(|t| lower.contains(t.as_str()))
                 .cloned()
                 .collect();
             (!present.is_empty()).then_some(present)
@@ -315,11 +338,11 @@ fn rows_to_hits(
 }
 
 /// The query terms that a keyword search can highlight: whitespace/punctuation
-/// separated words of at least two characters.
+/// separated words of at least two characters (unicode-aware).
 fn match_terms(query: &str) -> Vec<String> {
     let mut terms: Vec<String> = query
         .split(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
-        .filter(|t| t.len() >= 2)
+        .filter(|t| t.chars().count() >= 2)
         .map(|t| t.to_lowercase())
         .collect();
     terms.sort();

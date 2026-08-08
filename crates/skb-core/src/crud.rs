@@ -199,13 +199,21 @@ pub async fn list_documents(db: &Db, q: &ListQuery) -> Result<Vec<DocumentSummar
         .take(0)
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("list take: {e}")))?;
 
-    // Per-document chunk counts in one grouped query (spec §9-6).
+    // Per-document chunk counts in one grouped query limited to the listed
+    // page (spec §9-6) so a large store does not scan every chunk.
+    let doc_ids: Vec<surrealdb::types::RecordId> = rows
+        .iter()
+        .filter_map(|row| row["id"].as_str())
+        .filter_map(|id| id.split_once(':'))
+        .map(|(table, key)| surrealdb::types::RecordId::new(table, key))
+        .collect();
     let mut r = db
         .db
         .query(
             "SELECT string::concat('document:', meta::id(document)) AS document, \
-             count() AS c FROM chunk GROUP BY document",
+             count() AS c FROM chunk WHERE document IN $docs GROUP BY document",
         )
+        .bind(("docs", doc_ids))
         .await
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("list chunks: {e}")))?;
     let count_rows: Vec<serde_json::Value> = r
@@ -417,6 +425,10 @@ pub struct DoctorReport {
     pub tokenizer_vocab: usize,
     pub model: String,
     pub schema_version: String,
+    /// `tokenizers` crate version recorded at fingerprint time (spec §5.4).
+    pub tokenizer_version: String,
+    /// Fingerprint schema version of the stored tokenizer metadata.
+    pub tokenizer_fingerprint_schema: String,
     /// Environment/connectivity problems detected (empty when healthy).
     pub errors: Vec<String>,
 }
@@ -438,6 +450,8 @@ pub async fn doctor(
         tokenizer_vocab: tokenizer.vocab_size(),
         model: String::new(),
         schema_version: String::new(),
+        tokenizer_version: String::new(),
+        tokenizer_fingerprint_schema: String::new(),
         errors: Vec::new(),
     };
     // Connectivity first: the point of doctor is to report problems, so a
@@ -456,6 +470,18 @@ pub async fn doctor(
     match db.get_meta("schema_version").await {
         Ok(version) => report.schema_version = version.unwrap_or_default(),
         Err(e) => report.errors.push(format!("read schema_version meta: {e}")),
+    }
+    match db.get_meta("tokenizer_version").await {
+        Ok(v) => report.tokenizer_version = v.unwrap_or_default(),
+        Err(e) => report
+            .errors
+            .push(format!("read tokenizer_version meta: {e}")),
+    }
+    match db.get_meta("tokenizer_fingerprint_schema").await {
+        Ok(v) => report.tokenizer_fingerprint_schema = v.unwrap_or_default(),
+        Err(e) => report
+            .errors
+            .push(format!("read tokenizer_fingerprint_schema meta: {e}")),
     }
     if report.embedding_dimension == 0 {
         report

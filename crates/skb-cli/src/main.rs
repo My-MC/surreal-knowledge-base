@@ -413,25 +413,19 @@ async fn run(cli: &Cli) -> Result<u8> {
                 // Bound stdin reads by upload.max_file_mb (spec §12.3).
                 let max = kb.config().upload.max_file_mb.saturating_mul(1024 * 1024);
                 let read_cap = max.saturating_add(1);
-                if *base64 {
-                    let mut raw = Vec::new();
-                    std::io::stdin().take(read_cap).read_to_end(&mut raw)?;
-                    if raw.len() as u64 > max {
-                        anyhow::bail!("stdin exceeds upload.max_file_mb");
-                    }
-                    let content = String::from_utf8(raw)?;
-                    let result = kb.upload(build(None, None, None, Some(content))).await?;
-                    output(&result, &fmt)?;
-                } else {
-                    let mut raw = Vec::new();
-                    std::io::stdin().take(read_cap).read_to_end(&mut raw)?;
-                    if raw.len() as u64 > max {
-                        anyhow::bail!("stdin exceeds upload.max_file_mb");
-                    }
-                    let content = String::from_utf8(raw)?;
-                    let result = kb.upload(build(None, None, Some(content), None)).await?;
-                    output(&result, &fmt)?;
+                let mut raw = Vec::new();
+                std::io::stdin().take(read_cap).read_to_end(&mut raw)?;
+                if raw.len() as u64 > max {
+                    anyhow::bail!("stdin exceeds upload.max_file_mb");
                 }
+                let content = String::from_utf8(raw)?;
+                let req = if *base64 {
+                    build(None, None, None, Some(content))
+                } else {
+                    build(None, None, Some(content), None)
+                };
+                let result = kb.upload(req).await?;
+                output(&result, &fmt)?;
             } else if expanded.len() > 1 {
                 // Multi-input uploads: successful uploads are committed and
                 // returned in `results`, failures are aggregated in `errors`

@@ -659,7 +659,10 @@ pub fn extract_entities(content: &str) -> Vec<EntityInfo> {
     // Markdown links: [text](link)
     let link_re = regex::Regex::new(r"\[([^\]]+)\]\(([^)]+)\)").unwrap();
     for cap in link_re.captures_iter(content) {
-        let link_text = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+        let link_text = cap.get(1).map(|m| m.as_str()).unwrap_or("").trim();
+        if link_text.is_empty() {
+            continue;
+        }
         entities.push(EntityInfo {
             name: link_text.to_string(),
             kind: "reference".into(),

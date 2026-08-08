@@ -92,13 +92,19 @@ pub async fn reindex(
                     .into_iter()
                     .map(|e| e.name),
             );
-            result.entities_extracted = dry_entity_names.len();
             result.documents_processed += 1;
             result.chunks_created += chunks.len();
             result.tokens_total += chunks.iter().map(|c| c.token_count).sum::<usize>();
         }
+        result.entities_extracted = dry_entity_names.len();
         return Ok(result);
     }
+
+    // Mark the rebuild as in progress before touching data so an interruption
+    // (mid-wipe, mid-rebuild, or mid-index) is detectable on the next open with
+    // the *new* config, which would otherwise pass the model/dimension/
+    // fingerprint comparison and silently return empty or partial results.
+    db.set_meta("reindex_in_progress", "1").await?;
 
     if dimension_changed {
         // 1. Atomic transition: wipe old chunks/mentions and redefine the
@@ -151,11 +157,13 @@ pub async fn reindex(
             }
         }
         update_metas(db, embedder, tokenizer, config).await?;
+        db.set_meta("reindex_in_progress", "0").await?;
     } else {
         result = rebuild_all(db, embedder, tokenizer, config, &docs, progress).await?;
         // Always refresh metadata after a successful rebuild: even a
         // tokenizer-only change must record the new fingerprint (§5.4).
         update_metas(db, embedder, tokenizer, config).await?;
+        db.set_meta("reindex_in_progress", "0").await?;
     }
 
     Ok(result)

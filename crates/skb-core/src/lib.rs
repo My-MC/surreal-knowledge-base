@@ -99,6 +99,17 @@ impl KnowledgeBase {
         // database has no meta table yet and takes the initialization path.
         let is_new = db.is_new_database().await?;
         if !is_new && !allow_mismatch {
+            // An interrupted reindex leaves the store in a partial state (old
+            // chunks wiped, new ones not all rebuilt) that normal model/
+            // dimension/fingerprint comparisons cannot detect once the meta has
+            // been updated to the new values. Refuse to operate until the
+            // rebuild is re-run to completion (spec §9-5).
+            if db.get_meta("reindex_in_progress").await?.as_deref() == Some("1") {
+                return Err(SkbError::new(
+                    ErrorCode::ModelMismatch,
+                    "an interrupted reindex left the database incomplete. Run reindex to rebuild.",
+                ));
+            }
             if let Some(ref stored) = db.get_meta("embedding_model").await? {
                 if stored != &config.embedding.model {
                     return Err(SkbError::new(
@@ -239,22 +250,23 @@ impl KnowledgeBase {
         &self,
         max: usize,
     ) -> Result<(Vec<DocumentSummary>, bool), SkbError> {
+        const PAGE: usize = 100;
         let mut docs = Vec::new();
         let mut offset = 0;
         loop {
             let page = self
                 .list_documents(&ListQuery {
-                    limit: Some(100),
+                    limit: Some(PAGE),
                     offset: Some(offset),
                     order: None,
                 })
                 .await?;
             let page_len = page.len();
             docs.extend(page);
-            if page_len < 100 || docs.len() > max {
+            if page_len < PAGE || docs.len() > max {
                 break;
             }
-            offset += 100;
+            offset += PAGE;
         }
         let truncated = docs.len() > max;
         docs.truncate(max);
@@ -300,18 +312,21 @@ impl KnowledgeBase {
         let mut r = r
             .check()
             .map_err(|e| SkbError::new(ErrorCode::Db, format!("query check: {e}")))?;
-        // Each statement's result is exposed as its own JSON value; a missing
-        // index (Value::None) marks the end of the statement list.
+        // Each statement's result is exposed as its own JSON value, bounded by
+        // the actual statement count so a legitimate Value::None (e.g. RETURN
+        // NONE or COMMIT) is preserved rather than truncating the list.
+        let n = r.num_statements();
         let mut statements: Vec<serde_json::Value> = Vec::new();
-        let mut idx = 0usize;
-        loop {
+        for idx in 0..n {
             match r.take::<surrealdb::types::Value>(idx) {
-                Ok(value) if value != surrealdb::types::Value::None => {
-                    statements.push(value.into_json_value());
+                Ok(value) => statements.push(value.into_json_value()),
+                Err(e) => {
+                    return Err(SkbError::new(
+                        ErrorCode::Db,
+                        format!("query take {idx}: {e}"),
+                    ))
                 }
-                Ok(_) | Err(_) => break,
             }
-            idx += 1;
         }
         Ok(serde_json::json!({ "statements": statements }))
     }

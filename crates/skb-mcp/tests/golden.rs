@@ -166,7 +166,6 @@ fn run_cli(dir: &std::path::Path, args: &[&str], stdin_data: Option<&str>) -> Re
         cmd.output().expect("failed to run skb binary")
     };
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let _ = args;
     if output.status.success() {
         serde_json::from_str(&stdout).map_err(|e| json!(format!("non-JSON output: {stdout}: {e}")))
     } else {
