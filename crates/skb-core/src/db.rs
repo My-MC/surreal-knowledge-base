@@ -8,6 +8,11 @@ pub struct Db {
     pub db: Surreal<surrealdb::engine::local::Db>,
 }
 
+/// SQL for upserting a `meta` key/value; shared by the connection handle and
+/// the transaction implementation so the behavior cannot diverge.
+const SET_META_SQL: &str = "INSERT INTO meta (key, meta_value) VALUES ($key, $val) \
+                            ON DUPLICATE KEY UPDATE meta_value = $val";
+
 /// Something that can persist a `meta` table key/value. Implemented for both
 /// the connection handle and an in-progress transaction so metadata writes can
 /// be grouped atomically (e.g. reindex §9-5).
@@ -27,16 +32,13 @@ impl MetaStore for Db {
 
 impl MetaStore for surrealdb::method::Transaction<surrealdb::engine::local::Db> {
     async fn set_meta(&self, key: &str, val: &str) -> Result<(), SkbError> {
-        self.query(
-            "INSERT INTO meta (key, meta_value) VALUES ($key, $val) \
-             ON DUPLICATE KEY UPDATE meta_value = $val",
-        )
-        .bind(("key", key))
-        .bind(("val", val))
-        .await
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("set_meta: {e}")))?
-        .check()
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("set_meta check: {e}")))?;
+        self.query(SET_META_SQL)
+            .bind(("key", key))
+            .bind(("val", val))
+            .await
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("set_meta: {e}")))?
+            .check()
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("set_meta check: {e}")))?;
         Ok(())
     }
 }
@@ -117,10 +119,7 @@ impl Db {
 
     pub async fn set_meta(&self, key: &str, val: &str) -> Result<(), SkbError> {
         self.db
-            .query(
-                "INSERT INTO meta (key, meta_value) VALUES ($key, $val) \
-                 ON DUPLICATE KEY UPDATE meta_value = $val",
-            )
+            .query(SET_META_SQL)
             .bind(("key", key))
             .bind(("val", val))
             .await

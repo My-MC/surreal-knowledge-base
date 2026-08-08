@@ -429,10 +429,13 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let config = Config::load().unwrap_or_else(|e| {
-        tracing::warn!(error = %e, "failed to load config; falling back to defaults");
-        Config::default()
-    });
+    let config = Config::load().map_err(|e| {
+        let err = skb_core::error::SkbError::new(
+            skb_core::error::ErrorCode::Config,
+            format!("failed to load config: {e}"),
+        );
+        rmcp::ErrorData::invalid_params(err.to_string(), None)
+    })?;
     // In a model/tokenizer mismatch state, start anyway so `skb_reindex`
     // can rebuild the database (spec §9-5).
     let kb = match KnowledgeBase::open(config.clone()).await {
