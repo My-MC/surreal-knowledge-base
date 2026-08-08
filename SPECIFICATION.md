@@ -283,6 +283,16 @@ LLM 抽出は `EntityExtractor` トレイトの差し替え実装として将来
    - `meta` テーブルを新モデル情報で更新。
 3. チャンク長のみの変更も、既存ドキュメントへの反映には同じ `reindex` が必要（新規アップロード分には即時反映される）。
 
+> **依存更新時の fingerprint 互換性（§5.4 規則 3 の運用）**: `tokenizers` クレートまたは
+> serde_json 等のシリアライザを更新し、同じ `tokenizer.json` に対する canonical JSON 出力が
+> 変わった場合、schema version（`TOKENIZER_FINGERPRINT_SCHEMA`）が同一でも fingerprint は
+> 変化し `E_MODEL_MISMATCH` になる。fingerprint には `tokenizers` のバージョン（`tokenizer_version`）
+> も含まれるため、`tokenizers` のメジャー/マイナー更新は通常この不一致を引き起こす。
+> 対応手順: (a) 影響のない変更か fingerprint 差の確認、(b) canonicalization 規則や対象フィールドを
+> 変えた場合のみ `TOKENIZER_FINGERPRINT_SCHEMA` を更新、(c) 利用者は `skb reindex` を実行する。
+> `tokenizer_version` / `tokenizer_fingerprint_schema` は `meta` に保存されるため `skb doctor`
+> で確認できる。
+
 ※ reindex は全件再処理のため、大規模データでは長時間化する。進捗通知（§7.1）に対応する。
 
 ---

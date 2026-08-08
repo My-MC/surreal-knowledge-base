@@ -28,6 +28,12 @@ use std::sync::Arc;
 /// the canonicalization rules or the covered fields change.
 pub const TOKENIZER_FINGERPRINT_SCHEMA: &str = "1";
 
+/// `tokenizers` crate version the fingerprint is bound to. Keep in sync with
+/// `crates/skb-core/Cargo.toml`; bumping `tokenizers` (or the serializer)
+/// changes the canonical JSON output, so a fingerprint mismatch is expected and
+/// users must `skb reindex` (§5.4 rule 3).
+pub const TOKENIZER_CRATE_VERSION: &str = "0.23";
+
 pub struct KnowledgeBase {
     db: Db,
     embedder: Arc<dyn Embed>,
@@ -267,6 +273,7 @@ fn resolve_tokenizer_path(config: &Config) -> Result<std::path::PathBuf, SkbErro
 pub(crate) struct TokenizerMeta {
     fingerprint: String,
     algorithm: String,
+    tokenizers_version: String,
 }
 
 /// Resolved tokenizer acquisition source used for fingerprinting: the model id
@@ -294,6 +301,7 @@ pub(crate) fn tokenizer_fingerprint(
         .to_string();
     let canonical = serde_json::to_string(&serde_json::json!({
         "schema": TOKENIZER_FINGERPRINT_SCHEMA,
+        "tokenizers": TOKENIZER_CRATE_VERSION,
         "source": source,
         "algorithm": algorithm,
         "config": config,
@@ -314,6 +322,7 @@ pub(crate) fn tokenizer_fingerprint(
     Ok(TokenizerMeta {
         fingerprint,
         algorithm,
+        tokenizers_version: TOKENIZER_CRATE_VERSION.to_string(),
     })
 }
 
@@ -354,6 +363,8 @@ pub(crate) async fn save_tokenizer_meta(
         .await?;
     db.set_meta("tokenizer_source", source).await?;
     db.set_meta("tokenizer_algorithm", &meta.algorithm).await?;
+    db.set_meta("tokenizer_version", &meta.tokenizers_version)
+        .await?;
     db.set_meta("tokenizer_fingerprint_schema", TOKENIZER_FINGERPRINT_SCHEMA)
         .await?;
     db.set_meta("tokenizer_fingerprint", &meta.fingerprint)
