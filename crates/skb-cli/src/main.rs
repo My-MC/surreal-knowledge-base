@@ -286,9 +286,7 @@ async fn run(cli: &Cli) -> Result<u8> {
                 Err(e) => return Err(e.into()),
             };
             let report = kb.doctor().await?;
-            if fmt == "json" {
-                output(&report, &fmt)?;
-            } else {
+            if fmt == "table" {
                 println!("=== SKB Doctor ===");
                 println!(
                     "DB connection: {}",
@@ -310,6 +308,8 @@ async fn run(cli: &Cli) -> Result<u8> {
                 } else {
                     println!("Status: {} problem(s) found", report.errors.len());
                 }
+            } else {
+                output(&report, &fmt)?;
             }
         }
         Commands::Query { surql } => {

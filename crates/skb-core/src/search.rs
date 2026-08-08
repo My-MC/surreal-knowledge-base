@@ -232,7 +232,9 @@ async fn hybrid_search(
     let mut scores: HashMap<String, RankedHit> = HashMap::new();
 
     for (rank, row) in vrows.iter().enumerate() {
-        let id = row["chunk_id"].as_str().unwrap_or("").to_string();
+        let Some(id) = row["chunk_id"].as_str().filter(|s| !s.is_empty()) else {
+            continue;
+        };
         let content = row["content"].as_str().unwrap_or("").to_string();
         let idx = row["idx"].as_u64().unwrap_or(0) as usize;
         let doc = row["document"].as_str().unwrap_or("").to_string();
@@ -240,7 +242,7 @@ async fn hybrid_search(
         let source = row["source"].as_str().map(|s| s.to_string());
         let rrf = 1.0 / (rrf_k + (rank as f64 + 1.0));
         scores
-            .entry(id)
+            .entry(id.to_string())
             .and_modify(|e| e.score += rrf)
             .or_insert(RankedHit {
                 score: rrf,
@@ -254,7 +256,9 @@ async fn hybrid_search(
 
     let highlights = match_terms(query);
     for (rank, row) in krows.iter().enumerate() {
-        let id = row["chunk_id"].as_str().unwrap_or("").to_string();
+        let Some(id) = row["chunk_id"].as_str().filter(|s| !s.is_empty()) else {
+            continue;
+        };
         let content = row["content"].as_str().unwrap_or("").to_string();
         let idx = row["idx"].as_u64().unwrap_or(0) as usize;
         let doc = row["document"].as_str().unwrap_or("").to_string();
@@ -262,7 +266,7 @@ async fn hybrid_search(
         let source = row["source"].as_str().map(|s| s.to_string());
         let rrf = 1.0 / (rrf_k + (rank as f64 + 1.0));
         scores
-            .entry(id)
+            .entry(id.to_string())
             .and_modify(|e| e.score += rrf)
             .or_insert(RankedHit {
                 score: rrf,
@@ -284,25 +288,28 @@ async fn hybrid_search(
 
     Ok(sorted
         .into_iter()
-        .map(|(_, hit)| {
-            let lower = hit.content.to_lowercase();
-            let hit_highlights = highlights
-                .iter()
-                .filter(|t| lower.contains(t.as_str()))
-                .cloned()
-                .collect::<Vec<String>>();
-            SearchHit {
-                document_id: hit.document,
-                chunk_idx: hit.idx,
-                content: hit.content,
-                score: hit.score,
-                title: hit.title,
-                source: hit.source,
-                highlights: (!hit_highlights.is_empty()).then_some(hit_highlights),
-                matched_entities: None,
-            }
+        .map(|(_, hit)| SearchHit {
+            document_id: hit.document,
+            chunk_idx: hit.idx,
+            content: hit.content.clone(),
+            score: hit.score,
+            title: hit.title,
+            source: hit.source,
+            highlights: present_terms(&hit.content, &highlights),
+            matched_entities: None,
         })
         .collect())
+}
+
+/// Terms from `terms` that actually occur in `content`; `None` when none do.
+fn present_terms(content: &str, terms: &[String]) -> Option<Vec<String>> {
+    let lower = content.to_lowercase();
+    let present: Vec<String> = terms
+        .iter()
+        .filter(|t| lower.contains(t.as_str()))
+        .cloned()
+        .collect();
+    (!present.is_empty()).then_some(present)
 }
 
 fn rows_to_hits(
@@ -314,15 +321,6 @@ fn rows_to_hits(
         let content = row["content"].as_str().unwrap_or("").to_string();
         // Only terms actually present in this hit's content are highlighted;
         // a keyword row whose content lacks the query terms reports None.
-        let hit_highlights = highlights.map(|terms| {
-            let lower = content.to_lowercase();
-            let present: Vec<String> = terms
-                .iter()
-                .filter(|t| lower.contains(t.as_str()))
-                .cloned()
-                .collect();
-            (!present.is_empty()).then_some(present)
-        });
         hits.push(SearchHit {
             document_id: row["document"].as_str().unwrap_or("").to_string(),
             chunk_idx: row["idx"].as_u64().unwrap_or(0) as usize,
@@ -330,7 +328,10 @@ fn rows_to_hits(
             score: row["score"].as_f64().unwrap_or(0.0),
             title: row["title"].as_str().map(|s| s.to_string()),
             source: row["source"].as_str().map(|s| s.to_string()),
-            highlights: hit_highlights.flatten(),
+            highlights: highlights.and_then(|terms| {
+                let content = row["content"].as_str().unwrap_or("");
+                present_terms(content, terms)
+            }),
             matched_entities: None,
         });
     }
@@ -519,6 +520,10 @@ mod tests {
             serde_json::json!(["hybrid", "vector", "keyword"])
         );
         assert_eq!(value["properties"]["top_k"]["minimum"], 1);
+        assert_eq!(
+            value["properties"]["top_k"]["maximum"], MAX_TOP_K as u64,
+            "schema top_k maximum must track MAX_TOP_K"
+        );
         assert_eq!(value["properties"]["graph_expand"]["maximum"], 5);
     }
 }

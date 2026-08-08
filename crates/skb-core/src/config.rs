@@ -576,9 +576,15 @@ mod tests {
     fn load_works_without_config_file_when_env_set() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let _model = EnvGuard::set("SKB_EMBEDDING_MODEL", "env-only-model");
-        // No config file exists for this process cwd in CI; load() must fall
-        // back to defaults + env instead of failing.
+        // Point HOME at an empty dir under ./target/ so neither ./skb.toml nor
+        // ~/.config/skb/config.toml can influence the result; Config::load()
+        // must fall back to defaults + env override.
+        let home =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/skb-cfg-test-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let _home = EnvGuard::set("HOME", home.to_str().unwrap());
         let config = Config::load().unwrap();
         assert_eq!(config.embedding.model, "env-only-model");
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

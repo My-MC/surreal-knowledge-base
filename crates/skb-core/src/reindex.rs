@@ -166,6 +166,12 @@ pub async fn reindex(
         db.set_meta("reindex_in_progress", "0").await?;
     }
 
+    // Guarantee the final progress notification reaches 100% even when the
+    // loop skipped documents (e.g. empty content), so clients see completion.
+    if let Some(report) = progress {
+        report(docs.len(), docs.len());
+    }
+
     Ok(result)
 }
 

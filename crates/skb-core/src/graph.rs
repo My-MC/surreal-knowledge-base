@@ -3,7 +3,22 @@ use crate::error::{ErrorCode, SkbError};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::sync::LazyLock;
 use surrealdb::types::RecordId;
+
+/// Compile-once regular expressions for entity/section extraction (called per
+/// chunk during ingest and reindex, so per-call `Regex::new` would recompile
+/// them O(documents × chunks) times).
+static LINK_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"\[([^\]]+)\]\(([^)]+)\)").unwrap());
+static WIKI_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"\[\[([^\]|]+)(?:\|([^\]]+))?\]\]").unwrap());
+static TAG_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?:^|\s)#([a-zA-Z][\w-]{1,})").unwrap());
+static HEADING_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?m)^#{1,6}\s+(.+)").unwrap());
+static SECTION_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?m)^(#{1,6})\s+(.+)").unwrap());
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct EntityInfo {
@@ -657,8 +672,7 @@ pub fn extract_entities(content: &str) -> Vec<EntityInfo> {
     let mut entities = Vec::new();
 
     // Markdown links: [text](link)
-    let link_re = regex::Regex::new(r"\[([^\]]+)\]\(([^)]+)\)").unwrap();
-    for cap in link_re.captures_iter(content) {
+    for cap in LINK_RE.captures_iter(content) {
         let link_text = cap.get(1).map(|m| m.as_str()).unwrap_or("").trim();
         if link_text.is_empty() {
             continue;
@@ -671,8 +685,7 @@ pub fn extract_entities(content: &str) -> Vec<EntityInfo> {
     }
 
     // WikiLinks: [[target]] or [[target|alias]]
-    let wiki_re = regex::Regex::new(r"\[\[([^\]|]+)(?:\|([^\]]+))?\]\]").unwrap();
-    for cap in wiki_re.captures_iter(content) {
+    for cap in WIKI_RE.captures_iter(content) {
         let name = cap
             .get(2)
             .map(|m| m.as_str())
@@ -707,8 +720,7 @@ pub fn extract_entities(content: &str) -> Vec<EntityInfo> {
 
     // Inline tags: #tag (preceded by space, start-of-line, or punct)
     // Uses word boundary: \b#tag matches when # is at word boundary
-    let tag_re = regex::Regex::new(r"(?:^|\s)#([a-zA-Z][\w-]{1,})").unwrap();
-    for cap in tag_re.captures_iter(content) {
+    for cap in TAG_RE.captures_iter(content) {
         let tag = cap.get(1).map(|m| m.as_str()).unwrap_or("");
         entities.push(EntityInfo {
             name: tag.to_string(),
@@ -718,10 +730,9 @@ pub fn extract_entities(content: &str) -> Vec<EntityInfo> {
     }
 
     // Headings: ^#{1,6}\s+(.+)
-    let heading_re = regex::Regex::new(r"(?m)^#{1,6}\s+(.+)").unwrap();
-    for cap in heading_re.captures_iter(content) {
+    for cap in HEADING_RE.captures_iter(content) {
         let heading = cap.get(1).map(|m| m.as_str()).unwrap_or("");
-        if heading.len() > 2 {
+        if heading.chars().count() > 2 {
             entities.push(EntityInfo {
                 name: heading.trim().to_string(),
                 kind: "section".into(),
@@ -812,11 +823,10 @@ pub struct Section {
 /// Extract heading sections with levels for hierarchy linking.
 pub fn extract_sections(content: &str) -> Vec<Section> {
     let mut sections = Vec::new();
-    let heading_re = regex::Regex::new(r"(?m)^(#{1,6})\s+(.+)").unwrap();
-    for cap in heading_re.captures_iter(content) {
+    for cap in SECTION_RE.captures_iter(content) {
         let level = cap.get(1).map(|m| m.as_str().len()).unwrap_or(1) as u32;
         let name = cap.get(2).map(|m| m.as_str().trim()).unwrap_or("");
-        if name.len() > 2 {
+        if name.chars().count() > 2 {
             sections.push(Section {
                 name: name.to_string(),
                 level,
@@ -845,11 +855,11 @@ pub(crate) async fn link_section_hierarchy(
             let sql = "INSERT INTO entity (id, name, kind, description) \
                        VALUES ($id, $name, $kind, $description) \
                        ON DUPLICATE KEY UPDATE description = $description";
-            // Both endpoints of the part-of edge must exist as entities. The
-            // parent is a prior stack entry (already upserted); the child may
-            // have been missed by chunk processing (e.g. a tab-headed section
-            // whose boundary was not recognized as a heading), so upsert it
-            // here before creating the edge.
+            // The child endpoint of the part-of edge must exist as an entity;
+            // it may have been missed by chunk processing (e.g. a tab-headed
+            // section whose boundary was not recognized as a heading), so
+            // upsert it here before creating the edge. The parent is a prior
+            // stack entry already upserted by ingest.
             tx.query(sql)
                 .bind(("id", entity_record_id(&section.name)?))
                 .bind(("name", section.name.clone()))
@@ -859,21 +869,6 @@ pub(crate) async fn link_section_hierarchy(
                 .map_err(|e| SkbError::new(ErrorCode::Db, format!("section upsert: {e}")))?
                 .check()
                 .map_err(|e| SkbError::new(ErrorCode::Db, format!("section upsert check: {e}")))?;
-            tx.query(sql)
-                .bind(("id", entity_record_id(parent)?))
-                .bind(("name", parent.clone()))
-                .bind(("kind", "section"))
-                .bind(("description", ""))
-                .await
-                .map_err(|e| SkbError::new(ErrorCode::Db, format!("section upsert: {e}")))?
-                .check()
-                .map_err(|e| SkbError::new(ErrorCode::Db, format!("section upsert check: {e}")))?;
-            // Idempotent edge: `RELATE` always creates a new edge, so remove
-            // an existing part-of edge between the same pair first. Section
-            // entities are global (shared across documents), so the dedup is
-            // per pair — repeated uploads never accumulate duplicates.
-            // Direction: the child section is part of its ancestor, so the
-            // edge points child -> part-of -> parent.
             tx.query(
                 "DELETE FROM related_to WHERE relation = 'part-of' \
                  AND in = $child AND out = $parent; \

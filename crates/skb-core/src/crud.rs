@@ -207,18 +207,21 @@ pub async fn list_documents(db: &Db, q: &ListQuery) -> Result<Vec<DocumentSummar
         .filter_map(|id| id.split_once(':'))
         .map(|(table, key)| surrealdb::types::RecordId::new(table, key))
         .collect();
-    let mut r = db
-        .db
-        .query(
-            "SELECT string::concat('document:', meta::id(document)) AS document, \
-             count() AS c FROM chunk WHERE document IN $docs GROUP BY document",
-        )
-        .bind(("docs", doc_ids))
-        .await
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("list chunks: {e}")))?;
-    let count_rows: Vec<serde_json::Value> = r
-        .take(0)
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("list chunks take: {e}")))?;
+    let count_rows: Vec<serde_json::Value> = if doc_ids.is_empty() {
+        Vec::new()
+    } else {
+        let mut r = db
+            .db
+            .query(
+                "SELECT string::concat('document:', meta::id(document)) AS document, \
+                 count() AS c FROM chunk WHERE document IN $docs GROUP BY document",
+            )
+            .bind(("docs", doc_ids))
+            .await
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("list chunks: {e}")))?;
+        r.take(0)
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("list chunks take: {e}")))?
+    };
     let counts: HashMap<String, usize> = count_rows
         .iter()
         .filter_map(|row| {

@@ -26,6 +26,10 @@ pub(crate) trait MetaStore {
 
 impl MetaStore for Db {
     async fn set_meta(&self, key: &str, val: &str) -> Result<(), SkbError> {
+        // Deliberately delegate to the inherent `Db::set_meta` below (which
+        // resolves to the inherent method, not this trait method, so no
+        // recursion). If the inherent method is ever removed or renamed, this
+        // call would resolve to the trait method and recurse infinitely.
         Db::set_meta(self, key, val).await
     }
 }

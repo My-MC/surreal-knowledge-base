@@ -487,58 +487,43 @@ fn is_pdf_bytes(bytes: &[u8]) -> bool {
 /// accumulate blocking workers and their input buffers.
 const MAX_CONCURRENT_PDF_JOBS: usize = 4;
 
-static PDF_SEMAPHORE: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+static PDF_SEMAPHORE: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+    std::sync::OnceLock::new();
 
-fn pdf_semaphore() -> &'static tokio::sync::Semaphore {
-    PDF_SEMAPHORE.get_or_init(|| tokio::sync::Semaphore::new(MAX_CONCURRENT_PDF_JOBS))
+fn pdf_semaphore() -> std::sync::Arc<tokio::sync::Semaphore> {
+    PDF_SEMAPHORE
+        .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PDF_JOBS)))
+        .clone()
 }
 
 /// Extract PDF text with resource guards: page count, wall-clock time and
 /// output size (PDF bomb mitigation, spec §12.3). The page-count check is the
-/// primary PDF-bomb defense; parsing and extraction run on blocking threads
-/// under a wall-clock timeout so a slow document cannot hang the request. A
-/// fixed concurrency cap bounds how many blocking jobs may pile up.
+/// primary PDF-bomb defense; parsing and extraction run in one blocking
+/// closure that owns the semaphore permit, so the concurrency slot is held
+/// until the blocking work actually finishes even if the wall-clock timeout
+/// fires and the caller stops waiting.
 async fn extract_pdf_checked(bytes: &[u8]) -> Result<String, SkbError> {
-    let _permit = pdf_semaphore()
-        .acquire()
+    let permit = pdf_semaphore()
+        .acquire_owned()
         .await
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("pdf semaphore: {e}")))?;
     let start = Instant::now();
     let shared = std::sync::Arc::new(bytes.to_vec());
-    let doc = tokio::time::timeout(
-        Duration::from_secs(MAX_PROCESS_SECONDS),
-        tokio::task::spawn_blocking({
-            let shared = shared.clone();
-            move || lopdf::Document::load_mem(&shared)
-        }),
-    )
-    .await
-    .map_err(|_| SkbError::new(ErrorCode::Validation, "pdf parsing exceeded time limit"))?
-    .map_err(|e| SkbError::new(ErrorCode::Io, format!("pdf parse join: {e}")))?
-    .map_err(|e| SkbError::new(ErrorCode::Io, format!("pdf parse: {e}")))?;
-    let pages = doc.get_pages().len();
-    if pages > MAX_PDF_PAGES {
-        return Err(SkbError::new(
-            ErrorCode::Validation,
-            format!("pdf has {pages} pages, limit is {MAX_PDF_PAGES}"),
-        ));
-    }
-    // The extraction itself is synchronous and cannot be cancelled; the
-    // timeout bounds how long the caller waits. Parse and extraction share
-    // one MAX_PROCESS_SECONDS budget so a slow parse cannot be followed by a
-    // full second timeout.
-    let remaining = Duration::from_secs(MAX_PROCESS_SECONDS).saturating_sub(start.elapsed());
-    let text = tokio::time::timeout(
-        remaining,
-        tokio::task::spawn_blocking({
-            let shared = shared.clone();
-            move || pdf_extract::extract_text_from_mem(&shared)
-        }),
-    )
-    .await
-    .map_err(|_| SkbError::new(ErrorCode::Validation, "pdf extraction exceeded time limit"))?
-    .map_err(|e| SkbError::new(ErrorCode::Io, format!("pdf extract join: {e}")))?
-    .map_err(|e| SkbError::new(ErrorCode::Io, format!("pdf extract: {e}")))?;
+    let job = tokio::task::spawn_blocking(move || -> Result<String, String> {
+        let _permit = permit;
+        let doc = lopdf::Document::load_mem(&shared).map_err(|e| format!("pdf parse: {e}"))?;
+        let pages = doc.get_pages().len();
+        if pages > MAX_PDF_PAGES {
+            return Err(format!("pdf has {pages} pages, limit is {MAX_PDF_PAGES}"));
+        }
+        pdf_extract::extract_text_from_mem(&shared).map_err(|e| format!("pdf extract: {e}"))
+    });
+    let text = tokio::time::timeout(Duration::from_secs(MAX_PROCESS_SECONDS), job)
+        .await
+        .map_err(|_| SkbError::new(ErrorCode::Validation, "pdf processing exceeded time limit"))?
+        .map_err(|e| SkbError::new(ErrorCode::Io, format!("pdf join: {e}")))?
+        .map_err(|e| SkbError::new(ErrorCode::Validation, e))?;
+    let _ = start;
     Ok(text)
 }
 
@@ -1146,7 +1131,7 @@ mod tests {
 
     /// Serve an HTTP response repeatedly on a loopback listener in a background
     /// thread, returning the base URL.
-    fn serve_repeatedly(response: &'static str, times: usize) -> String {
+    fn serve_repeatedly(response: String, times: usize) -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
@@ -1166,7 +1151,7 @@ mod tests {
         // A 302 pointing back at itself never terminates; the manual redirect
         // loop must cap at MAX_REDIRECTS.
         let url = serve_repeatedly(
-            "HTTP/1.1 302 Found\r\nlocation: /self\r\ncontent-length: 0\r\n\r\n",
+            "HTTP/1.1 302 Found\r\nlocation: /self\r\ncontent-length: 0\r\n\r\n".to_string(),
             MAX_REDIRECTS + 1,
         );
         let config = Config::default();
@@ -1189,7 +1174,7 @@ mod tests {
             body.len(),
             body
         );
-        let url = serve_repeatedly(Box::leak(response.into_boxed_str()), 1);
+        let url = serve_repeatedly(response, 1);
         let mut config = Config::default();
         config.upload.max_file_mb = 1;
         assert!(matches!(

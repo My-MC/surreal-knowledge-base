@@ -147,8 +147,18 @@ impl KnowledgeBase {
             .await?;
             db.set_meta("schema_version", "1").await?;
         } else {
-            // Backfill embedding_max_input_tokens for stores created before the
-            // key existed; it is read by doctor and dimension/mismatch checks.
+            // Backfill metadata for stores created before these keys existed
+            // (e.g. migrate succeeded but set_meta was interrupted). Without
+            // them the model/dimension comparison in open skips (None), so a
+            // config change would go undetected.
+            if db.get_meta("embedding_model").await?.is_none() {
+                db.set_meta("embedding_model", &config.embedding.model)
+                    .await?;
+            }
+            if db.get_meta("embedding_dimension").await?.is_none() {
+                db.set_meta("embedding_dimension", &dimension.to_string())
+                    .await?;
+            }
             if db.get_meta("embedding_max_input_tokens").await?.is_none() {
                 db.set_meta(
                     "embedding_max_input_tokens",
@@ -1239,17 +1249,9 @@ mod tests {
             let mut config_b = config_a.clone();
             config_b.embedding.tokenizer = tok_b.display().to_string();
             // Absorb the same transient file-lock race as open_retrying.
-            let mut opened = None;
-            for _ in 0..8 {
-                match KnowledgeBase::open_for_reindex(config_b.clone()).await {
-                    Ok(kb) => {
-                        opened = Some(kb);
-                        break;
-                    }
-                    Err(_) => tokio::time::sleep(std::time::Duration::from_millis(150)).await,
-                }
-            }
-            opened.expect("open_for_reindex must succeed");
+            open_for_reindex_retrying(config_b.clone())
+                .await
+                .expect("open_for_reindex must succeed");
 
             // But the new fingerprint was NOT recorded: a normal open still
             // reports E_MODEL_MISMATCH (rebuild required).

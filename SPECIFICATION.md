@@ -337,7 +337,7 @@ impl KnowledgeBase {
     // 管理
     pub async fn stats(&self) -> Result<Stats>;
     pub async fn doctor(&self) -> Result<DoctorReport>;  // 環境診断
-    pub async fn reindex(&self, req: ReindexRequest) -> Result<ReindexResult>; // モデル/チャンク設定変更の全件反映（§5.4）
+    pub async fn reindex(&self, req: &ReindexRequest, progress: Option<&ProgressFn>) -> Result<ReindexResult>; // モデル/チャンク設定変更の全件反映（§5.4）
 }
 ```
 

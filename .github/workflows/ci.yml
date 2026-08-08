@@ -21,12 +21,13 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Format check
-        run: cargo fmt --all -- --check
-      - name: Clippy (warning-free)
-        run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Cargo check
         run: cargo check --workspace
+      - name: Clippy (warning-free)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      # CI は検証のみでリポジトリを変更しないため、cargo fix / cargo clippy --fix は実行しない。
+      - name: Format check
+        run: cargo fmt --all -- --check
       - name: Serial tests (incl. golden contract tests)
         run: cargo test --workspace -- --test-threads=1
       - name: Check no native-tls / openssl dependency
@@ -138,8 +139,15 @@ jobs:
           done
       - name: Check GLIBC floor
         run: |
-          echo "Max GLIBC version required:"
-          objdump -T npm/packages/linux-x64/bin/skb-mcp | grep -oP 'GLIBC_[0-9.]+' | sort -Vu | tail -1
+          MAX_GLIBC=$(objdump -T npm/packages/linux-x64/bin/skb-mcp \
+            | grep -oP 'GLIBC_\K[0-9.]+' | sort -Vu | tail -1)
+          echo "Max GLIBC version required: $MAX_GLIBC"
+          LIMIT=2.38
+          HIGHEST=$(printf '%s\n%s\n' "$MAX_GLIBC" "$LIMIT" | sort -V | tail -1)
+          if [ "$HIGHEST" != "$LIMIT" ]; then
+            echo "GLIBC floor exceeded: requires $MAX_GLIBC, limit is $LIMIT"
+            exit 1
+          fi
       - name: Smoke test (pack, install, full MCP flow)
         run: |
           cd "$GITHUB_WORKSPACE/npm" && npm pack
@@ -245,10 +253,12 @@ jobs:
           BIN=npm-out/packages/darwin-arm64/bin/skb-mcp
           chmod +x "$BIN"
           otool -L "$BIN"
-          if otool -L "$BIN" 2>&1 | grep -q libonnxruntime; then
-            echo "libonnxruntime must not be linked"
-            exit 1
-          fi
+          for lib in libonnxruntime libssl libcrypto; do
+            if otool -L "$BIN" 2>&1 | grep -q "$lib"; then
+              echo "unexpected dynamic dependency: $lib"
+              exit 1
+            fi
+          done
       - name: MCP E2E flow (initialize -> tools/list -> upload -> search)
         run: |
           cat > skb.toml << EOF
@@ -288,7 +298,7 @@ jobs:
           if (-not $dumpbin) { Write-Error "dumpbin not found"; exit 1 }
           $deps = & $dumpbin.FullName /dependents npm-out\packages\win32-x64\bin\skb-mcp.exe
           $deps | Select-String '\.dll'
-          if ($deps | Select-String 'libonnxruntime') { Write-Error "libonnxruntime.dll must not be imported"; exit 1 }
+          if ($deps | Select-String 'onnxruntime') { Write-Error "onnxruntime.dll must not be imported"; exit 1 }
           if (-not ($deps | Select-String 'MSVCP140.dll')) { Write-Error "MSVCP140.dll (VC++ runtime) must be imported"; exit 1 }
           if (-not ($deps | Select-String 'VCRUNTIME140.dll')) { Write-Error "VCRUNTIME140.dll (VC++ runtime) must be imported"; exit 1 }
           Write-Output "VC++ runtime present on runner: $(Test-Path "$env:WINDIR\System32\vcruntime140.dll")"

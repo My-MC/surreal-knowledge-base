@@ -313,5 +313,8 @@ fn golden_upload_search_list_stats_get_delete() {
         "CLI error: {cli_err}"
     );
 
+    // Terminate the MCP server so its SurrealKV file handles are released
+    // before removing the data directory (Windows cannot delete open handles).
+    drop(mcp);
     let _ = std::fs::remove_dir_all(&root);
 }
