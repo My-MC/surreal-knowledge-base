@@ -274,7 +274,17 @@ async fn run(cli: &Cli) -> Result<u8> {
             output(&stats, &fmt)?;
         }
         Commands::Doctor => {
-            let kb = KnowledgeBase::open(cfg()?).await?;
+            // In a model/tokenizer mismatch state the normal open refuses to
+            // operate; `doctor` must still run to diagnose the mismatch, so
+            // fall back to the diagnostic load path (read-only) (§9-5).
+            let config = cfg()?;
+            let kb = match KnowledgeBase::open(config.clone()).await {
+                Ok(kb) => kb,
+                Err(e) if e.code == skb_core::error::ErrorCode::ModelMismatch => {
+                    KnowledgeBase::open_for_reindex(config).await?
+                }
+                Err(e) => return Err(e.into()),
+            };
             let report = kb.doctor().await?;
             if fmt == "json" {
                 output(&report, &fmt)?;
@@ -318,6 +328,17 @@ async fn run(cli: &Cli) -> Result<u8> {
             recursive,
             base64,
         } => {
+            // Exactly one input source may be given (spec §12.3); a conflict
+            // between --stdin, --url, and paths is rejected before opening the
+            // database or expanding paths.
+            let active_sources = [*stdin, url.is_some(), !paths.is_empty()]
+                .into_iter()
+                .filter(|present| *present)
+                .count();
+            if active_sources > 1 {
+                anyhow::bail!("specify exactly one of --stdin, --url, or paths, not several");
+            }
+
             let kb = KnowledgeBase::open(cfg()?).await?;
             let meta: HashMap<String, String> = metadata
                 .as_ref()
@@ -340,6 +361,11 @@ async fn run(cli: &Cli) -> Result<u8> {
                             for file in collect_files(&path)? {
                                 expanded.push(file.display().to_string());
                             }
+                        } else if path.is_dir() {
+                            anyhow::bail!(
+                                "no files to upload: matched directory '{}'; use --recursive",
+                                path.display()
+                            );
                         } else if path.is_file() {
                             expanded.push(path.display().to_string());
                         }
@@ -367,16 +393,6 @@ async fn run(cli: &Cli) -> Result<u8> {
                 anyhow::bail!(
                     "no files to upload: matched entries are directories; use --recursive"
                 );
-            }
-
-            // Exactly one input source may be given (spec §12.3); a conflict
-            // between --stdin, --url, and paths is rejected before any work.
-            let active_sources = [*stdin, url.is_some(), !paths.is_empty()]
-                .into_iter()
-                .filter(|present| *present)
-                .count();
-            if active_sources > 1 {
-                anyhow::bail!("specify exactly one of --stdin, --url, or paths, not several");
             }
 
             let build = |p: Option<String>,
@@ -565,9 +581,9 @@ async fn run(cli: &Cli) -> Result<u8> {
                 let _ = std::io::Write::flush(&mut std::io::stderr());
             };
             let result = kb.reindex(&req, Some(&progress)).await?;
-            if !*dry_run {
-                eprintln!();
-            }
+            // The progress callback printed a partial line; terminate it so
+            // the shell prompt does not appear on the same line.
+            eprintln!();
             output(&result, &fmt)?;
         }
         Commands::Config { cmd } => match cmd {

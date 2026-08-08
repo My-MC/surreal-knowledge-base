@@ -96,30 +96,14 @@ impl ServerHandler for SkbServer {
         let contents: Vec<ResourceContents> = if uri == "skb://documents" {
             // Bound the response: accumulate at most MAX_DOCUMENTS_RESOURCE
             // entries so a large store cannot exhaust memory or produce an
-            // unbounded payload (spec §8.3). Fetch one extra page to learn
-            // whether truncation actually occurred; `truncated` is reported
-            // inside a valid JSON payload so clients can parse the resource.
+            // unbounded payload (spec §8.3). The snapshot API pages internally
+            // so the server-level lock is not held across repeated async
+            // fetches; `truncated` is reported inside a valid JSON payload.
             const MAX_DOCUMENTS_RESOURCE: usize = 10_000;
-            let mut docs: Vec<skb_core::crud::DocumentSummary> = Vec::new();
-            let mut offset = 0;
-            loop {
-                let page = kb
-                    .list_documents(&ListQuery {
-                        limit: Some(100),
-                        offset: Some(offset),
-                        order: None,
-                    })
-                    .await
-                    .map_err(err_data)?;
-                let page_len = page.len();
-                docs.extend(page);
-                if page_len < 100 || docs.len() > MAX_DOCUMENTS_RESOURCE {
-                    break;
-                }
-                offset += 100;
-            }
-            let truncated = docs.len() > MAX_DOCUMENTS_RESOURCE;
-            docs.truncate(MAX_DOCUMENTS_RESOURCE);
+            let (docs, truncated) = kb
+                .document_snapshot(MAX_DOCUMENTS_RESOURCE)
+                .await
+                .map_err(err_data)?;
             let body = serde_json::to_string_pretty(&serde_json::json!({
                 "documents": docs,
                 "truncated": truncated,
@@ -387,33 +371,52 @@ impl SkbServer {
                 // Throttle progress notifications so a slow client cannot
                 // accumulate an unbounded number of in-flight sends: emit at
                 // most one per PROGRESS_EVERY documents, always the final one.
+                // A bounded channel + single worker serializes sends and
+                // backpressures the callback.
                 const PROGRESS_EVERY: usize = 10;
-                let progress: Option<Box<skb_core::reindex::ProgressFn>> =
-                    context.meta.get_progress_token().map(|token| {
-                        let peer = context.peer.clone();
-                        Box::new(move |done: usize, total: usize| {
-                            if done != total && !done.is_multiple_of(PROGRESS_EVERY) {
-                                return;
+                let progress = context.meta.get_progress_token().map(|token| {
+                    let (tx, mut rx) =
+                        tokio::sync::mpsc::channel::<(usize, usize)>(PROGRESS_EVERY * 2);
+                    let peer = context.peer.clone();
+                    let worker_token = token.clone();
+                    tokio::spawn(async move {
+                        while let Some((done, total)) = rx.recv().await {
+                            let notification = rmcp::model::Notification::new(
+                                rmcp::model::ProgressNotificationParam::new(
+                                    worker_token.clone(),
+                                    done as f64,
+                                )
+                                .with_total(total as f64),
+                            );
+                            if let Err(e) = peer
+                                .send_notification(
+                                    rmcp::model::ServerNotification::ProgressNotification(
+                                        notification,
+                                    ),
+                                )
+                                .await
+                            {
+                                tracing::warn!(error = %e, "progress notification send failed");
                             }
-                            let peer = peer.clone();
-                            let token = token.clone();
-                            tokio::spawn(async move {
-                                let notification = rmcp::model::Notification::new(
-                                    rmcp::model::ProgressNotificationParam::new(token, done as f64)
-                                        .with_total(total as f64),
-                                );
-                                let _ = peer
-                                    .send_notification(
-                                        rmcp::model::ServerNotification::ProgressNotification(
-                                            notification,
-                                        ),
-                                    )
-                                    .await;
-                            });
-                        }) as Box<skb_core::reindex::ProgressFn>
+                        }
                     });
-                kb.reindex(&params, progress.as_deref())
-                    .await
+                    let tx = tx;
+                    Box::new(move |done: usize, total: usize| {
+                        if done != total && !done.is_multiple_of(PROGRESS_EVERY) {
+                            return;
+                        }
+                        let _ = tx.try_send((done, total));
+                    }) as Box<skb_core::reindex::ProgressFn>
+                });
+                let result = kb.reindex(&params, progress.as_deref()).await;
+                // Drain any queued progress notifications (including the
+                // final one) before returning the tool result, so a client
+                // does not see the result arrive before the last update.
+                if progress.is_some() {
+                    tokio::task::yield_now().await;
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                result
                     .map(|r| serde_json::to_value(r).unwrap_or_default())
                     .map_err(|e| format!("{e}"))
             }

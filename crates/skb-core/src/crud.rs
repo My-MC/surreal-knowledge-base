@@ -333,7 +333,8 @@ pub async fn delete_document(
     let chunks_deleted = rows.first().and_then(|v| v["c"].as_u64()).unwrap_or(0) as usize;
 
     let query = "DELETE FROM mentions WHERE in.document = $id; DELETE FROM chunk WHERE document = $id; DELETE $id;";
-    db.db
+    let r = db
+        .db
         .query(query)
         .bind(("id", record_id))
         .await

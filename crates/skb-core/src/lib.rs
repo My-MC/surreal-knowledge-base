@@ -232,6 +232,35 @@ impl KnowledgeBase {
         crud::list_documents(&self.db, q).await
     }
 
+    /// Return at most `max` documents plus whether more remain. Paging is
+    /// performed in one place so callers do not hold a lock across repeated
+    /// async fetches (the MCP `skb://documents` resource, spec §8.3).
+    pub async fn document_snapshot(
+        &self,
+        max: usize,
+    ) -> Result<(Vec<DocumentSummary>, bool), SkbError> {
+        let mut docs = Vec::new();
+        let mut offset = 0;
+        loop {
+            let page = self
+                .list_documents(&ListQuery {
+                    limit: Some(100),
+                    offset: Some(offset),
+                    order: None,
+                })
+                .await?;
+            let page_len = page.len();
+            docs.extend(page);
+            if page_len < 100 || docs.len() > max {
+                break;
+            }
+            offset += 100;
+        }
+        let truncated = docs.len() > max;
+        docs.truncate(max);
+        Ok((docs, truncated))
+    }
+
     pub async fn get_document(&self, req: &GetDocumentRequest) -> Result<DocumentDetail, SkbError> {
         crud::get_document(&self.db, req).await
     }
