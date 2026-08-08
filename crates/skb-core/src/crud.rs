@@ -429,7 +429,9 @@ pub async fn doctor(
     // Meta reads can also fail; record instead of propagating.
     match db.get_meta("embedding_model").await {
         Ok(model) => report.model = model.unwrap_or_default(),
-        Err(e) => report.errors.push(format!("read embedding_model meta: {e}")),
+        Err(e) => report
+            .errors
+            .push(format!("read embedding_model meta: {e}")),
     }
     match db.get_meta("schema_version").await {
         Ok(version) => report.schema_version = version.unwrap_or_default(),
