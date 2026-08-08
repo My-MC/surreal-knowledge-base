@@ -353,6 +353,8 @@ async fn run(cli: &Cli) -> Result<u8> {
                         for file in collect_files(path)? {
                             expanded.push(file.display().to_string());
                         }
+                    } else if path.is_dir() {
+                        anyhow::bail!("no files to upload: input is a directory; use --recursive");
                     } else {
                         expanded.push(pattern.clone());
                     }
