@@ -77,6 +77,7 @@ pub async fn reindex(
     };
 
     if dry_run {
+        let mut dry_entity_names = std::collections::HashSet::new();
         for doc in docs.iter() {
             let content = doc["content"].as_str().unwrap_or("");
             if content.is_empty() {
@@ -90,7 +91,12 @@ pub async fn reindex(
             if chunks.is_empty() {
                 continue;
             }
-            result.entities_extracted += crate::graph::extract_entities(content).len();
+            dry_entity_names.extend(
+                crate::graph::extract_entities(content)
+                    .into_iter()
+                    .map(|e| e.name),
+            );
+            result.entities_extracted = dry_entity_names.len();
             result.documents_processed += 1;
             result.chunks_created += chunks.len();
             result.tokens_total += chunks.iter().map(|c| c.token_count).sum::<usize>();
@@ -216,6 +222,7 @@ async fn rebuild_all(
         tokens_total: 0,
         entities_extracted: 0,
     };
+    let mut all_entity_names: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (i, doc) in docs.iter().enumerate() {
         let did = doc["did"].as_str().unwrap_or("");
         let content = doc["content"].as_str().unwrap_or("");
@@ -240,19 +247,22 @@ async fn rebuild_all(
             .await
             .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex begin: {e}")))?;
         let rebuilt = rebuild_document(&tx, did, &chunks, &embeddings).await;
-        let entities_extracted = match rebuilt {
-            Ok(count) => {
+        let entity_names = match rebuilt {
+            Ok(names) => {
                 tx.commit()
                     .await
                     .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex commit: {e}")))?;
-                count
+                names
             }
             Err(e) => {
                 let _ = tx.cancel().await;
                 return Err(e);
             }
         };
-        result.entities_extracted += entities_extracted;
+        entity_names.into_iter().for_each(|n| {
+            all_entity_names.insert(n);
+        });
+
         result.documents_processed += 1;
         result.chunks_created += chunks.len();
         result.tokens_total += chunks.iter().map(|c| c.token_count).sum::<usize>();
@@ -260,6 +270,7 @@ async fn rebuild_all(
             report(i + 1, total);
         }
     }
+    result.entities_extracted = all_entity_names.len();
 
     Ok(result)
 }
@@ -278,7 +289,7 @@ async fn update_metas(
         .clone()
         .begin()
         .await
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex begin: {e}")))?;
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex meta begin: {e}")))?;
     let result = async {
         tx.set_meta("embedding_model", &config.embedding.model)
             .await?;
@@ -316,7 +327,7 @@ async fn rebuild_document(
     did: &str,
     chunks: &[crate::tokenize::Chunk],
     embeddings: &[Vec<f32>],
-) -> Result<usize, SkbError> {
+) -> Result<Vec<String>, SkbError> {
     let document = surrealdb::types::RecordId::new("document", did);
     tx.query(
         "DELETE FROM mentions WHERE in.document = $document; \
@@ -361,13 +372,13 @@ async fn rebuild_document(
         chunk_ids.push(cid.to_string());
     }
 
-    let mut entities = 0usize;
+    let mut entity_names = std::collections::HashSet::new();
     for (cid, chunk) in chunk_ids.iter().zip(chunks.iter()) {
-        entities += crate::graph::index_chunk_entities_in_transaction(tx, cid, &chunk.content)
-            .await?
-            .len();
+        let names =
+            crate::graph::index_chunk_entities_in_transaction(tx, cid, &chunk.content).await?;
+        entity_names.extend(names);
     }
-    Ok(entities)
+    Ok(entity_names.into_iter().collect())
 }
 
 fn embed_in_batches(

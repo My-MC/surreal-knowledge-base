@@ -88,17 +88,17 @@ impl OrderBy {
     }
 }
 
+/// Upper bound for list_documents / list_chunks limits: results are materialized
+/// in memory, so unbounded limits would let a single request exhaust memory.
+const MAX_LIST_LIMIT: usize = 10_000;
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
 pub struct ListQuery {
-    #[schemars(range(min = 1, max = 10_000))]
+    #[schemars(range(min = 1, max = MAX_LIST_LIMIT))]
     pub limit: Option<usize>,
     pub offset: Option<usize>,
     pub order: Option<OrderBy>,
 }
-
-/// Upper bound for list_documents / list_chunks limits: results are materialized
-/// in memory, so unbounded limits would let a single request exhaust memory.
-const MAX_LIST_LIMIT: usize = 10_000;
 
 impl ListQuery {
     pub fn validate(&self) -> Result<(), SkbError> {
