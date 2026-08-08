@@ -441,7 +441,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_top_k_that_overflows_fetch_k() {
+    fn rejects_top_k_above_max() {
         let mut req = request("hello");
         req.top_k = Some(MAX_TOP_K + 1);
         assert!(matches!(

@@ -1,5 +1,6 @@
 use crate::config::Config;
-use crate::db::{Db, MetaStore};
+use crate::db::Db;
+use crate::db::MetaStore;
 use crate::embed::Embed;
 use crate::error::{ErrorCode, SkbError};
 use crate::tokenize::Tokenize;
@@ -360,10 +361,11 @@ async fn rebuild_document(
         chunk_ids.push(cid.to_string());
     }
 
-    let mut entities = 0;
+    let mut entities = 0usize;
     for (cid, chunk) in chunk_ids.iter().zip(chunks.iter()) {
-        entities +=
-            crate::graph::index_chunk_entities_in_transaction(tx, cid, &chunk.content).await?;
+        entities += crate::graph::index_chunk_entities_in_transaction(tx, cid, &chunk.content)
+            .await?
+            .len();
     }
     Ok(entities)
 }
