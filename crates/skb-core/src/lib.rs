@@ -36,7 +36,22 @@ pub struct KnowledgeBase {
 }
 
 impl KnowledgeBase {
+    /// Open the knowledge base, refusing to operate when the stored
+    /// model/dimension/tokenizer no longer match the configuration
+    /// (`E_MODEL_MISMATCH`, spec §5.4). Use [`KnowledgeBase::open_for_reindex`]
+    /// to rebuild after such a change.
     pub async fn open(config: Config) -> Result<Self, SkbError> {
+        Self::open_inner(config, false).await
+    }
+
+    /// Open the knowledge base even when the stored model/dimension/tokenizer
+    /// mismatch the configuration, so that `reindex` can rebuild it
+    /// (spec §9-5: management path from the mismatch state).
+    pub async fn open_for_reindex(config: Config) -> Result<Self, SkbError> {
+        Self::open_inner(config, true).await
+    }
+
+    async fn open_inner(config: Config, allow_mismatch: bool) -> Result<Self, SkbError> {
         let db = Db::open(&config).await?;
 
         let tokenizer_path = resolve_tokenizer_path(&config)?;
@@ -72,20 +87,38 @@ impl KnowledgeBase {
             config.resolve_embedding_settings(embedder.dimension(), embedder.max_input_tokens())?;
 
         let dimension = embedder.dimension();
+
+        // Compare the stored model/dimension BEFORE migrate so a mismatch never
+        // modifies the schema, field, index or meta (spec §9-5). A brand-new
+        // database has no meta table yet and takes the initialization path.
+        let is_new = db.is_new_database().await?;
+        if !is_new && !allow_mismatch {
+            if let Some(ref stored) = db.get_meta("embedding_model").await? {
+                if stored != &config.embedding.model {
+                    return Err(SkbError::new(
+                        ErrorCode::ModelMismatch,
+                        format!(
+                            "config: '{}', stored: '{}'. Run reindex to switch models.",
+                            config.embedding.model, stored
+                        ),
+                    ));
+                }
+            }
+            if let Some(ref stored) = db.get_meta("embedding_dimension").await? {
+                if stored != &dimension.to_string() {
+                    return Err(SkbError::new(
+                        ErrorCode::ModelMismatch,
+                        format!(
+                            "config dimension: '{dimension}', stored: '{stored}'. Run reindex to rebuild."
+                        ),
+                    ));
+                }
+            }
+        }
+
         db.migrate(dimension).await?;
 
-        let stored_model = db.get_meta("embedding_model").await?;
-        if let Some(ref stored) = stored_model {
-            if stored != &config.embedding.model {
-                return Err(SkbError::new(
-                    ErrorCode::ModelMismatch,
-                    format!(
-                        "config: '{}', stored: '{}'. Run reindex to switch models.",
-                        config.embedding.model, stored
-                    ),
-                ));
-            }
-        } else {
+        if is_new {
             db.set_meta("embedding_model", &config.embedding.model)
                 .await?;
             db.set_meta("embedding_dimension", &dimension.to_string())
@@ -99,10 +132,15 @@ impl KnowledgeBase {
         }
 
         // Tokenizer fingerprint: compute, then compare against the stored
-        // fingerprint (spec §5.4 rule 3). A mismatch requires a reindex.
+        // fingerprint (spec §5.4 rule 3). A mismatch requires a reindex;
+        // the reindex path records the new fingerprint instead.
         let tokenizer_source = tokenizer_source_for(&config);
         let tokenizer_meta = tokenizer_fingerprint(&tokenizer_source, &tokenizer.config_json()?)?;
-        sync_tokenizer_meta(&db, &config, &tokenizer_source, &tokenizer_meta).await?;
+        if allow_mismatch {
+            save_tokenizer_meta(&db, &config, &tokenizer_source, &tokenizer_meta).await?;
+        } else {
+            sync_tokenizer_meta(&db, &config, &tokenizer_source, &tokenizer_meta).await?;
+        }
 
         tracing::info!(model=%config.embedding.model, dim=dimension, "KnowledgeBase opened");
 
@@ -233,6 +271,7 @@ impl KnowledgeBase {
     pub async fn reindex(
         &self,
         req: &reindex::ReindexRequest,
+        progress: Option<&reindex::ProgressFn>,
     ) -> Result<reindex::ReindexResult, SkbError> {
         reindex::reindex(
             &self.db,
@@ -240,6 +279,7 @@ impl KnowledgeBase {
             self.tokenizer.as_ref(),
             &self.config,
             req,
+            progress,
         )
         .await
     }
@@ -457,6 +497,12 @@ mod tests {
 
     fn cleanup(kb: &KnowledgeBase) {
         let _ = std::fs::remove_dir_all(&kb.config().storage.path);
+    }
+
+    /// In-process reopening of the same SurrealKv path needs the previous
+    /// connection's router task to finish the datastore shutdown (file lock).
+    async fn settle_db_lock() {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     }
 
     /// Write a minimal but valid `tokenizer.json` (single-token BPE) for
@@ -684,6 +730,264 @@ mod tests {
             vec.hits[0].highlights.is_none(),
             "vector mode has no highlights"
         );
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// Embedder that reports one dimension but emits vectors of another —
+    /// used to force a chunk-write failure inside the reindex transaction.
+    struct WrongDimEmbedder {
+        declared: usize,
+        actual: usize,
+    }
+
+    impl Embed for WrongDimEmbedder {
+        fn dimension(&self) -> usize {
+            self.declared
+        }
+        fn max_input_tokens(&self) -> usize {
+            8192
+        }
+        fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, SkbError> {
+            Ok(texts.iter().map(|_| vec![0.0f32; self.actual]).collect())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_model_mismatch_blocks_open_and_reindex_recovers() {
+        let n = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::path::PathBuf::from(format!("./target/skb-test-mm-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tok_path = dir.join("tokenizer.json");
+        write_fixture_tokenizer(&tok_path, "alpha");
+
+        let mut config_a = Config::default();
+        config_a.embedding.onnx_path = "mock".to_string();
+        config_a.embedding.dimension = 8;
+        config_a.embedding.model = "model-a".to_string();
+        config_a.embedding.tokenizer = tok_path.display().to_string();
+        config_a.storage.path = dir.join("db");
+
+        let kb = KnowledgeBase::open(config_a.clone()).await.unwrap();
+        kb.upload(UploadRequest {
+            path: None,
+            url: None,
+            content: Some("some document body".into()),
+            content_base64: None,
+            title: Some("doc".into()),
+            tags: None,
+            metadata: None,
+            force: None,
+        })
+        .await
+        .unwrap();
+        drop(kb);
+        settle_db_lock().await;
+
+        // Same database, different model: normal open refuses to operate.
+        let mut config_b = config_a.clone();
+        config_b.embedding.model = "model-b".to_string();
+        let err = open_expecting_error(config_b.clone()).await;
+        assert!(matches!(err.code, ErrorCode::ModelMismatch));
+        settle_db_lock().await;
+
+        // The management path can open and rebuild.
+        let kb = KnowledgeBase::open_for_reindex(config_b.clone())
+            .await
+            .unwrap();
+        let result = kb
+            .reindex(&reindex::ReindexRequest::default(), None)
+            .await
+            .unwrap();
+        assert_eq!(result.documents_processed, 1);
+        drop(kb);
+        settle_db_lock().await;
+
+        // After the rebuild the new model opens normally.
+        KnowledgeBase::open(config_b).await.unwrap();
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_dimension_change_redefines_schema_and_recovers() {
+        let n = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::path::PathBuf::from(format!("./target/skb-test-dimchg-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tok_path = dir.join("tokenizer.json");
+        write_fixture_tokenizer(&tok_path, "alpha");
+
+        let mut config = Config::default();
+        config.embedding.onnx_path = "mock".to_string();
+        config.embedding.dimension = 8;
+        config.embedding.tokenizer = tok_path.display().to_string();
+        config.storage.path = dir.join("db");
+
+        let kb = KnowledgeBase::open(config.clone()).await.unwrap();
+        kb.upload(UploadRequest {
+            path: None,
+            url: None,
+            content: Some("a document with some content".into()),
+            content_base64: None,
+            title: Some("doc".into()),
+            tags: None,
+            metadata: None,
+            force: None,
+        })
+        .await
+        .unwrap();
+
+        // Reindex with a 16-dimension embedder: schema must be redefined.
+        let dim16 = MockEmbedder { dimension: 16 };
+        let result = reindex::reindex(
+            kb.db(),
+            &dim16,
+            kb.tokenizer().as_ref(),
+            kb.config(),
+            &reindex::ReindexRequest::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.documents_processed, 1);
+        let stored_dim = kb.db().get_meta("embedding_dimension").await.unwrap();
+        assert_eq!(stored_dim.as_deref(), Some("16"));
+        drop(kb);
+        settle_db_lock().await;
+
+        // A normal open with the old 8-dim config now reports a mismatch.
+        let err = open_expecting_error(config.clone()).await;
+        assert!(matches!(err.code, ErrorCode::ModelMismatch));
+        settle_db_lock().await;
+
+        // Rebuild back to 8 via the reindex path, then normal open works again.
+        let kb = KnowledgeBase::open_for_reindex(config.clone())
+            .await
+            .unwrap();
+        let result = kb
+            .reindex(&reindex::ReindexRequest::default(), None)
+            .await
+            .unwrap();
+        assert_eq!(result.documents_processed, 1);
+        drop(kb);
+        settle_db_lock().await;
+        KnowledgeBase::open(config).await.unwrap();
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_dimension_change_interruption_is_detectable_and_recovers() {
+        let n = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::path::PathBuf::from(format!("./target/skb-test-dimrb-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tok_path = dir.join("tokenizer.json");
+        write_fixture_tokenizer(&tok_path, "alpha");
+
+        let mut config = Config::default();
+        config.embedding.onnx_path = "mock".to_string();
+        config.embedding.dimension = 8;
+        config.embedding.tokenizer = tok_path.display().to_string();
+        config.storage.path = dir.join("db");
+
+        let kb = KnowledgeBase::open(config.clone()).await.unwrap();
+        kb.upload(UploadRequest {
+            path: None,
+            url: None,
+            content: Some("a document with some content".into()),
+            content_base64: None,
+            title: Some("doc".into()),
+            tags: None,
+            metadata: None,
+            force: None,
+        })
+        .await
+        .unwrap();
+
+        // Declared 16 (drives the schema transition) but emits 8-dim vectors:
+        // the rebuild fails after the transition committed.
+        let broken = WrongDimEmbedder {
+            declared: 16,
+            actual: 8,
+        };
+        let err = reindex::reindex(
+            kb.db(),
+            &broken,
+            kb.tokenizer().as_ref(),
+            kb.config(),
+            &reindex::ReindexRequest::default(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err.code, ErrorCode::Db));
+        drop(kb);
+        settle_db_lock().await;
+
+        // The interrupted state is detectable: a plain open with the old
+        // config must refuse to operate.
+        let err = open_expecting_error(config.clone()).await;
+        assert!(matches!(err.code, ErrorCode::ModelMismatch));
+        settle_db_lock().await;
+
+        // Re-running reindex through the management path completes the
+        // rebuild back to dimension 8, then normal open works again.
+        let kb = KnowledgeBase::open_for_reindex(config.clone())
+            .await
+            .unwrap();
+        let result = kb
+            .reindex(&reindex::ReindexRequest::default(), None)
+            .await
+            .unwrap();
+        assert_eq!(result.documents_processed, 1);
+        drop(kb);
+        settle_db_lock().await;
+        KnowledgeBase::open(config).await.unwrap();
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_reindex_reports_progress() {
+        let kb = setup().await;
+        let path = kb.config().storage.path.clone();
+        for i in 0..2 {
+            kb.upload(UploadRequest {
+                path: None,
+                url: None,
+                content: Some(format!("document number {i} with body text")),
+                content_base64: None,
+                title: Some(format!("doc-{i}")),
+                tags: None,
+                metadata: None,
+                force: None,
+            })
+            .await
+            .unwrap();
+        }
+
+        let updates: std::sync::Arc<std::sync::Mutex<Vec<(usize, usize)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let progress = {
+            let updates = updates.clone();
+            move |done: usize, total: usize| {
+                updates.lock().unwrap().push((done, total));
+            }
+        };
+        let result = kb
+            .reindex(&reindex::ReindexRequest::default(), Some(&progress))
+            .await
+            .unwrap();
+        assert_eq!(result.documents_processed, 2);
+
+        let updates = updates.lock().unwrap();
+        assert!(!updates.is_empty(), "progress callback must be invoked");
+        let (last_done, last_total) = *updates.last().unwrap();
+        assert_eq!(last_total, 2);
+        assert_eq!(last_done, 2);
 
         let _ = std::fs::remove_dir_all(&path);
     }
@@ -1311,7 +1615,7 @@ mod tests {
         assert!(multi_hop.nodes.iter().any(|node| node.name == "C"));
 
         let reindexed = kb
-            .reindex(&reindex::ReindexRequest::default())
+            .reindex(&reindex::ReindexRequest::default(), None)
             .await
             .unwrap();
         assert_eq!(reindexed.documents_processed, 1);
