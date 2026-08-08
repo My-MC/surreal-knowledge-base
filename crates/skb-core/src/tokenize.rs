@@ -90,17 +90,20 @@ impl Tokenize for TokenizersImpl {
 
         while start < ids.len() {
             let window_end = (start + max_tokens).min(ids.len());
-            let chunk_start_off = offsets.get(start).map(|o| o.0).unwrap_or(0);
             let mut end = window_end;
 
-            // Break before the first token that starts at or after the next
-            // heading inside the window (robust even when no token starts
-            // exactly on the heading byte offset). The chunk's own heading
-            // (at its start) never triggers a break.
-            let first_heading = headings.partition_point(|&h| h <= chunk_start_off);
+            // Break before the first token that ENDS after the next heading
+            // inside the window: the token containing the heading start goes
+            // to the next chunk, keeping the heading line intact even when no
+            // token starts exactly on the heading byte offset. A heading that
+            // falls inside the chunk's FIRST token (e.g. a "##" merged with
+            // the preceding newline) is the chunk's own heading and never
+            // triggers a break.
+            let first_token_end = offsets.get(start).map(|o| o.1).unwrap_or(0);
+            let first_heading = headings.partition_point(|&h| h <= first_token_end);
             if let Some(&heading_off) = headings.get(first_heading) {
                 if let Some(i) = (start + 1..window_end)
-                    .find(|&i| offsets.get(i).map(|o| o.0).unwrap_or(0) >= heading_off)
+                    .find(|&i| offsets.get(i).map(|o| o.1).unwrap_or(0) > heading_off)
                 {
                     end = i;
                 }
@@ -235,6 +238,7 @@ mod tests {
 
     fn fixture_tokenizer(path: &std::path::Path, word: &str) {
         use tokenizers::models::bpe::BPE;
+        use tokenizers::pre_tokenizers::whitespace::WhitespaceSplit;
         use tokenizers::Tokenizer;
         let mut vocab = ahash::AHashMap::default();
         vocab.insert("<unk>".to_string(), 0);
@@ -244,7 +248,12 @@ mod tests {
             .unk_token("<unk>".to_string())
             .build()
             .unwrap();
-        std::fs::write(path, serde_json::to_string(&Tokenizer::new(bpe)).unwrap()).unwrap();
+        let mut tok = Tokenizer::new(bpe);
+        // Word-based splitting keeps "## Beta" in one token run, like a real
+        // subword tokenizer would (per-char fallback tokens would split the
+        // heading line across chunks).
+        tok.with_pre_tokenizer(Some(WhitespaceSplit));
+        std::fs::write(path, serde_json::to_string(&tok).unwrap()).unwrap();
     }
 
     #[test]
