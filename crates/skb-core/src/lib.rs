@@ -73,21 +73,40 @@ impl KnowledgeBase {
 
         // Compare/validate stored embedding metadata BEFORE migrate so a
         // mismatch never modifies the schema (spec §5.4). A brand-new database
-        // has no `meta` table yet (get_meta errors), which is treated as a
-        // first-open initialization path.
-        let stored_model = match db.get_meta("embedding_model").await {
-            Ok(model) => model,
-            Err(e) if e.code == ErrorCode::Db => None, // fresh store: no meta table
-            Err(e) => return Err(e),
-        };
-        if let Some(ref stored) = stored_model {
-            if stored != &config.embedding.model {
+        // has no tables yet and takes the initialization path.
+        let is_new = db.is_new_database().await?;
+        if is_new {
+            db.migrate(dimension).await?;
+            db.set_meta("embedding_model", &config.embedding.model)
+                .await?;
+            db.set_meta("embedding_dimension", &dimension.to_string())
+                .await?;
+            db.set_meta(
+                "embedding_max_input_tokens",
+                &config.embedding.max_input_tokens.to_string(),
+            )
+            .await?;
+            db.set_meta("schema_version", "1").await?;
+        } else {
+            let stored_model = db.get_meta("embedding_model").await?;
+            if let Some(ref stored) = stored_model {
+                if stored != &config.embedding.model {
+                    return Err(SkbError::new(
+                        ErrorCode::ModelMismatch,
+                        format!(
+                            "config: '{}', stored: '{}'. Run reindex to switch models.",
+                            config.embedding.model, stored
+                        ),
+                    ));
+                }
+            } else {
+                // An existing store missing embedding_model cannot be
+                // distinguished from a fresh one without inspecting vectors;
+                // refuse to guess and require an explicit rebuild rather than
+                // silently re-initializing over existing vectors.
                 return Err(SkbError::new(
                     ErrorCode::ModelMismatch,
-                    format!(
-                        "config: '{}', stored: '{}'. Run reindex to switch models.",
-                        config.embedding.model, stored
-                    ),
+                    "existing store has no embedding_model metadata. Run reindex to rebuild.",
                 ));
             }
             // Existing store: validate any stored dimension/max_input values
@@ -127,19 +146,6 @@ impl KnowledgeBase {
                 .await?;
             }
             db.migrate(dimension).await?;
-        } else {
-            // New database: initialize all embedding metadata.
-            db.migrate(dimension).await?;
-            db.set_meta("embedding_model", &config.embedding.model)
-                .await?;
-            db.set_meta("embedding_dimension", &dimension.to_string())
-                .await?;
-            db.set_meta(
-                "embedding_max_input_tokens",
-                &config.embedding.max_input_tokens.to_string(),
-            )
-            .await?;
-            db.set_meta("schema_version", "1").await?;
         }
 
         // Tokenizer fingerprint: compute, then compare against the stored

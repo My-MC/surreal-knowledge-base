@@ -36,6 +36,25 @@ impl Db {
         }
     }
 
+    /// True when the database has no tables yet (a freshly created data
+    /// directory). Used to decide whether stored metadata can be compared
+    /// before the schema is applied.
+    pub async fn is_new_database(&self) -> Result<bool, SkbError> {
+        let mut r = self
+            .db
+            .query("INFO FOR DB")
+            .await
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("info db: {e}")))?;
+        let rows: Vec<serde_json::Value> = r
+            .take(0)
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("info db take: {e}")))?;
+        let tables = rows.first().and_then(|v| v["tables"].as_object());
+        // Fail closed: if the result shape is unexpected (tables missing),
+        // treat the database as existing so metadata comparison is never
+        // skipped on a populated store.
+        Ok(tables.is_some_and(|t| t.is_empty()))
+    }
+
     pub async fn migrate(&self, embedding_dim: usize) -> Result<(), SkbError> {
         let schema = include_str!("../../../schema/001_init.surql");
         let schema = schema.replace("{DIM}", &embedding_dim.to_string());
