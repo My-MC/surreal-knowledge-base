@@ -126,7 +126,7 @@ pub struct GetDocumentRequest {
 
 impl GetDocumentRequest {
     pub fn validate(&self) -> Result<(), SkbError> {
-        validate_document_id(&self.id)
+        validate_document_id(&self.id).map(|_| ())
     }
 }
 
@@ -137,14 +137,14 @@ pub struct DeleteDocumentRequest {
 
 impl DeleteDocumentRequest {
     pub fn validate(&self) -> Result<(), SkbError> {
-        validate_document_id(&self.id)
+        validate_document_id(&self.id).map(|_| ())
     }
 }
 
 /// Validate that `id` is a `document:<key>` record id and reject inputs that
 /// could alter the query when interpolated (the query itself is parameterized
 /// as a second layer of defense).
-fn validate_document_id(id: &str) -> Result<(), SkbError> {
+fn validate_document_id(id: &str) -> Result<(&str, &str), SkbError> {
     if id.trim().is_empty() {
         return Err(SkbError::new(ErrorCode::Validation, "id must not be empty"));
     }
@@ -175,7 +175,7 @@ fn validate_document_id(id: &str) -> Result<(), SkbError> {
             format!("invalid document id: '{id}'"),
         ));
     }
-    Ok(())
+    Ok((table, key))
 }
 
 pub async fn list_documents(db: &Db, q: &ListQuery) -> Result<Vec<DocumentSummary>, SkbError> {
@@ -365,9 +365,7 @@ fn val_u64(row: &serde_json::Value, key: &str) -> u64 {
 /// Convert a validated document id string into a typed `RecordId` for query
 /// parameter binding (never interpolated into SurrealQL).
 fn document_record_id(id: &str) -> Result<surrealdb::types::RecordId, SkbError> {
-    let (table, key) = id
-        .split_once(':')
-        .expect("validated document id must contain ':'");
+    let (table, key) = validate_document_id(id)?;
     Ok(surrealdb::types::RecordId::new(table, key))
 }
 
