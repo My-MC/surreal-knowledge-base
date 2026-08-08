@@ -591,7 +591,7 @@ fn fetch_url(url_str: &str, config: &Config) -> Result<(Vec<u8>, Option<String>)
             .headers()
             .get("content-type")
             .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
+            .map(|s| s.split(';').next().unwrap_or("").trim().to_string());
         let body = resp
             .body_mut()
             .with_config()
@@ -662,27 +662,44 @@ fn reject_blocked_ip(ip: IpAddr) -> Result<(), SkbError> {
 /// their IPv6 equivalents.
 pub fn is_blocked_ip(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(v4) => {
-            v4.is_private()
-                || v4.is_loopback()
-                || v4.is_link_local()
-                || v4.is_multicast()
-                || v4.is_unspecified()
-                || v4.is_broadcast()
-                || v4.is_documentation()
-                || is_cgnat(v4)
-                || is_benchmarking(v4)
-                || is_reserved_v4(v4)
-                || v4.octets() == [169, 254, 169, 254]
-        }
+        IpAddr::V4(v4) => is_blocked_v4(v4),
         IpAddr::V6(v6) => {
-            v6.is_loopback()
+            // IPv4-mapped (::ffff:0:0/96) and IPv4-compatible (::/96)
+            // addresses must be judged by their IPv4 form, otherwise
+            // ::ffff:127.0.0.1 etc. would bypass the SSRF guard. Native v6
+            // ranges are checked first so ::1 etc. cannot slip through the
+            // v4-compatible conversion (::1 -> 0.0.0.1).
+            if v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
                 || v6.is_unique_local()
                 || v6.is_unicast_link_local()
+            {
+                return true;
+            }
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_blocked_v4(v4);
+            }
+            if let Some(v4) = v6.to_ipv4() {
+                return is_blocked_v4(v4);
+            }
+            false
         }
     }
+}
+
+fn is_blocked_v4(v4: std::net::Ipv4Addr) -> bool {
+    v4.is_private()
+        || v4.is_loopback()
+        || v4.is_link_local()
+        || v4.is_multicast()
+        || v4.is_unspecified()
+        || v4.is_broadcast()
+        || v4.is_documentation()
+        || is_cgnat(v4)
+        || is_benchmarking(v4)
+        || is_reserved_v4(v4)
+        || v4.octets() == [169, 254, 169, 254]
 }
 
 /// 100.64.0.0/10 — shared address space (CGNAT).
@@ -828,6 +845,19 @@ mod tests {
             "::",
         ];
         for ip in blocked {
+            let ip: IpAddr = ip.parse().unwrap();
+            assert!(is_blocked_ip(ip), "{ip} should be blocked");
+        }
+        // IPv4-mapped / IPv4-compatible IPv6 must be judged by their IPv4 form.
+        let mapped: Vec<&str> = vec![
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
+            "::ffff:192.168.1.1",
+            "::ffff:169.254.169.254",
+            "::127.0.0.1",
+            "::ffff:100.64.0.1",
+        ];
+        for ip in mapped {
             let ip: IpAddr = ip.parse().unwrap();
             assert!(is_blocked_ip(ip), "{ip} should be blocked");
         }
