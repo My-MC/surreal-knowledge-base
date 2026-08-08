@@ -477,11 +477,28 @@ fn is_pdf_bytes(bytes: &[u8]) -> bool {
     bytes.starts_with(b"%PDF-")
 }
 
+/// Upper bound on PDF parse/extract jobs running concurrently across all
+/// requests. The blocking tasks are not cancellable after the wall-clock
+/// timeout fires, so without a cap a flood of non-terminating PDFs could
+/// accumulate blocking workers and their input buffers.
+const MAX_CONCURRENT_PDF_JOBS: usize = 4;
+
+static PDF_SEMAPHORE: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+
+fn pdf_semaphore() -> &'static tokio::sync::Semaphore {
+    PDF_SEMAPHORE.get_or_init(|| tokio::sync::Semaphore::new(MAX_CONCURRENT_PDF_JOBS))
+}
+
 /// Extract PDF text with resource guards: page count, wall-clock time and
 /// output size (PDF bomb mitigation, spec §12.3). The page-count check is the
 /// primary PDF-bomb defense; parsing and extraction run on blocking threads
-/// under a wall-clock timeout so a slow document cannot hang the request.
+/// under a wall-clock timeout so a slow document cannot hang the request. A
+/// fixed concurrency cap bounds how many blocking jobs may pile up.
 async fn extract_pdf_checked(bytes: &[u8]) -> Result<String, SkbError> {
+    let _permit = pdf_semaphore()
+        .acquire()
+        .await
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("pdf semaphore: {e}")))?;
     let start = Instant::now();
     let shared = std::sync::Arc::new(bytes.to_vec());
     let doc = tokio::time::timeout(
