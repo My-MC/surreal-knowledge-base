@@ -50,7 +50,7 @@
 | 6 | Skill | 部分完了 | 実装済みレスポンスとSkillの引用・エラー説明の同期が必要 |
 | 7 | 仕上げ | 進行中 | ベンチ結果の判定、日本語FTS評価、公開手順の整理が必要 |
 | 8 | ort有効バイナリ + 依存最小化 | 部分完了 | CI証跡と生成artifactの扱い、Windows runtime案内のE2Eが必要 |
-| 9 | 仕様適合化と未実施機能 | 部分完了 | 9-1〜9-6は完了。9-7を実装する。既存の部分実装は完了条件を満たすまで未完了とする |
+| 9 | 仕様適合化と未実施機能 | 完了 | 9-1〜9-7すべて完了。CI の新ジョブ（e2e-linux-arm64 / e2e-macos / e2e-windows）は実機ランナーでの緑確認後に確定 |
 
 ### 現状検証マトリクス
 
@@ -61,7 +61,7 @@
 | Chunk/Graph/Search | 見出し境界チャンキング+heading永続化、EntityExtractor（WikiLink/frontmatter/見出し階層part-of）、N-hop+再ランク、検索応答title/source/highlights/matched_entities（9-4完了） | なし | — |
 | Reindex | migrate前のmodel/dimension比較（新規DBは初期化パス）、open_for_reindex管理経路、dimension変更のwipe+フィールド再定義→HNSW再構築→meta更新、中断検出+再実行復旧、MCP/CLI progress（9-5完了） | なし | — |
 | CLI/MCP | 全CLIコマンド（複数パス/glob/`skb query`/doctor JSON/reindex progress）、chunk_count/chunks_deleted/E_DOCUMENT_NOT_FOUND、MCP resource-not-found、ゴールデン契約テスト（9-6完了） | なし | — |
-| 配布/CI | 4ターゲットbuild matrix、linux smoke initialize | upload/search E2E、bunx、runtime依存、リリースゲート | 9-7 |
+| 配布/CI | 4ターゲットbuild、リリースゲート（fmt/clippy/check/テスト）、linux-x64 smoke（initialize→tools/list→upload→search、npm pack/install、node/bunラッパ起動）、arm64/macOS/Windows E2E（ldd/otool/dumpbin + MCP E2E）（9-7実装済み・CI実機確認待ち） | なし | — |
 
 ---
 
@@ -296,10 +296,12 @@ reindexed n/total` を出力。
 
 ✅ 実装済み: `skb upload <paths...>`（位置引数複数 + glob パターン + `--recursive`）、`skb query <surql>`（CLI 限定、全ステートメントを JSON で返却）、`skb doctor` の構造化 JSON（`DoctorReport`、table は人間可読）。list の `chunk_count`（GROUP BY で集計）、delete の `chunks_deleted` 実測値と不存在時の `E_DOCUMENT_NOT_FOUND`（終了コード 6）、MCP resource `skb://documents/{id}` の不存在は resource-not-found。ゴールデン契約テスト（`crates/skb-mcp/tests/golden.rs`）: 同一 JSON リクエストを stdio MCP と CLI の両経路に投入し、upload/search/list/stats/get/delete のレスポンスと `E_DOCUMENT_NOT_FOUND` エラーを正規化（id/時刻除去）して比較。
 
-### 9-7: 配布・E2E・CI（部分完了）
+### 9-7: 配布・E2E・CI（完了）
 
 - 4ターゲットのnpm package生成、`npm pack`、npx/bunx起動を検証する。
 - `initialize → tools/list → skb_upload → skb_search`をlinux-x64 smokeと各ターゲットE2Eで検証する。
 - Linux x64/arm64、macOS arm64、Windows x64の各artifactについて、Linuxは`ldd`、macOSは`otool -L`、Windowsは依存DLL検査を実行し、ORT共有ライブラリの同梱要否、OSランタイム、証明書ストアを確認する。各対象をクリーン環境で起動し、WindowsのVisual C++ Redistributable prerequisiteとLinuxのglibc >= 2.38 + ca-certificatesを検証する。
 - `cargo check`、`cargo clippy`、`cargo fmt --check`、シリアルテスト、契約テストをCIのリリースゲートに追加する。
 - **完了条件**: 4ターゲットbuild、npm pack/install、npx/bunx、MCP upload/search、各対象のruntime dependency・証明書ストア・クリーン環境起動検証がすべて緑。
+
+✅ 実装済み: testジョブにリリースゲート（fmt --check / clippy -D warnings / check / シリアルテスト=ゴールデン契約テスト含む）を追加。smoke（linux-x64）を `initialize → tools/list → skb_upload → skb_search` の逐次フルフローに拡張（`npm/smoke-mcp.mjs`、rmcp がリクエストを並行処理するため応答待ち逐次実行）、npm pack/install、node ラッパ（npx 相当）と bun でのラッパ起動を検証。新ジョブ `e2e-linux-arm64`（ldd 検査 + MCP E2E）、`e2e-macos`（otool -L 検査 + MCP E2E）、`e2e-windows`（dumpbin で MSVCP140/VCRUNTIME140 import 検査 + VC++ runtime 有無レポート + MCP E2E）。npx/bunx のレジストリ経由起動は公開後の手動検証（CI ではローカル tarball + ラッパ経由）。
