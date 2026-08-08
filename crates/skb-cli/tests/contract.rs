@@ -87,7 +87,7 @@ fn core_search(query: &str, mode: &str) -> Value {
         let kb = skb_core::KnowledgeBase::open(config).await.unwrap();
         let req = skb_core::search::SearchRequest {
             query: query.into(),
-            mode: Some(mode.into()),
+            mode: Some(mode.parse().unwrap()),
             top_k: Some(5),
             graph_expand: None,
             filter: None,
@@ -106,7 +106,14 @@ fn core_list() -> Value {
     config.storage.path = dir.join("db");
     rt.block_on(async {
         let kb = skb_core::KnowledgeBase::open(config).await.unwrap();
-        let docs = kb.list_documents(10, 0, None).await.unwrap();
+        let docs = kb
+            .list_documents(&skb_core::crud::ListQuery {
+                limit: Some(10),
+                offset: Some(0),
+                order: None,
+            })
+            .await
+            .unwrap();
         serde_json::to_value(docs).unwrap()
     })
 }
@@ -204,6 +211,85 @@ fn contract_config_set_updates_existing_config() {
     assert!(config.contains("search = { rrf_k = 42 }"));
     let shown = run_skb(&["config", "show"], None);
     assert_eq!(shown["search"]["rrf_k"], 42);
+}
+
+#[test]
+fn contract_config_env_override() {
+    setup_config();
+    let output = Command::new(skb_binary())
+        .args(["config", "show"])
+        .env("SKB_SEARCH_TOP_K", "42")
+        .current_dir(test_dir())
+        .output()
+        .expect("failed to run skb config show");
+    assert!(output.status.success());
+    let val: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(val["search"]["top_k"], 42);
+}
+
+#[test]
+fn contract_upload_partial_failure() {
+    setup_config();
+    let dir = test_dir();
+    let docs_dir = dir.join("docs");
+    std::fs::create_dir_all(&docs_dir).unwrap();
+    std::fs::write(docs_dir.join("good.md"), "# Good\n\ncontent").unwrap();
+    // PNG magic bytes: not UTF-8, not a supported format.
+    std::fs::write(
+        docs_dir.join("blob.bin"),
+        [0x89u8, 0x50, 0x4e, 0x47, 0x0d, 0x0a],
+    )
+    .unwrap();
+
+    // Partial failure must exit non-zero while still reporting the committed
+    // results and the aggregated errors on stdout.
+    let output = Command::new(skb_binary())
+        .args([
+            "upload",
+            "--path",
+            docs_dir.to_str().unwrap(),
+            "--recursive",
+        ])
+        .current_dir(test_dir())
+        .output()
+        .expect("failed to run skb upload");
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "partial failure must exit non-zero"
+    );
+    let val: Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    let results = val["results"].as_array().unwrap();
+    let errors = val["errors"].as_array().unwrap();
+    assert_eq!(results.len(), 1, "good file must be committed");
+    assert_eq!(errors.len(), 1, "bad file must be reported");
+    assert_eq!(results[0]["status"], "created");
+    assert_eq!(errors[0]["error"], "E_UNSUPPORTED_FORMAT");
+    assert_eq!(
+        errors[0]["input"],
+        docs_dir.join("blob.bin").display().to_string()
+    );
+}
+
+#[test]
+fn contract_search_response_fields() {
+    setup_config();
+    run_skb(
+        &["upload", "--stdin", "--title", "fields-test"],
+        Some("highlighted query words with zzzkw token"),
+    );
+
+    let search = run_skb(&["search", "zzzkw", "--mode", "keyword"], None);
+    let hit = &search["hits"][0];
+    assert_eq!(hit["title"], "fields-test");
+    assert!(hit["source"].is_string());
+    let hl = hit["highlights"].as_array().unwrap();
+    assert!(hl.iter().any(|v| v == "zzzkw"));
+
+    let vec = run_skb(&["search", "zzzkw", "--mode", "vector"], None);
+    assert!(vec["hits"][0]["title"].is_string());
+    assert!(vec["hits"][0]["highlights"].is_null());
 }
 
 #[test]

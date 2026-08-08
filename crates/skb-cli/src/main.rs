@@ -1,12 +1,14 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use skb_core::config::Config;
+use skb_core::crud::{DeleteDocumentRequest, GetDocumentRequest, ListQuery, OrderBy};
 use skb_core::graph::{EntityInfo, GraphQueryRequest, LinkInfo};
 use skb_core::ingest::UploadRequest;
 use skb_core::search::SearchRequest;
 use skb_core::KnowledgeBase;
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{Read, Write};
+use std::str::FromStr;
 
 #[derive(Parser)]
 #[command(name = "skb", version, about = "Surreal Knowledge Base CLI")]
@@ -24,9 +26,9 @@ enum Commands {
     Upload {
         #[arg(long)]
         path: Option<String>,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "path")]
         url: Option<String>,
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["path", "url"])]
         stdin: bool,
         #[arg(long)]
         title: Option<String>,
@@ -38,7 +40,7 @@ enum Commands {
         metadata: Option<String>,
         #[arg(long, help = "upload all files under a directory path")]
         recursive: bool,
-        #[arg(long, help = "read base64-encoded content from stdin")]
+        #[arg(long, conflicts_with_all = ["path", "url"], requires = "stdin", help = "read base64-encoded content from stdin")]
         base64: bool,
     },
     /// Search documents
@@ -192,7 +194,7 @@ async fn async_main() -> std::process::ExitCode {
     let fmt = cli.format.clone();
 
     match run(&cli).await {
-        Ok(()) => std::process::ExitCode::SUCCESS,
+        Ok(code) => std::process::ExitCode::from(code),
         Err(e) => {
             emit_error(&fmt, &e);
             std::process::ExitCode::from(exit_code_of(&e))
@@ -225,7 +227,7 @@ fn exit_code_of(e: &anyhow::Error) -> u8 {
         .unwrap_or(1)
 }
 
-async fn run(cli: &Cli) -> Result<()> {
+async fn run(cli: &Cli) -> Result<u8> {
     let fmt = cli.format.clone();
     match &cli.command {
         Commands::List {
@@ -234,12 +236,24 @@ async fn run(cli: &Cli) -> Result<()> {
             order,
         } => {
             let kb = KnowledgeBase::open(cfg()?).await?;
-            let docs = kb.list_documents(*limit, *offset, order.clone()).await?;
+            let order = order.as_deref().map(OrderBy::from_str).transpose()?;
+            let docs = kb
+                .list_documents(&ListQuery {
+                    limit: Some(*limit),
+                    offset: Some(*offset),
+                    order,
+                })
+                .await?;
             output(&docs, &fmt)?;
         }
         Commands::Get { id, chunks } => {
             let kb = KnowledgeBase::open(cfg()?).await?;
-            let doc = kb.get_document(id, *chunks).await?;
+            let doc = kb
+                .get_document(&GetDocumentRequest {
+                    id: id.clone(),
+                    include_chunks: Some(*chunks),
+                })
+                .await?;
             output(&doc, &fmt)?;
         }
         Commands::Delete { id, yes } => {
@@ -247,7 +261,9 @@ async fn run(cli: &Cli) -> Result<()> {
                 anyhow::bail!("use --yes to confirm deletion of {id}");
             }
             let kb = KnowledgeBase::open(cfg()?).await?;
-            let result = kb.delete_document(id).await?;
+            let result = kb
+                .delete_document(&DeleteDocumentRequest { id: id.clone() })
+                .await?;
             output(&result, &fmt)?;
         }
         Commands::Stats => {
@@ -309,24 +325,63 @@ async fn run(cli: &Cli) -> Result<()> {
             };
 
             if *stdin {
-                let mut content = String::new();
+                // Bound stdin reads by upload.max_file_mb (spec §12.3).
+                let max = kb.config().upload.max_file_mb.saturating_mul(1024 * 1024);
+                let read_cap = max.saturating_add(1);
                 if *base64 {
                     let mut raw = Vec::new();
-                    std::io::stdin().read_to_end(&mut raw)?;
-                    content = String::from_utf8(raw)?;
+                    std::io::stdin().take(read_cap).read_to_end(&mut raw)?;
+                    if raw.len() as u64 > max {
+                        anyhow::bail!("stdin exceeds upload.max_file_mb");
+                    }
+                    let content = String::from_utf8(raw)?;
                     let result = kb.upload(build(None, None, Some(content))).await?;
                     output(&result, &fmt)?;
                 } else {
-                    std::io::stdin().read_to_string(&mut content)?;
+                    let mut content = String::new();
+                    std::io::stdin()
+                        .take(read_cap)
+                        .read_to_string(&mut content)?;
+                    if content.len() as u64 > max {
+                        anyhow::bail!("stdin exceeds upload.max_file_mb");
+                    }
                     let result = kb.upload(build(None, Some(content), None)).await?;
                     output(&result, &fmt)?;
                 }
-            } else if !paths.is_empty() {
-                let mut results = Vec::new();
+            } else if paths.len() > 1 {
+                // Multi-input uploads: successful uploads are committed and
+                // returned in `results`, failures are aggregated in `errors`
+                // (spec §12.3). A single input keeps the direct UploadResult
+                // shape with top-level document_id/status fields.
+                let mut results: Vec<serde_json::Value> = Vec::new();
+                let mut errors: Vec<serde_json::Value> = Vec::new();
                 for p in paths {
-                    results.push(kb.upload(build(Some(p), None, None)).await?);
+                    match kb.upload(build(Some(p.clone()), None, None)).await {
+                        Ok(result) => results.push(serde_json::to_value(result)?),
+                        Err(e) => errors.push(serde_json::json!({
+                            "input": p,
+                            "error": skb_core::error::ErrorCode::from_std(&e)
+                                .map(|c| c.code_str().to_string())
+                                .unwrap_or_else(|| "E_INTERNAL".to_string()),
+                            "message": format!("{e:#}"),
+                        })),
+                    }
                 }
-                output(&results, &fmt)?;
+                // Multi-input uploads always report {results, errors}; any
+                // failure makes the command exit non-zero so callers can
+                // detect partial failure (spec §12.3).
+                output(
+                    &serde_json::json!({ "results": results, "errors": errors }),
+                    &fmt,
+                )?;
+                if !errors.is_empty() {
+                    // The JSON payload is already on stdout; exit non-zero
+                    // without emitting a second error document. Returning the
+                    // code (rather than std::process::exit) lets the embedded
+                    // SurrealKv connection drop and flush normally.
+                    let _ = std::io::stdout().flush();
+                    return Ok(1);
+                }
             } else {
                 let result = kb.upload(build(path.clone(), None, None)).await?;
                 output(&result, &fmt)?;
@@ -356,7 +411,7 @@ async fn run(cli: &Cli) -> Result<()> {
                 .collect::<Result<_, _>>()?;
             let req = SearchRequest {
                 query: query.clone(),
-                mode: Some(mode.clone()),
+                mode: Some(mode.parse()?),
                 top_k: Some(*top_k),
                 graph_expand: *graph_expand,
                 filter: if filter.is_empty() {
@@ -417,9 +472,25 @@ async fn run(cli: &Cli) -> Result<()> {
             }
         }
         Commands::Reindex { dry_run } => {
-            let kb = KnowledgeBase::open(cfg()?).await?;
+            // A model/dimension/tokenizer mismatch blocks normal open; reindex
+            // is the management path out of that state (spec §9-5).
+            let config = cfg()?;
+            let kb = match KnowledgeBase::open(config.clone()).await {
+                Ok(kb) => kb,
+                Err(e) if e.code == skb_core::error::ErrorCode::ModelMismatch => {
+                    KnowledgeBase::open_for_reindex(config).await?
+                }
+                Err(e) => return Err(e.into()),
+            };
             let req = skb_core::reindex::ReindexRequest { dry_run: *dry_run };
-            let result = kb.reindex(&req).await?;
+            let progress = |done: usize, total: usize| {
+                eprint!("\rreindexed {done}/{total}");
+                let _ = std::io::Write::flush(&mut std::io::stderr());
+            };
+            let result = kb.reindex(&req, Some(&progress)).await?;
+            if !*dry_run {
+                eprintln!();
+            }
             output(&result, &fmt)?;
         }
         Commands::Config { cmd } => match cmd {
@@ -437,7 +508,7 @@ async fn run(cli: &Cli) -> Result<()> {
         },
     }
 
-    Ok(())
+    Ok(0)
 }
 
 /// `skb config set storage.path './db'`: write a dotted key into the writable
@@ -509,5 +580,40 @@ fn parse_scalar_item(raw: &str) -> toml_edit::Item {
 }
 
 fn cfg() -> Result<Config> {
-    Config::load().or_else(|_| Ok(Config::default()))
+    Config::load()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn upload_base64_requires_stdin() {
+        assert!(Cli::try_parse_from(["skb", "upload", "--base64"]).is_err());
+        assert!(Cli::try_parse_from(["skb", "upload", "--base64", "--path", "a.md"]).is_err());
+        assert!(
+            Cli::try_parse_from(["skb", "upload", "--base64", "--url", "https://x.example/a"])
+                .is_err()
+        );
+        assert!(Cli::try_parse_from(["skb", "upload", "--base64", "--stdin"]).is_ok());
+    }
+
+    #[test]
+    fn upload_rejects_multiple_input_sources() {
+        assert!(Cli::try_parse_from(["skb", "upload", "--path", "a.md", "--stdin"]).is_err());
+        assert!(Cli::try_parse_from([
+            "skb",
+            "upload",
+            "--path",
+            "a.md",
+            "--url",
+            "https://x.example/a"
+        ])
+        .is_err());
+        assert!(
+            Cli::try_parse_from(["skb", "upload", "--url", "https://x.example/a", "--stdin"])
+                .is_err()
+        );
+    }
 }
