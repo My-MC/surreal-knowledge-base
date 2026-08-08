@@ -1,12 +1,14 @@
 use crate::config::Config;
 use crate::db::Db;
+use crate::db::MetaStore;
 use crate::embed::Embed;
 use crate::error::{ErrorCode, SkbError};
 use crate::tokenize::Tokenize;
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ReindexResult {
     pub documents_processed: usize,
     pub chunks_created: usize,
@@ -14,7 +16,7 @@ pub struct ReindexResult {
     pub entities_extracted: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
 pub struct ReindexRequest {
     /// Only report what a reindex would do, without mutating the database.
     #[serde(default)]
@@ -42,6 +44,7 @@ pub async fn reindex(
         .take(0)
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex take: {e}")))?;
 
+    let mut all_entity_names = std::collections::HashSet::new();
     let mut result = ReindexResult {
         documents_processed: 0,
         chunks_created: 0,
@@ -68,8 +71,12 @@ pub async fn reindex(
         }
 
         if dry_run {
-            let entities = crate::graph::extract_entities(content);
-            result.entities_extracted += entities.len();
+            all_entity_names.extend(
+                crate::graph::extract_entities(content)
+                    .into_iter()
+                    .map(|e| e.name),
+            );
+            result.entities_extracted = all_entity_names.len();
             result.documents_processed += 1;
             result.chunks_created += chunks.len();
             result.tokens_total += chunks.iter().map(|c| c.token_count).sum::<usize>();
@@ -86,26 +93,79 @@ pub async fn reindex(
             .await
             .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex begin: {e}")))?;
         let rebuilt = rebuild_document(&tx, did, &chunks, &embeddings).await;
-        let entities_extracted = match rebuilt {
-            Ok(count) => {
+        let entity_names = match rebuilt {
+            Ok(names) => {
                 tx.commit()
                     .await
                     .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex commit: {e}")))?;
-                count
+                names
             }
             Err(e) => {
                 let _ = tx.cancel().await;
                 return Err(e);
             }
         };
-        result.entities_extracted += entities_extracted;
+        entity_names.into_iter().for_each(|n| {
+            all_entity_names.insert(n);
+        });
 
         result.documents_processed += 1;
         result.chunks_created += chunks.len();
         result.tokens_total += chunks.iter().map(|c| c.token_count).sum::<usize>();
     }
+    result.entities_extracted = all_entity_names.len();
+
+    if !dry_run {
+        update_metas(db, embedder, tokenizer, config).await?;
+    }
 
     Ok(result)
+}
+
+/// Record the resolved model/tokenizer metadata after a successful rebuild
+/// (spec §5.4 rule 3). All writes share one transaction so a partial failure
+/// cannot leave stale model/dimension/fingerprint metadata behind.
+async fn update_metas(
+    db: &Db,
+    embedder: &dyn Embed,
+    tokenizer: &dyn Tokenize,
+    config: &Config,
+) -> Result<(), SkbError> {
+    let tx = db
+        .db
+        .clone()
+        .begin()
+        .await
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex meta begin: {e}")))?;
+    let result = async {
+        tx.set_meta("embedding_model", &config.embedding.model)
+            .await?;
+        tx.set_meta("embedding_dimension", &embedder.dimension().to_string())
+            .await?;
+        tx.set_meta(
+            "embedding_max_input_tokens",
+            &embedder.max_input_tokens().to_string(),
+        )
+        .await?;
+        tx.set_meta("schema_version", "1").await?;
+        let source = crate::tokenizer_source_for(config);
+        let meta = crate::tokenizer_fingerprint(&source, &tokenizer.config_json()?)?;
+        crate::save_tokenizer_meta(&tx, config, &source, &meta).await?;
+        Ok::<(), SkbError>(())
+    }
+    .await;
+    match result {
+        Ok(()) => {
+            tx.commit()
+                .await
+                .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex meta commit: {e}")))?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = tx.cancel().await;
+            Err(e)
+        }
+    }
 }
 
 type LocalTransaction = surrealdb::method::Transaction<surrealdb::engine::local::Db>;
@@ -116,7 +176,7 @@ async fn rebuild_document(
     did: &str,
     chunks: &[crate::tokenize::Chunk],
     embeddings: &[Vec<f32>],
-) -> Result<usize, SkbError> {
+) -> Result<Vec<String>, SkbError> {
     let document = surrealdb::types::RecordId::new("document", did);
     tx.query(
         "DELETE FROM mentions WHERE in.document = $document; \
@@ -131,7 +191,8 @@ async fn rebuild_document(
     let mut chunk_ids = Vec::with_capacity(chunks.len());
     for (i, (chunk, emb)) in chunks.iter().zip(embeddings.iter()).enumerate() {
         let chunk_sql = "CREATE chunk SET document = $document, idx = $idx, \
-                         content = $content, token_count = $token_count, embedding = $embedding \
+                         content = $content, token_count = $token_count, \
+                         heading = $heading, embedding = $embedding \
                          RETURN string::concat('chunk:', meta::id(id)) AS cid";
         let mut response = tx
             .query(chunk_sql)
@@ -139,6 +200,7 @@ async fn rebuild_document(
             .bind(("idx", i as i64))
             .bind(("content", chunk.content.clone()))
             .bind(("token_count", chunk.token_count as i64))
+            .bind(("heading", chunk.heading.clone()))
             .bind(("embedding", emb.clone()))
             .await
             .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex chunk: {e}")))?
@@ -159,12 +221,13 @@ async fn rebuild_document(
         chunk_ids.push(cid.to_string());
     }
 
-    let mut entities = 0;
+    let mut entity_names = std::collections::HashSet::new();
     for (cid, chunk) in chunk_ids.iter().zip(chunks.iter()) {
-        entities +=
-            crate::graph::index_chunk_entities_in_transaction(tx, cid, &chunk.content).await?;
+        let names = crate::graph::index_chunk_entities_in_transaction(tx, cid, &chunk.content)
+            .await?;
+        entity_names.extend(names);
     }
-    Ok(entities)
+    Ok(entity_names.into_iter().collect())
 }
 
 fn embed_in_batches(

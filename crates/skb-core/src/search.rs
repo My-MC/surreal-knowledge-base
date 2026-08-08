@@ -1,30 +1,83 @@
+use crate::config::SearchMode;
 use crate::db::Db;
 use crate::embed::Embed;
 use crate::error::{ErrorCode, SkbError};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Practical upper bound for `top_k`; also keeps `fetch_k = top_k * 3` small.
+pub const MAX_TOP_K: usize = 1000;
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SearchRequest {
     pub query: String,
-    pub mode: Option<String>,
+    pub mode: Option<SearchMode>,
+    #[schemars(range(min = 1, max = 1000))]
     pub top_k: Option<usize>,
+    #[schemars(range(min = 0, max = 5))]
     pub graph_expand: Option<usize>,
     pub filter: Option<HashMap<String, String>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl SearchRequest {
+    pub fn validate(&self) -> Result<(), SkbError> {
+        if self.query.trim().is_empty() {
+            return Err(SkbError::new(
+                ErrorCode::Validation,
+                "query must not be empty",
+            ));
+        }
+        if let Some(top_k) = self.top_k {
+            if top_k == 0 {
+                return Err(SkbError::new(
+                    ErrorCode::Validation,
+                    "top_k must be at least 1",
+                ));
+            }
+            if top_k > MAX_TOP_K {
+                return Err(SkbError::new(
+                    ErrorCode::Validation,
+                    format!("top_k must be at most {MAX_TOP_K}"),
+                ));
+            }
+        }
+        if let Some(depth) = self.graph_expand {
+            if depth > 5 {
+                return Err(SkbError::new(
+                    ErrorCode::Validation,
+                    "graph_expand must be at most 5",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SearchHit {
     pub document_id: String,
     pub chunk_idx: usize,
     pub content: String,
     pub score: f64,
+    /// Document title; always present for persisted chunks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Document source (path / url / inline); always present for persisted chunks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Query terms found in the chunk (keyword mode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub highlights: Option<Vec<String>>,
+    /// Entities that led to this hit via graph expansion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_entities: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SearchResponse {
     pub hits: Vec<SearchHit>,
-    pub mode: String,
+    pub mode: SearchMode,
     pub elapsed_ms: u64,
 }
 
@@ -34,20 +87,15 @@ pub async fn search(
     rrf_k: usize,
     req: SearchRequest,
 ) -> Result<SearchResponse, SkbError> {
-    let mode = req.mode.as_deref().unwrap_or("hybrid");
+    req.validate()?;
+    let mode = req.mode.unwrap_or(SearchMode::Hybrid);
     let top_k = req.top_k.unwrap_or(10);
     let start = std::time::Instant::now();
 
     let hits = match mode {
-        "vector" => vector_search(db, embedder, &req.query, top_k).await?,
-        "keyword" => keyword_search(db, &req.query, top_k).await?,
-        "hybrid" => hybrid_search(db, embedder, &req.query, top_k, rrf_k).await?,
-        _ => {
-            return Err(SkbError::new(
-                ErrorCode::Validation,
-                format!("unknown mode: {mode}"),
-            ))
-        }
+        SearchMode::Vector => vector_search(db, embedder, &req.query, top_k).await?,
+        SearchMode::Keyword => keyword_search(db, &req.query, top_k).await?,
+        SearchMode::Hybrid => hybrid_search(db, embedder, &req.query, top_k, rrf_k).await?,
     };
 
     let hits = if let Some(filter) = &req.filter {
@@ -58,7 +106,7 @@ pub async fn search(
 
     Ok(SearchResponse {
         hits,
-        mode: mode.to_string(),
+        mode,
         elapsed_ms: start.elapsed().as_millis() as u64,
     })
 }
@@ -78,6 +126,7 @@ async fn vector_search(
     let emb_str = serde_json::to_string(&query_emb).unwrap_or_default();
     let sql = format!(
         "SELECT content, idx, meta::id(document) AS document, \
+         document.title AS title, document.source AS source, \
          vector::similarity::cosine(embedding, {emb_str}) AS score \
          FROM chunk WHERE embedding <|{top_k},40|> {emb_str} \
          ORDER BY score DESC LIMIT {top_k}"
@@ -92,13 +141,14 @@ async fn vector_search(
         .take(0)
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("vector take: {e}")))?;
 
-    rows_to_hits(&rows)
+    rows_to_hits(&rows, None)
 }
 
 async fn keyword_search(db: &Db, query: &str, top_k: usize) -> Result<Vec<SearchHit>, SkbError> {
     let escaped = query.replace('\'', "''");
     let sql = format!(
-        "SELECT content, idx, meta::id(document) AS document, search::score(0) AS score \
+        "SELECT content, idx, meta::id(document) AS document, \
+         document.title AS title, document.source AS source, search::score(0) AS score \
          FROM chunk WHERE content @@ '{escaped}' ORDER BY score DESC LIMIT {top_k}"
     );
 
@@ -111,7 +161,8 @@ async fn keyword_search(db: &Db, query: &str, top_k: usize) -> Result<Vec<Search
         .take(0)
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("keyword take: {e}")))?;
 
-    rows_to_hits(&rows)
+    let highlights = match_terms(query);
+    rows_to_hits(&rows, Some(&highlights))
 }
 
 async fn hybrid_search(
@@ -121,7 +172,9 @@ async fn hybrid_search(
     top_k: usize,
     rrf_k: usize,
 ) -> Result<Vec<SearchHit>, SkbError> {
-    let fetch_k = top_k * 3;
+    let fetch_k = top_k
+        .checked_mul(3)
+        .ok_or_else(|| SkbError::new(ErrorCode::Validation, "top_k too large"))?;
 
     let query_emb = embedder
         .embed_batch(&[query.to_string()])?
@@ -134,6 +187,7 @@ async fn hybrid_search(
     let vsql = format!(
         "SELECT content, idx, meta::id(id) AS chunk_id, \
          meta::id(document) AS document, \
+         document.title AS title, document.source AS source, \
          vector::similarity::cosine(embedding, {emb_str}) AS score \
          FROM chunk WHERE embedding <|{fetch_k},40|> {emb_str}"
     );
@@ -150,7 +204,8 @@ async fn hybrid_search(
     let escaped = query.replace('\'', "''");
     let ksql = format!(
         "SELECT content, idx, meta::id(id) AS chunk_id, \
-         meta::id(document) AS document, search::score(0) AS score \
+         meta::id(document) AS document, \
+         document.title AS title, document.source AS source, search::score(0) AS score \
          FROM chunk WHERE content @@ '{escaped}' ORDER BY score DESC LIMIT {fetch_k}"
     );
     let mut r = db
@@ -163,31 +218,37 @@ async fn hybrid_search(
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("hybrid kw take: {e}")))?;
 
     // RRF merge
+    type RankedHit = (f64, String, usize, String, Option<String>, Option<String>);
     let rrf_k = rrf_k.max(1) as f64;
-    let mut scores: HashMap<String, (f64, String, usize, String)> = HashMap::new();
+    let mut scores: HashMap<String, RankedHit> = HashMap::new();
 
     for (rank, row) in vrows.iter().enumerate() {
-        let id = row["id"].as_str().unwrap_or("").to_string();
+        let id = row["chunk_id"].as_str().unwrap_or("").to_string();
         let content = row["content"].as_str().unwrap_or("").to_string();
         let idx = row["idx"].as_u64().unwrap_or(0) as usize;
         let doc = row["document"].as_str().unwrap_or("").to_string();
+        let title = row["title"].as_str().map(|s| s.to_string());
+        let source = row["source"].as_str().map(|s| s.to_string());
         let rrf = 1.0 / (rrf_k + (rank as f64 + 1.0));
         scores
             .entry(id)
             .and_modify(|e| e.0 += rrf)
-            .or_insert((rrf, content, idx, doc));
+            .or_insert((rrf, content, idx, doc, title, source));
     }
 
+    let highlights = match_terms(query);
     for (rank, row) in krows.iter().enumerate() {
-        let id = row["id"].as_str().unwrap_or("").to_string();
+        let id = row["chunk_id"].as_str().unwrap_or("").to_string();
         let content = row["content"].as_str().unwrap_or("").to_string();
         let idx = row["idx"].as_u64().unwrap_or(0) as usize;
         let doc = row["document"].as_str().unwrap_or("").to_string();
+        let title = row["title"].as_str().map(|s| s.to_string());
+        let source = row["source"].as_str().map(|s| s.to_string());
         let rrf = 1.0 / (rrf_k + (rank as f64 + 1.0));
         scores
             .entry(id)
             .and_modify(|e| e.0 += rrf)
-            .or_insert((rrf, content, idx, doc));
+            .or_insert((rrf, content, idx, doc, title, source));
     }
 
     let mut sorted: Vec<_> = scores.into_iter().collect();
@@ -200,16 +261,23 @@ async fn hybrid_search(
 
     Ok(sorted
         .into_iter()
-        .map(|(_, (score, content, idx, doc))| SearchHit {
+        .map(|(_, (score, content, idx, doc, title, source))| SearchHit {
             document_id: doc,
             chunk_idx: idx,
             content,
             score,
+            title,
+            source,
+            highlights: Some(highlights.clone()),
+            matched_entities: None,
         })
         .collect())
 }
 
-fn rows_to_hits(rows: &[serde_json::Value]) -> Result<Vec<SearchHit>, SkbError> {
+fn rows_to_hits(
+    rows: &[serde_json::Value],
+    highlights: Option<&Vec<String>>,
+) -> Result<Vec<SearchHit>, SkbError> {
     let mut hits = Vec::new();
     for row in rows {
         hits.push(SearchHit {
@@ -217,9 +285,26 @@ fn rows_to_hits(rows: &[serde_json::Value]) -> Result<Vec<SearchHit>, SkbError> 
             chunk_idx: row["idx"].as_u64().unwrap_or(0) as usize,
             content: row["content"].as_str().unwrap_or("").to_string(),
             score: row["score"].as_f64().unwrap_or(0.0),
+            title: row["title"].as_str().map(|s| s.to_string()),
+            source: row["source"].as_str().map(|s| s.to_string()),
+            highlights: highlights.cloned(),
+            matched_entities: None,
         });
     }
     Ok(hits)
+}
+
+/// The query terms that a keyword search can highlight: whitespace/punctuation
+/// separated words of at least two characters.
+fn match_terms(query: &str) -> Vec<String> {
+    let mut terms: Vec<String> = query
+        .split(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
+        .filter(|t| t.len() >= 2)
+        .map(|t| t.to_lowercase())
+        .collect();
+    terms.sort();
+    terms.dedup();
+    terms
 }
 
 /// Post-filter hits by matching document fields (title/source/source_type/...).
@@ -305,6 +390,16 @@ fn validate_filter_fields(filter: &HashMap<String, String>) -> Result<(), SkbErr
 mod tests {
     use super::*;
 
+    fn request(query: &str) -> SearchRequest {
+        SearchRequest {
+            query: query.into(),
+            mode: None,
+            top_k: None,
+            graph_expand: None,
+            filter: None,
+        }
+    }
+
     #[test]
     fn validates_unsupported_filter_even_when_hits_are_empty() {
         let filter = HashMap::from([(String::from("unsupported"), String::from("value"))]);
@@ -316,5 +411,71 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn rejects_empty_query() {
+        let result = request("  ").validate();
+        assert!(matches!(
+            result,
+            Err(SkbError {
+                code: ErrorCode::Validation,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_zero_top_k() {
+        let mut req = request("hello");
+        req.top_k = Some(0);
+        assert!(matches!(
+            req.validate(),
+            Err(SkbError {
+                code: ErrorCode::Validation,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_top_k_above_max() {
+        let mut req = request("hello");
+        req.top_k = Some(MAX_TOP_K + 1);
+        assert!(matches!(
+            req.validate(),
+            Err(SkbError {
+                code: ErrorCode::Validation,
+                ..
+            })
+        ));
+        req.top_k = Some(MAX_TOP_K);
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_graph_expand_beyond_five() {
+        let mut req = request("hello");
+        req.graph_expand = Some(6);
+        assert!(matches!(
+            req.validate(),
+            Err(SkbError {
+                code: ErrorCode::Validation,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn search_schema_marks_query_required_and_mode_enum() {
+        let schema = schemars::schema_for!(SearchRequest);
+        let value = serde_json::to_value(&schema).unwrap();
+        assert_eq!(value["required"], serde_json::json!(["query"]));
+        assert_eq!(
+            value["$defs"]["SearchMode"]["enum"],
+            serde_json::json!(["hybrid", "vector", "keyword"])
+        );
+        assert_eq!(value["properties"]["top_k"]["minimum"], 1);
+        assert_eq!(value["properties"]["graph_expand"]["maximum"], 5);
     }
 }
