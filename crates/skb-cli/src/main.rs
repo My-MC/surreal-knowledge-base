@@ -46,7 +46,10 @@ enum Commands {
     /// Search documents
     Search {
         query: String,
-        #[arg(long, help = "hybrid|vector|keyword (default: config search.default_mode)")]
+        #[arg(
+            long,
+            help = "hybrid|vector|keyword (default: config search.default_mode)"
+        )]
         mode: Option<String>,
         #[arg(long, help = "number of hits (default: config search.top_k)")]
         top_k: Option<usize>,
