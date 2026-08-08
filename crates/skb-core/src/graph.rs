@@ -168,7 +168,9 @@ pub async fn upsert_entity(db: &Db, entity: &EntityInfo) -> Result<(), SkbError>
             entity.description.clone().unwrap_or_default(),
         ))
         .await
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("upsert entity: {e}")))?;
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("upsert entity: {e}")))?
+        .check()
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("upsert entity check: {e}")))?;
     Ok(())
 }
 
@@ -184,7 +186,9 @@ pub async fn link(db: &Db, link: &LinkInfo) -> Result<(), SkbError> {
         .bind(("relation", link.relation.clone()))
         .bind(("weight", weight))
         .await
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("link: {e}")))?;
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("link: {e}")))?
+        .check()
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("link check: {e}")))?;
     Ok(())
 }
 
@@ -1050,5 +1054,35 @@ mod tests {
         let entities = extractor.extract("[[WikiLink]]");
         assert_eq!(entities.len(), 1);
         assert_eq!(entities[0].name, "WikiLink");
+    }
+
+    #[test]
+    fn rejects_invalid_link_weight() {
+        for weight in [f64::NAN, f64::INFINITY, -1.0] {
+            assert!(matches!(
+                LinkInfo {
+                    from: "a".into(),
+                    to: "b".into(),
+                    relation: "r".into(),
+                    weight: Some(weight),
+                }
+                .validate(),
+                Err(SkbError {
+                    code: ErrorCode::Validation,
+                    ..
+                })
+            ));
+        }
+        // Valid non-negative finite weights are accepted.
+        for weight in [0.0, 1.0, 2.5] {
+            assert!(LinkInfo {
+                from: "a".into(),
+                to: "b".into(),
+                relation: "r".into(),
+                weight: Some(weight),
+            }
+            .validate()
+            .is_ok());
+        }
     }
 }

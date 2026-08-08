@@ -113,7 +113,7 @@ impl Default for SearchConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum SearchMode {
     Hybrid,
@@ -232,7 +232,7 @@ impl Config {
             })?;
         }
         if let Some(v) = env_opt("SKB_SEARCH_DEFAULT_MODE")? {
-            self.search.default_mode = v.parse().map_err(|e: SkbError| e)?;
+            self.search.default_mode = v.parse::<SearchMode>()?;
         }
         if let Some(v) = env_opt("SKB_SEARCH_TOP_K")? {
             self.search.top_k = v
@@ -533,7 +533,7 @@ mod tests {
 
     #[test]
     fn env_overrides_apply_with_precedence() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let _model = EnvGuard::set("SKB_EMBEDDING_MODEL", "env-model");
         let _tokens = EnvGuard::set("SKB_CHUNKING_MAX_TOKENS", "256");
         let _top_k = EnvGuard::set("SKB_SEARCH_TOP_K", "42");
@@ -552,7 +552,7 @@ mod tests {
 
     #[test]
     fn env_overrides_reject_invalid_numbers() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let _tokens = EnvGuard::set("SKB_CHUNKING_MAX_TOKENS", "not-a-number");
         let mut config = Config::default();
         assert!(config.apply_env_overrides().is_err());
@@ -560,7 +560,7 @@ mod tests {
 
     #[test]
     fn load_works_without_config_file_when_env_set() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let _model = EnvGuard::set("SKB_EMBEDDING_MODEL", "env-only-model");
         // No config file exists for this process cwd in CI; load() must fall
         // back to defaults + env instead of failing.
