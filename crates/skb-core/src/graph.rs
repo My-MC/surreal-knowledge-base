@@ -168,7 +168,9 @@ pub async fn upsert_entity(db: &Db, entity: &EntityInfo) -> Result<(), SkbError>
             entity.description.clone().unwrap_or_default(),
         ))
         .await
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("upsert entity: {e}")))?;
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("upsert entity: {e}")))?
+        .check()
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("upsert entity check: {e}")))?;
     Ok(())
 }
 
@@ -184,7 +186,9 @@ pub async fn link(db: &Db, link: &LinkInfo) -> Result<(), SkbError> {
         .bind(("relation", link.relation.clone()))
         .bind(("weight", weight))
         .await
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("link: {e}")))?;
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("link: {e}")))?
+        .check()
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("link check: {e}")))?;
     Ok(())
 }
 
@@ -554,18 +558,30 @@ pub async fn expand_search_hits(
             frontier.extend(next);
         }
 
+        // Dedup the frontier by entity name, keeping the best (closest hop =
+        // highest decay) score, so the chunk query below runs once per entity.
+        let mut best: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+        for (entity, decay) in frontier {
+            best.entry(entity)
+                .and_modify(|d| {
+                    if decay > *d {
+                        *d = decay;
+                    }
+                })
+                .or_insert(decay);
+        }
+        let frontier: Vec<(String, f64)> = best.into_iter().collect();
+
         // Chunks mentioning any frontier entity; scores are the origin hit's
         // score decayed by hop distance (spec §6 re-rank).
         for (entity, decay) in frontier {
-            let esql = format!(
-                "SELECT content, idx, meta::id(document) AS document, \
-                 document.title AS title, document.source AS source \
-                 FROM chunk WHERE $name IN ->mentions->entity.name \
-                 LIMIT {max_expand}"
-            );
+            let esql = "SELECT content, idx, meta::id(document) AS document, \
+                        document.title AS title, document.source AS source \
+                        FROM chunk WHERE $name IN ->mentions->entity.name \
+                        LIMIT 50";
             let mut r = db
                 .db
-                .query(&esql)
+                .query(esql)
                 .bind(("name", entity.clone()))
                 .await
                 .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand2: {e}")))?;
@@ -593,12 +609,13 @@ pub async fn expand_search_hits(
         }
     }
 
+    // No count truncation here: `max_expand` is the hop depth and the caller
+    // (KnowledgeBase::search) trims the merged list to top_k (spec §6).
     expanded.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    expanded.truncate(max_expand);
 
     Ok((expanded, origin_entities))
 }
@@ -731,7 +748,9 @@ fn frontmatter_list(content: &str, key: &str) -> Vec<String> {
             break;
         }
         if let Some((k, rest)) = trimmed.split_once(':') {
-            if k.trim() == key {
+            let is_target = k.trim() == key;
+            let rest = rest.trim();
+            if is_target {
                 in_list = true;
                 if let Some(items) = parse_inline_list(rest) {
                     out.extend(items);
@@ -739,9 +758,9 @@ fn frontmatter_list(content: &str, key: &str) -> Vec<String> {
                 }
                 continue;
             }
-            if !rest.trim().is_empty() || !in_list {
-                in_list = false;
-            }
+            // Any other key ends the current list: the following bullets
+            // belong to that key's value, not to the one we are collecting.
+            in_list = false;
         } else if in_list {
             if let Some(item) = trimmed.strip_prefix("-") {
                 let item = item.trim();
@@ -836,13 +855,23 @@ pub(crate) async fn link_section_hierarchy(
                 .map_err(|e| SkbError::new(ErrorCode::Db, format!("section upsert: {e}")))?
                 .check()
                 .map_err(|e| SkbError::new(ErrorCode::Db, format!("section upsert check: {e}")))?;
-            tx.query("RELATE $from->related_to->$to SET relation = 'part-of', weight = 1.0")
-                .bind(("from", entity_record_id(parent)?))
-                .bind(("to", entity_record_id(&section.name)?))
-                .await
-                .map_err(|e| SkbError::new(ErrorCode::Db, format!("section link: {e}")))?
-                .check()
-                .map_err(|e| SkbError::new(ErrorCode::Db, format!("section link check: {e}")))?;
+            // Idempotent edge: `RELATE` always creates a new edge, so remove
+            // an existing part-of edge between the same pair first. Section
+            // entities are global (shared across documents), so the dedup is
+            // per pair — repeated uploads never accumulate duplicates.
+            // Direction: the child section is part of its ancestor, so the
+            // edge points child -> part-of -> parent.
+            tx.query(
+                "DELETE FROM related_to WHERE relation = 'part-of' \
+                 AND in = $child AND out = $parent; \
+                 RELATE $child->related_to->$parent SET relation = 'part-of', weight = 1.0",
+            )
+            .bind(("child", entity_record_id(&section.name)?))
+            .bind(("parent", entity_record_id(parent)?))
+            .await
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("section link: {e}")))?
+            .check()
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("section link check: {e}")))?;
         }
         stack.push((section.name, section.level));
     }
@@ -988,6 +1017,15 @@ mod tests {
     }
 
     #[test]
+    fn frontmatter_list_stops_at_other_keys() {
+        // A bare key (`aliases:`) must end the tags list: the aliases bullets
+        // must not leak into the tags result (regression).
+        let content = "---\ntags:\n  - a\naliases:\n  - b\n  - c\ndescription: x\n---\nbody";
+        assert_eq!(frontmatter_list(content, "tags"), vec!["a"]);
+        assert_eq!(frontmatter_list(content, "aliases"), vec!["b", "c"]);
+    }
+
+    #[test]
     fn extract_dedups_entities() {
         let entities = extract_entities("[[A]] [A](x) #tag #tag");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
@@ -1016,5 +1054,35 @@ mod tests {
         let entities = extractor.extract("[[WikiLink]]");
         assert_eq!(entities.len(), 1);
         assert_eq!(entities[0].name, "WikiLink");
+    }
+
+    #[test]
+    fn rejects_invalid_link_weight() {
+        for weight in [f64::NAN, f64::INFINITY, -1.0] {
+            assert!(matches!(
+                LinkInfo {
+                    from: "a".into(),
+                    to: "b".into(),
+                    relation: "r".into(),
+                    weight: Some(weight),
+                }
+                .validate(),
+                Err(SkbError {
+                    code: ErrorCode::Validation,
+                    ..
+                })
+            ));
+        }
+        // Valid non-negative finite weights are accepted.
+        for weight in [0.0, 1.0, 2.5] {
+            assert!(LinkInfo {
+                from: "a".into(),
+                to: "b".into(),
+                relation: "r".into(),
+                weight: Some(weight),
+            }
+            .validate()
+            .is_ok());
+        }
     }
 }

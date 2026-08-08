@@ -8,6 +8,38 @@ pub struct Db {
     pub db: Surreal<surrealdb::engine::local::Db>,
 }
 
+/// Something that can persist a `meta` table key/value. Implemented for both
+/// the connection handle and an in-progress transaction so metadata writes can
+/// be grouped atomically (e.g. reindex §9-5).
+pub(crate) trait MetaStore {
+    fn set_meta(
+        &self,
+        key: &str,
+        val: &str,
+    ) -> impl std::future::Future<Output = Result<(), SkbError>> + Send;
+}
+
+impl MetaStore for Db {
+    async fn set_meta(&self, key: &str, val: &str) -> Result<(), SkbError> {
+        Db::set_meta(self, key, val).await
+    }
+}
+
+impl MetaStore for surrealdb::method::Transaction<surrealdb::engine::local::Db> {
+    async fn set_meta(&self, key: &str, val: &str) -> Result<(), SkbError> {
+        let query = format!(
+            "INSERT INTO meta (key, meta_value) VALUES ('{key}', '{val}') \
+             ON DUPLICATE KEY UPDATE meta_value = '{val}'"
+        );
+        self.query(&query)
+            .await
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("set_meta: {e}")))?
+            .check()
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("set_meta check: {e}")))?;
+        Ok(())
+    }
+}
+
 impl Db {
     pub async fn open(config: &Config) -> Result<Self, SkbError> {
         let path = shellexpand_path(&config.storage.path);
@@ -49,7 +81,10 @@ impl Db {
             .take(0)
             .map_err(|e| SkbError::new(ErrorCode::Db, format!("info db take: {e}")))?;
         let tables = rows.first().and_then(|v| v["tables"].as_object());
-        Ok(tables.is_none_or(|t| t.is_empty()))
+        // Fail closed: if the result shape is unexpected (tables missing),
+        // treat the database as existing so model/dimension comparison is
+        // never skipped on a populated store (spec §9-5).
+        Ok(tables.is_some_and(|t| t.is_empty()))
     }
 
     pub async fn migrate(&self, embedding_dim: usize) -> Result<(), SkbError> {

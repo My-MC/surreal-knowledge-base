@@ -96,6 +96,10 @@ pub struct ListQuery {
     pub order: Option<OrderBy>,
 }
 
+/// Upper bound for list_documents / list_chunks limits: results are materialized
+/// in memory, so unbounded limits would let a single request exhaust memory.
+const MAX_LIST_LIMIT: usize = 10_000;
+
 impl ListQuery {
     pub fn validate(&self) -> Result<(), SkbError> {
         if let Some(limit) = self.limit {
@@ -103,6 +107,12 @@ impl ListQuery {
                 return Err(SkbError::new(
                     ErrorCode::Validation,
                     "limit must be at least 1",
+                ));
+            }
+            if limit > MAX_LIST_LIMIT {
+                return Err(SkbError::new(
+                    ErrorCode::Validation,
+                    format!("limit must be at most {MAX_LIST_LIMIT}"),
                 ));
             }
         }
@@ -118,7 +128,7 @@ pub struct GetDocumentRequest {
 
 impl GetDocumentRequest {
     pub fn validate(&self) -> Result<(), SkbError> {
-        validate_document_id(&self.id)
+        validate_document_id(&self.id).map(|_| ())
     }
 }
 
@@ -129,14 +139,14 @@ pub struct DeleteDocumentRequest {
 
 impl DeleteDocumentRequest {
     pub fn validate(&self) -> Result<(), SkbError> {
-        validate_document_id(&self.id)
+        validate_document_id(&self.id).map(|_| ())
     }
 }
 
 /// Validate that `id` is a `document:<key>` record id and reject inputs that
 /// could alter the query when interpolated (the query itself is parameterized
 /// as a second layer of defense).
-fn validate_document_id(id: &str) -> Result<(), SkbError> {
+fn validate_document_id(id: &str) -> Result<(&str, &str), SkbError> {
     if id.trim().is_empty() {
         return Err(SkbError::new(ErrorCode::Validation, "id must not be empty"));
     }
@@ -167,7 +177,7 @@ fn validate_document_id(id: &str) -> Result<(), SkbError> {
             format!("invalid document id: '{id}'"),
         ));
     }
-    Ok(())
+    Ok((table, key))
 }
 
 pub async fn list_documents(db: &Db, q: &ListQuery) -> Result<Vec<DocumentSummary>, SkbError> {
@@ -406,13 +416,24 @@ pub async fn doctor(
         db_connected: false,
         embedding_dimension: embedder.dimension(),
         tokenizer_vocab: tokenizer.vocab_size(),
-        model: db.get_meta("embedding_model").await?.unwrap_or_default(),
-        schema_version: db.get_meta("schema_version").await?.unwrap_or_default(),
+        model: String::new(),
+        schema_version: String::new(),
         errors: Vec::new(),
     };
+    // Connectivity first: the point of doctor is to report problems, so a
+    // broken database must never make the report itself fail.
     match db.db.query("RETURN 1").await {
         Ok(_) => report.db_connected = true,
         Err(e) => report.errors.push(format!("SurrealDB connection: {e}")),
+    }
+    // Meta reads can also fail; record instead of propagating.
+    match db.get_meta("embedding_model").await {
+        Ok(model) => report.model = model.unwrap_or_default(),
+        Err(e) => report.errors.push(format!("read embedding_model meta: {e}")),
+    }
+    match db.get_meta("schema_version").await {
+        Ok(version) => report.schema_version = version.unwrap_or_default(),
+        Err(e) => report.errors.push(format!("read schema_version meta: {e}")),
     }
     if report.embedding_dimension == 0 {
         report
@@ -443,9 +464,7 @@ fn val_u64(row: &serde_json::Value, key: &str) -> u64 {
 /// Convert a validated document id string into a typed `RecordId` for query
 /// parameter binding (never interpolated into SurrealQL).
 fn document_record_id(id: &str) -> Result<surrealdb::types::RecordId, SkbError> {
-    let (table, key) = id
-        .split_once(':')
-        .expect("validated document id must contain ':'");
+    let (table, key) = validate_document_id(id)?;
     Ok(surrealdb::types::RecordId::new(table, key))
 }
 

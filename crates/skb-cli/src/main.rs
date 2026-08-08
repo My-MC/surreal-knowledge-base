@@ -7,7 +7,7 @@ use skb_core::ingest::UploadRequest;
 use skb_core::search::SearchRequest;
 use skb_core::KnowledgeBase;
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::str::FromStr;
 
 #[derive(Parser)]
@@ -373,9 +373,10 @@ async fn run(cli: &Cli) -> Result<()> {
             if *stdin {
                 // Bound stdin reads by upload.max_file_mb (spec §12.3).
                 let max = kb.config().upload.max_file_mb.saturating_mul(1024 * 1024);
+                let read_cap = max.saturating_add(1);
                 if *base64 {
                     let mut raw = Vec::new();
-                    std::io::stdin().take(max + 1).read_to_end(&mut raw)?;
+                    std::io::stdin().take(read_cap).read_to_end(&mut raw)?;
                     if raw.len() as u64 > max {
                         anyhow::bail!("stdin exceeds upload.max_file_mb");
                     }
@@ -385,7 +386,7 @@ async fn run(cli: &Cli) -> Result<()> {
                 } else {
                     let mut content = String::new();
                     std::io::stdin()
-                        .take(max + 1)
+                        .take(read_cap)
                         .read_to_string(&mut content)?;
                     if content.len() as u64 > max {
                         anyhow::bail!("stdin exceeds upload.max_file_mb");
@@ -393,9 +394,11 @@ async fn run(cli: &Cli) -> Result<()> {
                     let result = kb.upload(build(None, Some(content), None)).await?;
                     output(&result, &fmt)?;
                 }
-            } else if !expanded.is_empty() {
-                // Partial failure: successful uploads are committed and returned
-                // in `results`, failures are aggregated in `errors` (spec §12.3).
+            } else if expanded.len() > 1 {
+                // Multi-input uploads: successful uploads are committed and
+                // returned in `results`, failures are aggregated in `errors`
+                // (spec §12.3). A single input keeps the direct UploadResult
+                // shape with top-level document_id/status fields.
                 let mut results: Vec<serde_json::Value> = Vec::new();
                 let mut errors: Vec<serde_json::Value> = Vec::new();
                 for p in expanded {
@@ -410,13 +413,18 @@ async fn run(cli: &Cli) -> Result<()> {
                         })),
                     }
                 }
-                if errors.is_empty() {
-                    output(&results, &fmt)?;
-                } else {
-                    output(
-                        &serde_json::json!({ "results": results, "errors": errors }),
-                        &fmt,
-                    )?;
+                // Multi-input uploads always report {results, errors}; any
+                // failure makes the command exit non-zero so callers can
+                // detect partial failure (spec §12.3).
+                output(
+                    &serde_json::json!({ "results": results, "errors": errors }),
+                    &fmt,
+                )?;
+                if !errors.is_empty() {
+                    // The JSON payload is already on stdout; exit non-zero
+                    // without emitting a second error document.
+                    let _ = std::io::stdout().flush();
+                    std::process::exit(1);
                 }
             } else {
                 anyhow::bail!("no input: provide paths, --url, or --stdin");
