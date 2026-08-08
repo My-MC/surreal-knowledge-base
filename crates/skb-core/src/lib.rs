@@ -463,6 +463,7 @@ mod tests {
     /// fingerprint tests; `word` changes the vocabulary so fingerprints differ.
     fn write_fixture_tokenizer(path: &std::path::Path, word: &str) {
         use tokenizers::models::bpe::BPE;
+        use tokenizers::pre_tokenizers::whitespace::WhitespaceSplit;
         use tokenizers::Tokenizer;
 
         let mut vocab = ahash::AHashMap::default();
@@ -473,7 +474,10 @@ mod tests {
             .unk_token("<unk>".to_string())
             .build()
             .unwrap();
-        let tok = Tokenizer::new(bpe);
+        let mut tok = Tokenizer::new(bpe);
+        // Word-based splitting keeps heading lines in one token run (per-char
+        // fallback tokens would split "## Beta" across chunks).
+        tok.with_pre_tokenizer(Some(WhitespaceSplit));
         std::fs::write(path, serde_json::to_string(&tok).unwrap()).unwrap();
     }
 
@@ -1179,6 +1183,45 @@ mod tests {
         let schema = schemars::schema_for!(GraphQueryRequest);
         let value = serde_json::to_value(&schema).unwrap();
         assert_eq!(value["required"], serde_json::json!(["from"]));
+    }
+
+    #[tokio::test]
+    async fn test_section_hierarchy_part_of_direction() {
+        let kb = setup().await;
+        let path = kb.config().storage.path.clone();
+
+        kb.upload(UploadRequest {
+            path: None,
+            url: None,
+            content: Some("# Alpha\n\nbody\n\n## Beta\n\nmore body\n".into()),
+            content_base64: None,
+            title: Some("hierarchy".into()),
+            tags: None,
+            metadata: None,
+            force: None,
+        })
+        .await
+        .unwrap();
+
+        // Beta is part of Alpha: the edge must point Beta ->part-of-> Alpha.
+        let result = kb
+            .graph_query(&GraphQueryRequest {
+                from: "Beta".into(),
+                relation: Some("part-of".into()),
+                depth: Some(1),
+                limit: Some(10),
+            })
+            .await
+            .unwrap();
+        assert!(
+            result.edges.iter().any(|e| {
+                e.from == "entity:⟨Beta⟩" && e.to == "entity:⟨Alpha⟩" && e.relation == "part-of"
+            }),
+            "expected Beta ->part-of-> Alpha, got {:?}",
+            result.edges
+        );
+
+        let _ = std::fs::remove_dir_all(&path);
     }
 
     #[tokio::test]

@@ -674,6 +674,8 @@ pub fn is_blocked_ip(ip: IpAddr) -> bool {
                 || v6.is_multicast()
                 || v6.is_unique_local()
                 || v6.is_unicast_link_local()
+                || is_documentation_v6(v6)
+                || is_nat64_v6(v6)
             {
                 return true;
             }
@@ -717,6 +719,17 @@ fn is_benchmarking(v4: std::net::Ipv4Addr) -> bool {
 /// 240.0.0.0/4 — reserved for future use.
 fn is_reserved_v4(v4: std::net::Ipv4Addr) -> bool {
     v4.octets()[0] >= 240
+}
+
+/// 2001:db8::/32 — documentation range.
+fn is_documentation_v6(v6: std::net::Ipv6Addr) -> bool {
+    v6.segments()[0] == 0x2001 && v6.segments()[1] == 0x0db8
+}
+
+/// 64:ff9b::/96 — NAT64 well-known prefix (maps to IPv4 destinations).
+fn is_nat64_v6(v6: std::net::Ipv6Addr) -> bool {
+    let s = v6.segments();
+    s[0] == 0x64 && s[1] == 0xff9b && s[2] == 0 && s[3] == 0
 }
 
 fn base64_decode_checked(b64: &str, config: &Config) -> Result<Vec<u8>, SkbError> {
@@ -858,6 +871,11 @@ mod tests {
             "::ffff:100.64.0.1",
         ];
         for ip in mapped {
+            let ip: IpAddr = ip.parse().unwrap();
+            assert!(is_blocked_ip(ip), "{ip} should be blocked");
+        }
+        let extra_v6: Vec<&str> = vec!["2001:db8::1", "64:ff9b::c000:0201", "64:ff9b::7f00:1"];
+        for ip in extra_v6 {
             let ip: IpAddr = ip.parse().unwrap();
             assert!(is_blocked_ip(ip), "{ip} should be blocked");
         }

@@ -855,13 +855,15 @@ pub(crate) async fn link_section_hierarchy(
             // an existing part-of edge between the same pair first. Section
             // entities are global (shared across documents), so the dedup is
             // per pair — repeated uploads never accumulate duplicates.
+            // Direction: the child section is part of its ancestor, so the
+            // edge points child -> part-of -> parent.
             tx.query(
                 "DELETE FROM related_to WHERE relation = 'part-of' \
-                 AND in = $from AND out = $to; \
-                 RELATE $from->related_to->$to SET relation = 'part-of', weight = 1.0",
+                 AND in = $child AND out = $parent; \
+                 RELATE $child->related_to->$parent SET relation = 'part-of', weight = 1.0",
             )
-            .bind(("from", entity_record_id(parent)?))
-            .bind(("to", entity_record_id(&section.name)?))
+            .bind(("child", entity_record_id(&section.name)?))
+            .bind(("parent", entity_record_id(parent)?))
             .await
             .map_err(|e| SkbError::new(ErrorCode::Db, format!("section link: {e}")))?
             .check()
