@@ -49,7 +49,10 @@ impl Db {
             .take(0)
             .map_err(|e| SkbError::new(ErrorCode::Db, format!("info db take: {e}")))?;
         let tables = rows.first().and_then(|v| v["tables"].as_object());
-        Ok(tables.is_none_or(|t| t.is_empty()))
+        // Fail closed: if the result shape is unexpected (tables missing),
+        // treat the database as existing so model/dimension comparison is
+        // never skipped on a populated store (spec §9-5).
+        Ok(tables.is_some_and(|t| t.is_empty()))
     }
 
     pub async fn migrate(&self, embedding_dim: usize) -> Result<(), SkbError> {
