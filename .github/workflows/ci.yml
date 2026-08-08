@@ -282,12 +282,12 @@ jobs:
       - name: MCP E2E flow (initialize -> tools/list -> upload -> search)
         shell: pwsh
         run: |
-          @'
+          @"
           [storage]
           path = "db"
           [embedding]
           onnx_path = "mock"
           dimension = 8
-          tokenizer = "$env:GITHUB_WORKSPACE\npm\smoke-tokenizer.json"
-          '@ | Set-Content -Encoding ascii skb.toml
+          tokenizer = "$env:GITHUB_WORKSPACE/npm/smoke-tokenizer.json"
+          "@ | Set-Content -Encoding ascii skb.toml
           node "$env:GITHUB_WORKSPACE/npm/smoke-mcp.mjs" "$env:GITHUB_WORKSPACE/npm-out/packages/win32-x64/bin/skb-mcp.exe"
