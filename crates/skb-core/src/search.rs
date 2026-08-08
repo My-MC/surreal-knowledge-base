@@ -263,15 +263,22 @@ async fn hybrid_search(
 
     Ok(sorted
         .into_iter()
-        .map(|(_, (score, content, idx, doc, title, source))| SearchHit {
-            document_id: doc,
-            chunk_idx: idx,
-            content,
-            score,
-            title,
-            source,
-            highlights: Some(highlights.clone()),
-            matched_entities: None,
+        .map(|(_, (score, content, idx, doc, title, source))| {
+            let hit_highlights = highlights
+                .iter()
+                .filter(|t| content.to_lowercase().contains(t.as_str()))
+                .cloned()
+                .collect::<Vec<String>>();
+            SearchHit {
+                document_id: doc,
+                chunk_idx: idx,
+                content,
+                score,
+                title,
+                source,
+                highlights: (!hit_highlights.is_empty()).then_some(hit_highlights),
+                matched_entities: None,
+            }
         })
         .collect())
 }
@@ -282,14 +289,25 @@ fn rows_to_hits(
 ) -> Result<Vec<SearchHit>, SkbError> {
     let mut hits = Vec::new();
     for row in rows {
+        let content = row["content"].as_str().unwrap_or("").to_string();
+        // Only terms actually present in this hit's content are highlighted;
+        // a keyword row whose content lacks the query terms reports None.
+        let hit_highlights = highlights.map(|terms| {
+            let present: Vec<String> = terms
+                .iter()
+                .filter(|t| content.to_lowercase().contains(t.as_str()))
+                .cloned()
+                .collect();
+            (!present.is_empty()).then_some(present)
+        });
         hits.push(SearchHit {
             document_id: row["document"].as_str().unwrap_or("").to_string(),
             chunk_idx: row["idx"].as_u64().unwrap_or(0) as usize,
-            content: row["content"].as_str().unwrap_or("").to_string(),
+            content,
             score: row["score"].as_f64().unwrap_or(0.0),
             title: row["title"].as_str().map(|s| s.to_string()),
             source: row["source"].as_str().map(|s| s.to_string()),
-            highlights: highlights.cloned(),
+            highlights: hit_highlights.flatten(),
             matched_entities: None,
         });
     }

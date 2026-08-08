@@ -372,6 +372,12 @@ fn contract_upload_glob_and_multiple_paths() {
     assert_eq!(val["status"], "created");
     assert!(val["document_id"].is_string());
 
+    // A glob matching exactly one file also keeps the direct shape.
+    let one = format!("{}/*.tx?", docs.display());
+    let val = run_skb(&["upload", &one, "--force"], None);
+    assert!(val["document_id"].is_string());
+    assert!(val["status"] == "created" || val["status"] == "updated");
+
     let list = run_skb(&["list"], None);
     assert_eq!(list.as_array().unwrap().len(), 3);
 }

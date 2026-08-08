@@ -330,7 +330,7 @@ impl KnowledgeBase {
     pub async fn search(&self, req: SearchRequest) -> Result<SearchResponse>;
 
     // グラフ
-    pub async fn graph_query(&self, req: GraphQueryRequest) -> Result<GraphQueryResponse>;
+    pub async fn graph_query(&self, req: &GraphQueryRequest) -> Result<GraphQueryResponse>;
     pub async fn upsert_entity(&self, entity: &EntityInfo) -> Result<()>;
     pub async fn link_entities(&self, link: &LinkInfo) -> Result<()>;
 

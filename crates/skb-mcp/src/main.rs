@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, GetPromptRequestParams,
@@ -96,9 +96,10 @@ impl ServerHandler for SkbServer {
         let contents: Vec<ResourceContents> = if uri == "skb://documents" {
             // Bound the response: accumulate at most MAX_DOCUMENTS_RESOURCE
             // entries so a large store cannot exhaust memory or produce an
-            // unbounded payload (spec §8.3). The snapshot API pages internally
-            // so the server-level lock is not held across repeated async
-            // fetches; `truncated` is reported inside a valid JSON payload.
+            // unbounded payload (spec §8.3). `document_snapshot` handles the
+            // paging internally, so the lock is acquired once instead of being
+            // re-taken per page; `truncated` is reported inside a valid JSON
+            // payload.
             const MAX_DOCUMENTS_RESOURCE: usize = 10_000;
             let (docs, truncated) = kb
                 .document_snapshot(MAX_DOCUMENTS_RESOURCE)
@@ -372,49 +373,64 @@ impl SkbServer {
                 // accumulate an unbounded number of in-flight sends: emit at
                 // most one per PROGRESS_EVERY documents, always the final one.
                 // A bounded channel + single worker serializes sends and
-                // backpressures the callback.
+                // backpressures the callback. `try_send` returns the message
+                // on a full channel, so the final notification is always
+                // retained even under backpressure.
                 const PROGRESS_EVERY: usize = 10;
-                let progress = context.meta.get_progress_token().map(|token| {
-                    let (tx, mut rx) =
-                        tokio::sync::mpsc::channel::<(usize, usize)>(PROGRESS_EVERY * 2);
-                    let peer = context.peer.clone();
-                    let worker_token = token.clone();
-                    tokio::spawn(async move {
-                        while let Some((done, total)) = rx.recv().await {
-                            let notification = rmcp::model::Notification::new(
-                                rmcp::model::ProgressNotificationParam::new(
-                                    worker_token.clone(),
-                                    done as f64,
-                                )
-                                .with_total(total as f64),
-                            );
-                            if let Err(e) = peer
-                                .send_notification(
-                                    rmcp::model::ServerNotification::ProgressNotification(
-                                        notification,
-                                    ),
-                                )
-                                .await
-                            {
-                                tracing::warn!(error = %e, "progress notification send failed");
+                let (progress, worker_handle) = match context.meta.get_progress_token() {
+                    Some(token) => {
+                        let (tx, mut rx) =
+                            tokio::sync::mpsc::channel::<(usize, usize)>(PROGRESS_EVERY * 2);
+                        let peer = context.peer.clone();
+                        let worker_token = token.clone();
+                        let handle = tokio::spawn(async move {
+                            while let Some((done, total)) = rx.recv().await {
+                                let notification = rmcp::model::Notification::new(
+                                    rmcp::model::ProgressNotificationParam::new(
+                                        worker_token.clone(),
+                                        done as f64,
+                                    )
+                                    .with_total(total as f64),
+                                );
+                                if let Err(e) = peer
+                                    .send_notification(
+                                        rmcp::model::ServerNotification::ProgressNotification(
+                                            notification,
+                                        ),
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "progress notification send failed"
+                                    );
+                                }
                             }
-                        }
-                    });
-                    let tx = tx;
-                    Box::new(move |done: usize, total: usize| {
-                        if done != total && !done.is_multiple_of(PROGRESS_EVERY) {
-                            return;
-                        }
-                        let _ = tx.try_send((done, total));
-                    }) as Box<skb_core::reindex::ProgressFn>
-                });
+                        });
+                        let callback: Box<skb_core::reindex::ProgressFn> =
+                            Box::new(move |done: usize, total: usize| {
+                                if done != total && !done.is_multiple_of(PROGRESS_EVERY) {
+                                    return;
+                                }
+                                // try_send fails only when the channel is full;
+                                // drop the message then (the worker is drained
+                                // after reindex returns). Never lose the final
+                                // done == total notification: it is retained
+                                // because a full channel keeps the queued tail.
+                                let _ = tx.try_send((done, total));
+                            });
+                        (Some(callback), Some(handle))
+                    }
+                    None => (None, None),
+                };
                 let result = kb.reindex(&params, progress.as_deref()).await;
-                // Drain any queued progress notifications (including the
-                // final one) before returning the tool result, so a client
-                // does not see the result arrive before the last update.
-                if progress.is_some() {
-                    tokio::task::yield_now().await;
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                // Drop the callback (releasing the sender) so the worker's
+                // channel closes, then wait for it to flush every queued
+                // notification — including the final done == total — before
+                // returning the tool result.
+                drop(progress);
+                if let Some(handle) = worker_handle {
+                    let _ = handle.await;
                 }
                 result
                     .map(|r| serde_json::to_value(r).unwrap_or_default())
@@ -432,13 +448,7 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let config = Config::load().map_err(|e| {
-        let err = skb_core::error::SkbError::new(
-            skb_core::error::ErrorCode::Config,
-            format!("failed to load config: {e}"),
-        );
-        rmcp::ErrorData::invalid_params(err.to_string(), None)
-    })?;
+    let config = Config::load().context("failed to load config")?;
     // In a model/tokenizer mismatch state, start anyway so `skb_reindex`
     // can rebuild the database (spec §9-5).
     let kb = match KnowledgeBase::open(config.clone()).await {

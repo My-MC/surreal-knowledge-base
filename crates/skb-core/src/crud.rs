@@ -94,7 +94,7 @@ const MAX_LIST_LIMIT: usize = 10_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
 pub struct ListQuery {
-    #[schemars(range(min = 1, max = MAX_LIST_LIMIT))]
+    #[schemars(range(min = 1, max = 10_000))]
     pub limit: Option<usize>,
     pub offset: Option<usize>,
     pub order: Option<OrderBy>,
@@ -303,49 +303,68 @@ pub async fn delete_document(
     req.validate()?;
     let record_id = document_record_id(&req.id)?;
 
-    // A missing document is an explicit error (spec §9-6).
-    let mut r = db
+    // Existence check, chunk count and all deletes run in one transaction so
+    // a concurrent delete cannot skew `chunks_deleted` or leave partial state.
+    let tx = db
         .db
-        .query("SELECT id FROM $id LIMIT 1")
-        .bind(("id", record_id.clone()))
+        .clone()
+        .begin()
         .await
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete lookup: {e}")))?;
-    let rows: Vec<serde_json::Value> = r
-        .take(0)
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete lookup take: {e}")))?;
-    if rows.is_empty() {
-        return Err(SkbError::new(
-            ErrorCode::DocumentNotFound,
-            format!("not found: {}", req.id),
-        ));
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete begin: {e}")))?;
+    let result = async {
+        let mut r = tx
+            .query("SELECT id FROM $id LIMIT 1")
+            .bind(("id", record_id.clone()))
+            .await
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete lookup: {e}")))?;
+        let rows: Vec<serde_json::Value> = r
+            .take(0)
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete lookup take: {e}")))?;
+        if rows.is_empty() {
+            return Err(SkbError::new(
+                ErrorCode::DocumentNotFound,
+                format!("not found: {}", req.id),
+            ));
+        }
+
+        // Count the chunks that will be removed (spec §9-6).
+        let mut r = tx
+            .query("SELECT count() AS c FROM chunk WHERE document = $id GROUP ALL")
+            .bind(("id", record_id.clone()))
+            .await
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete count: {e}")))?;
+        let rows: Vec<serde_json::Value> = r
+            .take(0)
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete count take: {e}")))?;
+        let chunks_deleted = rows.first().and_then(|v| v["c"].as_u64()).unwrap_or(0) as usize;
+
+        let query = "DELETE FROM mentions WHERE in.document = $id; \
+                     DELETE FROM chunk WHERE document = $id; DELETE $id;";
+        tx.query(query)
+            .bind(("id", record_id))
+            .await
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete: {e}")))?
+            .check()
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete check: {e}")))?;
+
+        Ok::<usize, SkbError>(chunks_deleted)
     }
-
-    // Count the chunks that will be removed (spec §9-6).
-    let mut r = db
-        .db
-        .query("SELECT count() AS c FROM chunk WHERE document = $id GROUP ALL")
-        .bind(("id", record_id.clone()))
-        .await
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete count: {e}")))?;
-    let rows: Vec<serde_json::Value> = r
-        .take(0)
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete count take: {e}")))?;
-    let chunks_deleted = rows.first().and_then(|v| v["c"].as_u64()).unwrap_or(0) as usize;
-
-    let query = "DELETE FROM mentions WHERE in.document = $id; DELETE FROM chunk WHERE document = $id; DELETE $id;";
-    let r = db
-        .db
-        .query(query)
-        .bind(("id", record_id))
-        .await
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete: {e}")))?;
-    r.check()
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete check: {e}")))?;
-
-    Ok(DeleteResult {
-        document_id: req.id.clone(),
-        chunks_deleted,
-    })
+    .await;
+    match result {
+        Ok(chunks_deleted) => {
+            tx.commit()
+                .await
+                .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete commit: {e}")))?;
+            Ok(DeleteResult {
+                document_id: req.id.clone(),
+                chunks_deleted,
+            })
+        }
+        Err(e) => {
+            let _ = tx.cancel().await;
+            Err(e)
+        }
+    }
 }
 
 pub async fn stats(db: &Db, embedder: &dyn Embed) -> Result<Stats, SkbError> {

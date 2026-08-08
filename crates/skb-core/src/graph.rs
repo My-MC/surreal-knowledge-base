@@ -501,15 +501,13 @@ pub async fn expand_search_hits(
         let origin_score = hit.score.max(0.0);
 
         // Hop 1: entities mentioned by this chunk.
-        let sql = format!(
-            "SELECT ->mentions->entity.name AS e \
-             FROM chunk WHERE idx = {} AND meta::id(document) = '{}'",
-            hit.chunk_idx,
-            hit.document_id.replace('\'', "\\'")
-        );
+        let sql = "SELECT ->mentions->entity.name AS e \
+                   FROM chunk WHERE idx = $idx AND meta::id(document) = $document";
         let mut r = db
             .db
-            .query(&sql)
+            .query(sql)
+            .bind(("idx", hit.chunk_idx as i64))
+            .bind(("document", hit.document_id.clone()))
             .await
             .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand: {e}")))?;
         let rows: Vec<serde_json::Value> = r
@@ -844,6 +842,20 @@ pub(crate) async fn link_section_hierarchy(
             let sql = "INSERT INTO entity (id, name, kind, description) \
                        VALUES ($id, $name, $kind, $description) \
                        ON DUPLICATE KEY UPDATE description = $description";
+            // Both endpoints of the part-of edge must exist as entities. The
+            // parent is a prior stack entry (already upserted); the child may
+            // have been missed by chunk processing (e.g. a tab-headed section
+            // whose boundary was not recognized as a heading), so upsert it
+            // here before creating the edge.
+            tx.query(sql)
+                .bind(("id", entity_record_id(&section.name)?))
+                .bind(("name", section.name.clone()))
+                .bind(("kind", "section"))
+                .bind(("description", ""))
+                .await
+                .map_err(|e| SkbError::new(ErrorCode::Db, format!("section upsert: {e}")))?
+                .check()
+                .map_err(|e| SkbError::new(ErrorCode::Db, format!("section upsert check: {e}")))?;
             tx.query(sql)
                 .bind(("id", entity_record_id(parent)?))
                 .bind(("name", parent.clone()))

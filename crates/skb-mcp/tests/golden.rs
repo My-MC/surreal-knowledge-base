@@ -2,6 +2,10 @@
 // identical responses through the MCP handler (stdio) and the CLI (spec
 // §11.2-3). Each side runs against its own database with identical setup;
 // random document ids are normalized away before comparison.
+//
+// Run via: cargo test --workspace -- --test-threads=1
+// (spawns the real target/debug/skb and target/debug/skb-mcp binaries; do not
+// run standalone.)
 
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
@@ -11,12 +15,20 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 fn mcp_binary() -> PathBuf {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.push("../../target/debug/skb-mcp");
+    assert!(
+        path.exists(),
+        "missing target/debug/skb-mcp; run: cargo test --workspace -- --test-threads=1"
+    );
     path
 }
 
 fn cli_binary() -> PathBuf {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.push("../../target/debug/skb");
+    assert!(
+        path.exists(),
+        "missing target/debug/skb; run: cargo test --workspace -- --test-threads=1"
+    );
     path
 }
 
@@ -39,7 +51,8 @@ impl McpClient {
             .current_dir(dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            // stderr is inherited so a startup crash is visible in CI.
+            .stderr(Stdio::inherit())
             .spawn()
             .expect("failed to spawn skb-mcp (build with: cargo build -p skb-mcp)");
         let stdin = child.stdin.take().unwrap();
@@ -69,7 +82,13 @@ impl McpClient {
     fn read_response(&mut self, id: u64) -> Value {
         loop {
             let mut line = String::new();
-            self.stdout.read_line(&mut line).unwrap();
+            let read = self
+                .stdout
+                .read_line(&mut line)
+                .expect("failed to read skb-mcp stdout");
+            if read == 0 {
+                panic!("skb-mcp exited before responding to request {id} (early exit)");
+            }
             let msg: Value = serde_json::from_str(&line).unwrap();
             if msg["id"] == json!(id) {
                 return msg;
@@ -167,8 +186,15 @@ fn normalize(value: &mut Value) {
             map.remove("elapsed_ms");
             map.remove("created_at");
             map.remove("updated_at");
-            for v in map.values_mut() {
-                normalize(v);
+            for (k, v) in map.iter_mut() {
+                // `hits` carries ranking order that must survive comparison.
+                if k == "hits" {
+                    for hit in v.as_array_mut().into_iter().flatten() {
+                        normalize(hit);
+                    }
+                } else {
+                    normalize(v);
+                }
             }
         }
         Value::Array(items) => {

@@ -748,10 +748,14 @@ fn fetch_url_with_validator(
                     .trim()
                     .to_ascii_lowercase()
             });
+        // Read up to max_bytes + 1 so an exactly-at-limit response is accepted
+        // while an over-limit one trips BodyExceedsLimit; guard the +1 against
+        // u64 overflow.
+        let read_limit = max_bytes.saturating_add(1);
         let body = resp
             .body_mut()
             .with_config()
-            .limit(max_bytes + 1)
+            .limit(read_limit)
             .read_to_vec()
             .map_err(|e| match e {
                 ureq::Error::BodyExceedsLimit(_) => {

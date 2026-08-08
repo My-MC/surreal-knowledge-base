@@ -19,6 +19,18 @@ const rl = createInterface({ input: child.stdout });
 const pending = new Map();
 let nextId = 1;
 
+// If the child exits before responding (crash, bad config, etc.), fail all
+// in-flight requests immediately with the exit code instead of timing out.
+child.on("exit", (code, signal) => {
+  for (const [id, { reject }] of pending) {
+    clearTimeout(pending.get(id).timer);
+    pending.delete(id);
+    reject(
+      new Error(`MCP subprocess exited early (code=${code}, signal=${signal}) while waiting for request ${id}`)
+    );
+  }
+});
+
 rl.on("line", (line) => {
   let msg;
   try {
@@ -27,23 +39,25 @@ rl.on("line", (line) => {
     return;
   }
   if (msg.id !== undefined && pending.has(msg.id)) {
-    pending.get(msg.id)(msg);
+    const entry = pending.get(msg.id);
+    clearTimeout(entry.timer);
     pending.delete(msg.id);
+    entry.resolve(msg);
   }
 });
 
 function request(method, params) {
   const id = nextId++;
   return new Promise((resolve, reject) => {
-    pending.set(id, resolve);
-    const msg = { jsonrpc: "2.0", id, method, params };
-    child.stdin.write(JSON.stringify(msg) + "\n");
-    setTimeout(() => {
+    const timer = setTimeout(() => {
       if (pending.has(id)) {
         pending.delete(id);
         reject(new Error(`timeout waiting for response to ${method}`));
       }
     }, 30000);
+    pending.set(id, { resolve, reject, timer });
+    const msg = { jsonrpc: "2.0", id, method, params };
+    child.stdin.write(JSON.stringify(msg) + "\n");
   });
 }
 
@@ -97,7 +111,16 @@ const search = await request("tools/call", {
 });
 assert(!search.result?.isError, "skb_search must succeed");
 const searchText = search.result?.content?.[0]?.text ?? "";
-assert(searchText.includes("smoke-doc"), "skb_search must find the uploaded document");
+let searchJson;
+try {
+  searchJson = JSON.parse(searchText);
+} catch {
+  assert(false, `skb_search must return JSON, got: ${searchText}`);
+}
+assert(
+  (searchJson.hits ?? []).some((h) => h.title === "smoke-doc"),
+  "skb_search must find the uploaded document",
+);
 
 console.log("SMOKE OK");
 child.kill();

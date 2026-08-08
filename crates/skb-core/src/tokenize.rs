@@ -70,6 +70,12 @@ impl Tokenize for TokenizersImpl {
     }
 
     fn chunk(&self, text: &str, max_tokens: usize, overlap: usize) -> Result<Vec<Chunk>, SkbError> {
+        if max_tokens == 0 {
+            return Err(SkbError::new(
+                ErrorCode::Tokenize,
+                "chunk max_tokens must be at least 1",
+            ));
+        }
         let encoding = self
             .tokenizer
             .encode(text, false)
@@ -237,23 +243,7 @@ mod tests {
     }
 
     fn fixture_tokenizer(path: &std::path::Path, word: &str) {
-        use tokenizers::models::bpe::BPE;
-        use tokenizers::pre_tokenizers::whitespace::WhitespaceSplit;
-        use tokenizers::Tokenizer;
-        let mut vocab = ahash::AHashMap::default();
-        vocab.insert("<unk>".to_string(), 0);
-        vocab.insert(word.to_string(), 1);
-        let bpe = BPE::builder()
-            .vocab_and_merges(vocab, vec![])
-            .unk_token("<unk>".to_string())
-            .build()
-            .unwrap();
-        let mut tok = Tokenizer::new(bpe);
-        // Word-based splitting keeps "## Beta" in one token run, like a real
-        // subword tokenizer would (per-char fallback tokens would split the
-        // heading line across chunks).
-        tok.with_pre_tokenizer(Some(WhitespaceSplit));
-        std::fs::write(path, serde_json::to_string(&tok).unwrap()).unwrap();
+        crate::testutil::write_fixture_tokenizer(path, word);
     }
 
     #[test]

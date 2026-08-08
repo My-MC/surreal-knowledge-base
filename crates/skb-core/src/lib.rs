@@ -289,12 +289,17 @@ impl KnowledgeBase {
                 "query must not be empty",
             ));
         }
-        let mut r = self
+        let r = self
             .db
             .db
             .query(surql)
             .await
             .map_err(|e| SkbError::new(ErrorCode::Db, format!("query: {e}")))?;
+        // Check statement-level errors first so a failing statement surfaces
+        // instead of being swallowed while collecting values.
+        let mut r = r
+            .check()
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("query check: {e}")))?;
         // Each statement's result is exposed as its own JSON value; a missing
         // index (Value::None) marks the end of the statement list.
         let mut statements: Vec<serde_json::Value> = Vec::new();
@@ -506,6 +511,33 @@ fn parse_hf_model(model: &str) -> (&str, &str) {
     (parts[0], parts.get(1).copied().unwrap_or(parts[0]))
 }
 
+/// Shared #[cfg(test)] helpers used by unit tests across the crate.
+#[cfg(test)]
+pub(crate) mod testutil {
+    /// Write a minimal but valid `tokenizer.json` (single-token BPE) for
+    /// fingerprint/chunking tests; `word` changes the vocabulary so
+    /// fingerprints differ.
+    pub fn write_fixture_tokenizer(path: &std::path::Path, word: &str) {
+        use tokenizers::models::bpe::BPE;
+        use tokenizers::pre_tokenizers::whitespace::WhitespaceSplit;
+        use tokenizers::Tokenizer;
+
+        let mut vocab = ahash::AHashMap::default();
+        vocab.insert("<unk>".to_string(), 0);
+        vocab.insert(word.to_string(), 1);
+        let bpe = BPE::builder()
+            .vocab_and_merges(vocab, vec![])
+            .unk_token("<unk>".to_string())
+            .build()
+            .unwrap();
+        let mut tok = Tokenizer::new(bpe);
+        // Word-based splitting keeps heading lines in one token run (per-char
+        // fallback tokens would split "## Beta" across chunks).
+        tok.with_pre_tokenizer(Some(WhitespaceSplit));
+        std::fs::write(path, serde_json::to_string(&tok).unwrap()).unwrap();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -597,38 +629,25 @@ mod tests {
     }
 
     /// In-process reopening of the same SurrealKv path needs the previous
-    /// connection's router task to finish the datastore shutdown (file lock).
-    async fn settle_db_lock() {
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    }
-
-    /// Write a minimal but valid `tokenizer.json` (single-token BPE) for
-    /// fingerprint tests; `word` changes the vocabulary so fingerprints differ.
-    fn write_fixture_tokenizer(path: &std::path::Path, word: &str) {
-        use tokenizers::models::bpe::BPE;
-        use tokenizers::pre_tokenizers::whitespace::WhitespaceSplit;
-        use tokenizers::Tokenizer;
-
-        let mut vocab = ahash::AHashMap::default();
-        vocab.insert("<unk>".to_string(), 0);
-        vocab.insert(word.to_string(), 1);
-        let bpe = BPE::builder()
-            .vocab_and_merges(vocab, vec![])
-            .unk_token("<unk>".to_string())
-            .build()
-            .unwrap();
-        let mut tok = Tokenizer::new(bpe);
-        // Word-based splitting keeps heading lines in one token run (per-char
-        // fallback tokens would split "## Beta" across chunks).
-        tok.with_pre_tokenizer(Some(WhitespaceSplit));
-        std::fs::write(path, serde_json::to_string(&tok).unwrap()).unwrap();
-    }
-
+    /// connection's router task to finish the datastore shutdown (file lock);
+    /// the open helpers below retry transient Db (lock) errors instead of a
+    /// fixed sleep.
     async fn open_expecting_error(config: Config) -> SkbError {
-        match KnowledgeBase::open(config).await {
-            Ok(_) => panic!("expected open to fail"),
-            Err(e) => e,
+        // A prior open's file lock may still be releasing; retry on Db errors
+        // until the real validation error surfaces.
+        const ATTEMPTS: usize = 8;
+        let mut last = None;
+        for _ in 0..ATTEMPTS {
+            match KnowledgeBase::open(config.clone()).await {
+                Ok(_) => panic!("expected open to fail"),
+                Err(e) if matches!(e.code, ErrorCode::Db) => {
+                    last = Some(e);
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                }
+                Err(e) => return e,
+            }
         }
+        last.expect("ATTEMPTS is non-zero")
     }
 
     /// Open and drop a KnowledgeBase, retrying transient embedded-SurrealKv
@@ -639,6 +658,22 @@ mod tests {
         let mut last = None;
         for _ in 0..ATTEMPTS {
             match KnowledgeBase::open(config.clone()).await {
+                Ok(kb) => return Ok(kb),
+                Err(e) => {
+                    last = Some(e);
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                }
+            }
+        }
+        Err(last.expect("ATTEMPTS is non-zero"))
+    }
+
+    /// `open_for_reindex` variant that retries transient file-lock failures.
+    async fn open_for_reindex_retrying(config: Config) -> Result<KnowledgeBase, SkbError> {
+        const ATTEMPTS: usize = 8;
+        let mut last = None;
+        for _ in 0..ATTEMPTS {
+            match KnowledgeBase::open_for_reindex(config.clone()).await {
                 Ok(kb) => return Ok(kb),
                 Err(e) => {
                     last = Some(e);
@@ -875,7 +910,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let tok_path = dir.join("tokenizer.json");
-        write_fixture_tokenizer(&tok_path, "alpha");
+        crate::testutil::write_fixture_tokenizer(&tok_path, "alpha");
 
         let mut config_a = Config::default();
         config_a.embedding.onnx_path = "mock".to_string();
@@ -898,29 +933,22 @@ mod tests {
         .await
         .unwrap();
         drop(kb);
-        settle_db_lock().await;
 
         // Same database, different model: normal open refuses to operate.
         let mut config_b = config_a.clone();
         config_b.embedding.model = "model-b".to_string();
         let err = open_expecting_error(config_b.clone()).await;
         assert!(matches!(err.code, ErrorCode::ModelMismatch));
-        settle_db_lock().await;
-
-        // The management path can open and rebuild.
-        let kb = KnowledgeBase::open_for_reindex(config_b.clone())
-            .await
-            .unwrap();
+        let kb = open_for_reindex_retrying(config_b.clone()).await.unwrap();
         let result = kb
             .reindex(&reindex::ReindexRequest::default(), None)
             .await
             .unwrap();
         assert_eq!(result.documents_processed, 1);
         drop(kb);
-        settle_db_lock().await;
 
         // After the rebuild the new model opens normally.
-        KnowledgeBase::open(config_b).await.unwrap();
+        open_retrying(config_b).await.unwrap();
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -932,7 +960,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let tok_path = dir.join("tokenizer.json");
-        write_fixture_tokenizer(&tok_path, "alpha");
+        crate::testutil::write_fixture_tokenizer(&tok_path, "alpha");
 
         let mut config = Config::default();
         config.embedding.onnx_path = "mock".to_string();
@@ -970,25 +998,16 @@ mod tests {
         let stored_dim = kb.db().get_meta("embedding_dimension").await.unwrap();
         assert_eq!(stored_dim.as_deref(), Some("16"));
         drop(kb);
-        settle_db_lock().await;
-
-        // A normal open with the old 8-dim config now reports a mismatch.
         let err = open_expecting_error(config.clone()).await;
         assert!(matches!(err.code, ErrorCode::ModelMismatch));
-        settle_db_lock().await;
-
-        // Rebuild back to 8 via the reindex path, then normal open works again.
-        let kb = KnowledgeBase::open_for_reindex(config.clone())
-            .await
-            .unwrap();
+        let kb = open_for_reindex_retrying(config.clone()).await.unwrap();
         let result = kb
             .reindex(&reindex::ReindexRequest::default(), None)
             .await
             .unwrap();
         assert_eq!(result.documents_processed, 1);
         drop(kb);
-        settle_db_lock().await;
-        KnowledgeBase::open(config).await.unwrap();
+        open_retrying(config).await.unwrap();
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1000,7 +1019,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let tok_path = dir.join("tokenizer.json");
-        write_fixture_tokenizer(&tok_path, "alpha");
+        crate::testutil::write_fixture_tokenizer(&tok_path, "alpha");
 
         let mut config = Config::default();
         config.embedding.onnx_path = "mock".to_string();
@@ -1040,27 +1059,19 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err.code, ErrorCode::Db));
         drop(kb);
-        settle_db_lock().await;
 
         // The interrupted state is detectable: a plain open with the old
         // config must refuse to operate.
         let err = open_expecting_error(config.clone()).await;
         assert!(matches!(err.code, ErrorCode::ModelMismatch));
-        settle_db_lock().await;
-
-        // Re-running reindex through the management path completes the
-        // rebuild back to dimension 8, then normal open works again.
-        let kb = KnowledgeBase::open_for_reindex(config.clone())
-            .await
-            .unwrap();
+        let kb = open_for_reindex_retrying(config.clone()).await.unwrap();
         let result = kb
             .reindex(&reindex::ReindexRequest::default(), None)
             .await
             .unwrap();
         assert_eq!(result.documents_processed, 1);
         drop(kb);
-        settle_db_lock().await;
-        KnowledgeBase::open(config).await.unwrap();
+        open_retrying(config).await.unwrap();
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1146,8 +1157,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let tok_a = dir.join("tokenizer-a.json");
         let tok_b = dir.join("tokenizer-b.json");
-        write_fixture_tokenizer(&tok_a, "alpha");
-        write_fixture_tokenizer(&tok_b, "beta");
+        crate::testutil::write_fixture_tokenizer(&tok_a, "alpha");
+        crate::testutil::write_fixture_tokenizer(&tok_b, "beta");
 
         let mut config_a = Config::default();
         config_a.embedding.onnx_path = "mock".to_string();
@@ -1195,8 +1206,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let tok_a = dir.join("tokenizer-a.json");
         let tok_b = dir.join("tokenizer-b.json");
-        write_fixture_tokenizer(&tok_a, "alpha");
-        write_fixture_tokenizer(&tok_b, "beta");
+        crate::testutil::write_fixture_tokenizer(&tok_a, "alpha");
+        crate::testutil::write_fixture_tokenizer(&tok_b, "beta");
 
         let mut config_a = Config::default();
         config_a.embedding.onnx_path = "mock".to_string();
