@@ -49,10 +49,11 @@ impl Db {
     }
 
     pub async fn get_meta(&self, key: &str) -> Result<Option<String>, SkbError> {
-        let query = format!("SELECT meta_value FROM meta WHERE key = '{key}'");
+        let query = "SELECT meta_value FROM meta WHERE key = $key";
         let mut r = self
             .db
-            .query(&query)
+            .query(query)
+            .bind(("key", key.to_string()))
             .await
             .map_err(|e| SkbError::new(ErrorCode::Db, format!("get_meta: {e}")))?;
         let rows: Vec<serde_json::Value> = r
@@ -64,12 +65,12 @@ impl Db {
     }
 
     pub async fn set_meta(&self, key: &str, val: &str) -> Result<(), SkbError> {
-        let query = format!(
-            "INSERT INTO meta (key, meta_value) VALUES ('{key}', '{val}') \
-             ON DUPLICATE KEY UPDATE meta_value = '{val}'"
-        );
+        let query = "INSERT INTO meta (key, meta_value) VALUES ($key, $val) \
+                     ON DUPLICATE KEY UPDATE meta_value = $val";
         self.db
-            .query(&query)
+            .query(query)
+            .bind(("key", key.to_string()))
+            .bind(("val", val.to_string()))
             .await
             .map_err(|e| SkbError::new(ErrorCode::Db, format!("set_meta: {e}")))?
             .check()

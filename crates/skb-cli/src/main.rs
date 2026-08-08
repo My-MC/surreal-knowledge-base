@@ -46,10 +46,10 @@ enum Commands {
     /// Search documents
     Search {
         query: String,
-        #[arg(long, default_value = "hybrid")]
-        mode: String,
-        #[arg(long, default_value = "10")]
-        top_k: usize,
+        #[arg(long, help = "hybrid|vector|keyword (default: config search.default_mode)")]
+        mode: Option<String>,
+        #[arg(long, help = "number of hits (default: config search.top_k)")]
+        top_k: Option<usize>,
         #[arg(long)]
         graph_expand: Option<usize>,
         #[arg(long, value_delimiter = ',', help = "filter KEY=VALUE (repeatable)")]
@@ -372,8 +372,8 @@ async fn run(cli: &Cli) -> Result<()> {
                 .collect::<Result<_, _>>()?;
             let req = SearchRequest {
                 query: query.clone(),
-                mode: Some(mode.parse()?),
-                top_k: Some(*top_k),
+                mode: mode.as_deref().map(str::parse).transpose()?,
+                top_k: *top_k,
                 graph_expand: *graph_expand,
                 filter: if filter.is_empty() {
                     None
@@ -525,5 +525,7 @@ fn parse_scalar_item(raw: &str) -> toml_edit::Item {
 }
 
 fn cfg() -> Result<Config> {
-    Config::load().or_else(|_| Ok(Config::default()))
+    // Errors (invalid SKB_* env values, unreadable/ malformed config files)
+    // must surface instead of silently falling back to defaults.
+    Config::load().map_err(|e| anyhow::anyhow!("{e:#}"))
 }
