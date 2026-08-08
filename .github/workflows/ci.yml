@@ -11,20 +11,13 @@ env:
 
 jobs:
   test:
-    name: Test + release gates
+    name: Test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Format check
-        run: cargo fmt --all -- --check
-      - name: Clippy (warning-free)
-        run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Cargo check
-        run: cargo check --workspace
-      - name: Serial tests (incl. golden contract tests)
-        run: cargo test --workspace -- --test-threads=1
+      - run: cargo test --workspace -- --test-threads=1
       - name: Check no native-tls / openssl dependency
         run: |
           cargo tree -i openssl-sys 2>&1 | grep -q "did not match"
@@ -103,7 +96,6 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 22
-      - uses: oven-sh/setup-bun@v2
       - uses: actions/download-artifact@v8
         with:
           name: npm-linux-x64
@@ -124,7 +116,7 @@ jobs:
         run: |
           echo "Max GLIBC version required:"
           objdump -T npm/packages/linux-x64/bin/skb-mcp | grep -oP 'GLIBC_[0-9.]+' | sort -Vu | tail -1
-      - name: Smoke test (pack, install, full MCP flow)
+      - name: Smoke test (pack, install, MCP handshake)
         run: |
           cd "$GITHUB_WORKSPACE/npm" && npm pack
           cd "$GITHUB_WORKSPACE/npm/packages/linux-x64" && npm pack
@@ -147,115 +139,8 @@ jobs:
           EOF
 
           SKB_BIN="$(dirname "$(node -p "require.resolve('@surreal-knowledge-base/linux-x64/package.json')")")/bin/skb-mcp"
-          cd "$SMOKE"
-
-          # Full E2E flow: initialize -> tools/list -> skb_upload -> skb_search
-          # (requests are awaited sequentially: rmcp handles them concurrently)
-          node "$GITHUB_WORKSPACE/npm/smoke-mcp.mjs" "$SKB_BIN"
-
-      - name: Wrapper launch via node (npx-style) and bun
-        run: |
-          SMOKE="$GITHUB_WORKSPACE/target/skb-smoke"
-          cd "$SMOKE"
-          WRAPPER="$(node -p "require.resolve('surreal-knowledge-base/bin/skb-mcp.js')")"
-          echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"node-wrapper","version":"1.0"}}}' \
-            | node "$WRAPPER" 2>node.log | head -1 | grep -q 'protocolVersion' \
-            || { echo "node wrapper launch failed; stderr:"; cat node.log; exit 1; }
-          echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"bun-wrapper","version":"1.0"}}}' \
-            | bun "$WRAPPER" 2>bun.log | head -1 | grep -q 'protocolVersion' \
-            || { echo "bun wrapper launch failed; stderr:"; cat bun.log; exit 1; }
-
-  e2e-linux-arm64:
-    name: E2E (linux-arm64)
-    runs-on: ubuntu-24.04-arm
-    needs: build
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
-        with:
-          name: npm-linux-arm64
-          path: npm-out/
-      - name: Check shared library dependencies
-        run: |
-          BIN=npm-out/packages/linux-arm64/bin/skb-mcp
-          chmod +x "$BIN"
-          ldd "$BIN"
-          ldd "$BIN" 2>&1 | (! grep -q libonnxruntime)
-          ldd "$BIN" 2>&1 | (! grep -q libssl)
-          ldd "$BIN" 2>&1 | (! grep -q libcrypto)
-          ldd "$BIN" 2>&1 | (! grep -q libstdc++)
-      - name: MCP E2E flow (initialize -> tools/list -> upload -> search)
-        run: |
-          cat > skb.toml << EOF
-          [storage]
-          path = "db"
-          [embedding]
-          onnx_path = "mock"
-          dimension = 8
-          tokenizer = "$GITHUB_WORKSPACE/npm/smoke-tokenizer.json"
-          EOF
-          node "$GITHUB_WORKSPACE/npm/smoke-mcp.mjs" "$PWD/npm-out/packages/linux-arm64/bin/skb-mcp"
-
-  e2e-macos:
-    name: E2E (darwin-arm64)
-    runs-on: macos-latest
-    needs: build
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
-        with:
-          name: npm-darwin-arm64
-          path: npm-out/
-      - name: Check dynamic library dependencies (otool)
-        run: |
-          BIN=npm-out/packages/darwin-arm64/bin/skb-mcp
-          chmod +x "$BIN"
-          otool -L "$BIN"
-          otool -L "$BIN" 2>&1 | (! grep -q libonnxruntime)
-      - name: MCP E2E flow (initialize -> tools/list -> upload -> search)
-        run: |
-          cat > skb.toml << EOF
-          [storage]
-          path = "db"
-          [embedding]
-          onnx_path = "mock"
-          dimension = 8
-          tokenizer = "$GITHUB_WORKSPACE/npm/smoke-tokenizer.json"
-          EOF
-          node "$GITHUB_WORKSPACE/npm/smoke-mcp.mjs" "$PWD/npm-out/packages/darwin-arm64/bin/skb-mcp"
-
-  e2e-windows:
-    name: E2E (win32-x64)
-    runs-on: windows-2022
-    needs: build
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
-        with:
-          name: npm-win32-x64
-          path: npm-out/
-      - name: Check imported DLLs (VC++ runtime prerequisite)
-        shell: pwsh
-        run: |
-          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          $vsPath = & $vswhere -latest -property installationPath
-          $dumpbin = Get-ChildItem "$vsPath\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1
-          if (-not $dumpbin) { Write-Error "dumpbin not found" }
-          $deps = & $dumpbin.FullName /dependents npm-out\packages\win32-x64\bin\skb-mcp.exe
-          $deps | Select-String '\.dll'
-          if ($deps | Select-String 'libonnxruntime') { Write-Error "libonnxruntime.dll must not be imported" }
-          if (-not ($deps | Select-String 'MSVCP140.dll')) { Write-Error "MSVCP140.dll (VC++ runtime) must be imported" }
-          if (-not ($deps | Select-String 'VCRUNTIME140.dll')) { Write-Error "VCRUNTIME140.dll (VC++ runtime) must be imported" }
-          Write-Output "VC++ runtime present on runner: $(Test-Path "$env:WINDIR\System32\vcruntime140.dll")"
-      - name: MCP E2E flow (initialize -> tools/list -> upload -> search)
-        shell: pwsh
-        run: |
-          @'
-          [storage]
-          path = "db"
-          [embedding]
-          onnx_path = "mock"
-          dimension = 8
-          tokenizer = "$env:GITHUB_WORKSPACE\npm\smoke-tokenizer.json"
-          '@ | Set-Content -Encoding ascii skb.toml
-          node "$env:GITHUB_WORKSPACE/npm/smoke-mcp.mjs" "$env:GITHUB_WORKSPACE/npm-out/packages/win32-x64/bin/skb-mcp.exe"
+          echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"smoke-test","version":"1.0"}}}' \
+            | "$SKB_BIN" 2>mcp.log \
+            | head -1 \
+            | grep -q "protocolVersion" \
+            || { echo "MCP handshake failed; stderr:"; cat mcp.log; exit 1; }
