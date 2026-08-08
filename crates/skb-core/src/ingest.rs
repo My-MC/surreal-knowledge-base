@@ -20,10 +20,38 @@ pub const MAX_PROCESS_SECONDS: u64 = 30;
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[schemars(extend("oneOf" = [
-    {"required": ["path"]},
-    {"required": ["url"]},
-    {"required": ["content"]},
-    {"required": ["content_base64"]},
+    {
+        "required": ["path"],
+        "properties": {
+            "url": {"type": "null"},
+            "content": {"type": "null"},
+            "content_base64": {"type": "null"}
+        }
+    },
+    {
+        "required": ["url"],
+        "properties": {
+            "path": {"type": "null"},
+            "content": {"type": "null"},
+            "content_base64": {"type": "null"}
+        }
+    },
+    {
+        "required": ["content"],
+        "properties": {
+            "path": {"type": "null"},
+            "url": {"type": "null"},
+            "content_base64": {"type": "null"}
+        }
+    },
+    {
+        "required": ["content_base64"],
+        "properties": {
+            "path": {"type": "null"},
+            "url": {"type": "null"},
+            "content": {"type": "null"}
+        }
+    },
 ]))]
 pub struct UploadRequest {
     pub path: Option<String>,
@@ -771,7 +799,12 @@ fn is_documentation_v6(v6: std::net::Ipv6Addr) -> bool {
 /// 64:ff9b::/96 — NAT64 well-known prefix (maps to IPv4 destinations).
 fn is_nat64_v6(v6: std::net::Ipv6Addr) -> bool {
     let s = v6.segments();
-    s[0] == 0x64 && s[1] == 0xff9b && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0
+    s[0] == 0x64
+        && s[1] == 0xff9b
+        && s[2] == 0
+        && s[3] == 0
+        && s[4] == 0
+        && s[5] == 0
 }
 
 fn base64_decode_checked(b64: &str, config: &Config) -> Result<Vec<u8>, SkbError> {

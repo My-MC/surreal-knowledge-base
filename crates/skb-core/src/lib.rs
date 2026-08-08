@@ -452,6 +452,10 @@ mod tests {
 
     static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
+    fn is_upload_source(name: &str) -> bool {
+        matches!(name, "path" | "url" | "content" | "content_base64")
+    }
+
     fn mock_config() -> Config {
         let n = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
         let mut config = Config::default();
@@ -1534,6 +1538,28 @@ mod tests {
         assert!(one_of
             .iter()
             .any(|e| e["required"] == serde_json::json!(["content_base64"])));
+        // Each oneOf branch must null out the alternative input sources so the
+        // branches are mutually exclusive (spec §12.3, one source only).
+        for e in one_of.iter() {
+            let required = e["required"].as_array().unwrap();
+            let required_name = required[0].as_str().unwrap();
+            let nulled = e["properties"]
+                .as_object()
+                .unwrap()
+                .iter()
+                .filter(|(name, _)| {
+                    name.as_str() != required_name && is_upload_source(name.as_str())
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                nulled.len(),
+                3,
+                "branch {required_name} must null 3 sources"
+            );
+            for (_, schema) in nulled {
+                assert_eq!(schema["type"], serde_json::json!("null"));
+            }
+        }
     }
 
     #[test]
