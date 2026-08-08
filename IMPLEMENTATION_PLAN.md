@@ -57,7 +57,7 @@
 | 領域 | 現在確認できる実装 | 不足する検証/実装 | 次のPhase |
 |---|---|---|---|
 | 設定・モデル | `./skb.toml`/ユーザー設定探索、`SKB_*`環境変数オーバーライド、model名のmeta照合、dimension/max_inputのモデル解決と`E_VALIDATION`、tokenizer fingerprintの生成・meta保存・`E_MODEL_MISMATCH`、再起動検証（9-1完了） | なし | — |
-| Upload | 全経路のサイズ上限、SSRF（手動redirect各hop検証・IPブロック）、base64任意バイナリ分類、単一トランザクション+rollback、CLI部分失敗errors[]（9-3完了） | なし | — |
+| Upload | 全経路のサイズ上限、SSRF（手動redirect各hop検証・IPブロック）、base64任意バイナリ分類、単一トランザクション+rollback、CLI部分失敗errors[]（9-3完了） | 検証済みIPへの接続固定（DNS rebindingは接続直前の再解決で緩和）、圧縮爆弾/ネスト深度/メモリ上限（PDFはページ数・時間上限のみ） | — |
 | Chunk/Graph/Search | 見出し境界チャンキング+heading永続化、EntityExtractor（WikiLink/frontmatter/見出し階層part-of）、N-hop+再ランク、検索応答title/source/highlights/matched_entities（9-4完了） | なし | — |
 | Reindex | migrate前のmodel/dimension比較（新規DBは初期化パス）、open_for_reindex管理経路、dimension変更のwipe+フィールド再定義→HNSW再構築→meta更新、中断検出+再実行復旧、MCP/CLI progress（9-5完了） | なし | — |
 | CLI/MCP | stdio MCP、主要CLI/MCP操作、resource-not-found、共通DTO/JSON Schema（9-2完了） | CLI parity、件数、query、JSON、progress、golden test | 9-6 |
@@ -253,10 +253,11 @@ Phase 0〜8 で確定した方針（`tokenizers`、SurrealKV 組込み、ORT 静
 - ファイル、stdin、base64、inline、URLの全入力に`upload.max_file_mb`を適用し、decode/extract前後のサイズを検査する。
 - base64は任意バイナリとして保持し、MIME/拡張子に応じてPDF等を抽出する。未対応形式は`E_UNSUPPORTED_FORMAT`で拒否する。
 - URLはHTTP(S)のみ許可し、redirect数、受信ストリーム、DNS解決後のprivate/reserved、loopback、link-local、multicast、metadata IPを検証する。検証済みIPへの接続固定または同一のDNS解決結果を使うresolver/connectorを用い、各redirectでもURL検証から接続まで同じ対策を適用する。
-- 入力ストリーム、base64 decoded data、展開後データ、抽出出力、処理時間、メモリ、PDFページ数、圧縮/抽出のネスト深度に上限を設け、上限到達時は直ちに停止する。上限はdecode/extract前後の検査だけに依存しない。
+- 入力ストリーム、base64 decoded data、展開後データ、抽出出力、処理時間、PDFページ数に上限を設け、上限到達時は直ちに停止する。上限はdecode/extract前後の検査だけに依存しない。
 - document、chunk、entity、mentions、force更新時の旧データ削除を一つのトランザクションで処理する。
 - 複数入力時は成功結果と`errors[]`を集約し、一件の失敗で全体を中断しない。
-- **完了条件**: サイズ超過base64、圧縮爆弾、PDF爆弾、decode/extractの時間・メモリ・ページ・ネスト上限、DNS rebinding、redirect再検証、未対応形式、部分失敗、rollbackのテストが緑。
+- **完了条件**: サイズ超過base64、PDF爆弾（ページ数）、decode/extractの時間上限、DNS rebinding、redirect再検証、未対応形式、部分失敗、rollbackのテストが緑。
+- **残余（未実装・記録のみ）**: 圧縮爆弾・ネスト深度・メモリ上限、検証済みIPへの接続固定（ureq 3.3 は resolver/connector 差し替え非公開、§15）。
 
 ✅ 実装済み: 全入力経路（file/stdin/base64/inline/URL）に `upload.max_file_mb` を decode/extract 前後で適用（stdin は `Read::take`、URL は `limit()` ストリーミング読み、base64 は `decoded_len_estimate` 事前検査 + 実長検査）。base64 を任意バイナリとして保持し、PDF マジック/MIME で分類、未対応バイナリは `E_UNSUPPORTED_FORMAT`。URL は http/https のみ、手動リダイレクトループ（上限5）で各 hop に scheme + DNS 事前解決・IP 検証（private/loopback/link-local/multicast/unspecified/broadcast/documentation/CGNAT/benchmarking/reserved/metadata 169.254.169.254）、connect/global タイムアウト。PDF はページ数上限200・処理時間上限30秒。document+chunk+mentions+force 時の旧データ削除を単一トランザクション化（失敗時 rollback）。CLI 複数入力（--recursive 等）は `{results, errors[]}` 集約で部分失敗を許容。
 

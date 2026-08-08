@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::db::Db;
+use crate::db::{Db, MetaStore};
 use crate::embed::Embed;
 use crate::error::{ErrorCode, SkbError};
 use crate::tokenize::Tokenize;
@@ -259,6 +259,7 @@ async fn rebuild_all(
             report(i + 1, total);
         }
     }
+
     Ok(result)
 }
 
@@ -295,10 +296,12 @@ async fn update_metas(
     }
     .await;
     match result {
-        Ok(()) => tx
-            .commit()
-            .await
-            .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex meta commit: {e}"))),
+        Ok(()) => {
+            tx.commit()
+                .await
+                .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex meta commit: {e}")))?;
+            Ok(())
+        }
         Err(e) => {
             let _ = tx.cancel().await;
             Err(e)

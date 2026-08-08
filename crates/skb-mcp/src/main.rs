@@ -411,7 +411,10 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let config = Config::load().unwrap_or_default();
+    let config = Config::load().unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "failed to load config; falling back to defaults");
+        Config::default()
+    });
     // In a model/tokenizer mismatch state, start anyway so `skb_reindex`
     // can rebuild the database (spec §9-5).
     let kb = match KnowledgeBase::open(config.clone()).await {
