@@ -6,25 +6,28 @@ pub trait Embed: Send + Sync {
     fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, SkbError>;
 }
 
-pub struct MockEmbedder {
-    pub dimension: usize,
-}
+/// Dimension of the mock embedder; treated as the model's detected dimension
+/// so that explicit `embedding.dimension` values are validated against it.
+pub const MOCK_EMBEDDER_DIMENSION: usize = 8;
+
+pub struct MockEmbedder;
 
 impl Embed for MockEmbedder {
     fn dimension(&self) -> usize {
-        self.dimension
+        MOCK_EMBEDDER_DIMENSION
     }
     fn max_input_tokens(&self) -> usize {
         8192
     }
 
     fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, SkbError> {
+        let dim = self.dimension();
         Ok(texts
             .iter()
             .enumerate()
             .map(|(i, _)| {
-                let mut v = vec![0.0f32; self.dimension];
-                v[i % self.dimension] = 1.0;
+                let mut v = vec![0.0f32; dim];
+                v[i % dim] = 1.0;
                 l2_normalize(&mut v);
                 v
             })

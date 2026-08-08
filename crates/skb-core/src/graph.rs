@@ -1,39 +1,118 @@
 use crate::db::Db;
 use crate::error::{ErrorCode, SkbError};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use surrealdb::types::RecordId;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct EntityInfo {
     pub name: String,
     pub kind: String,
     pub description: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl EntityInfo {
+    pub fn validate(&self) -> Result<(), SkbError> {
+        if self.name.trim().is_empty() {
+            return Err(SkbError::new(
+                ErrorCode::Validation,
+                "name must not be empty",
+            ));
+        }
+        if self.kind.trim().is_empty() {
+            return Err(SkbError::new(
+                ErrorCode::Validation,
+                "kind must not be empty",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct LinkInfo {
     pub from: String,
     pub to: String,
     pub relation: String,
+    #[schemars(range(min = 0.0))]
     pub weight: Option<f64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl LinkInfo {
+    pub fn validate(&self) -> Result<(), SkbError> {
+        if self.from.trim().is_empty() {
+            return Err(SkbError::new(
+                ErrorCode::Validation,
+                "from must not be empty",
+            ));
+        }
+        if self.to.trim().is_empty() {
+            return Err(SkbError::new(ErrorCode::Validation, "to must not be empty"));
+        }
+        if self.relation.trim().is_empty() {
+            return Err(SkbError::new(
+                ErrorCode::Validation,
+                "relation must not be empty",
+            ));
+        }
+        if let Some(weight) = self.weight {
+            if !weight.is_finite() || weight < 0.0 {
+                return Err(SkbError::new(
+                    ErrorCode::Validation,
+                    "weight must be a finite non-negative number",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct GraphQueryRequest {
     pub from: String,
     pub relation: Option<String>,
+    #[schemars(range(min = 1, max = 5))]
     pub depth: Option<usize>,
+    #[schemars(range(min = 1))]
     pub limit: Option<usize>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl GraphQueryRequest {
+    pub fn validate(&self) -> Result<(), SkbError> {
+        if self.from.trim().is_empty() {
+            return Err(SkbError::new(
+                ErrorCode::Validation,
+                "from must not be empty",
+            ));
+        }
+        if let Some(depth) = self.depth {
+            if !(1..=5).contains(&depth) {
+                return Err(SkbError::new(
+                    ErrorCode::Validation,
+                    "depth must be between 1 and 5",
+                ));
+            }
+        }
+        if let Some(limit) = self.limit {
+            if limit == 0 {
+                return Err(SkbError::new(
+                    ErrorCode::Validation,
+                    "limit must be at least 1",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct GraphQueryResult {
     pub nodes: Vec<GraphNode>,
     pub edges: Vec<GraphEdge>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct GraphNode {
     pub id: String,
     pub name: String,
@@ -41,7 +120,7 @@ pub struct GraphNode {
     pub depth: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct GraphEdge {
     pub from: String,
     pub to: String,
@@ -75,6 +154,7 @@ fn entity_record_id(name: &str) -> Result<RecordId, SkbError> {
 
 /// Insert-or-update an entity, addressed by its deterministic id (`entity:⟨name⟩`).
 pub async fn upsert_entity(db: &Db, entity: &EntityInfo) -> Result<(), SkbError> {
+    entity.validate()?;
     let sql = "INSERT INTO entity (id, name, kind, description) \
                VALUES ($id, $name, $kind, $description) \
                ON DUPLICATE KEY UPDATE description = $description";
@@ -94,6 +174,7 @@ pub async fn upsert_entity(db: &Db, entity: &EntityInfo) -> Result<(), SkbError>
 
 /// Create a typed `related_to` edge between two entities.
 pub async fn link(db: &Db, link: &LinkInfo) -> Result<(), SkbError> {
+    link.validate()?;
     let weight = link.weight.unwrap_or(1.0);
     let sql = "RELATE $from->related_to->$to SET relation = $relation, weight = $weight";
     db.db
@@ -191,6 +272,7 @@ pub(crate) async fn index_chunk_entities_in_transaction(
 
 /// Traverse entity relations, optionally starting from a document record.
 pub async fn graph_query(db: &Db, req: &GraphQueryRequest) -> Result<GraphQueryResult, SkbError> {
+    req.validate()?;
     let depth = req.depth.unwrap_or(1).min(5);
     let limit = req.limit.unwrap_or(50);
     let from = req.from.clone();
@@ -521,4 +603,118 @@ pub fn extract_entities(content: &str) -> Vec<EntityInfo> {
     }
 
     entities
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn graph_request(from: &str) -> GraphQueryRequest {
+        GraphQueryRequest {
+            from: from.into(),
+            relation: None,
+            depth: None,
+            limit: None,
+        }
+    }
+
+    #[test]
+    fn rejects_empty_from() {
+        assert!(matches!(
+            graph_request("").validate(),
+            Err(SkbError {
+                code: ErrorCode::Validation,
+                ..
+            })
+        ));
+        assert!(matches!(
+            graph_request("  ").validate(),
+            Err(SkbError {
+                code: ErrorCode::Validation,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_out_of_range_depth() {
+        for depth in [0usize, 6] {
+            let mut req = graph_request("A");
+            req.depth = Some(depth);
+            assert!(matches!(
+                req.validate(),
+                Err(SkbError {
+                    code: ErrorCode::Validation,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_zero_limit() {
+        let mut req = graph_request("A");
+        req.limit = Some(0);
+        assert!(matches!(
+            req.validate(),
+            Err(SkbError {
+                code: ErrorCode::Validation,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_empty_entity_name_and_kind() {
+        for (name, kind) in [("", "k"), ("n", "")] {
+            assert!(matches!(
+                EntityInfo {
+                    name: name.into(),
+                    kind: kind.into(),
+                    description: None,
+                }
+                .validate(),
+                Err(SkbError {
+                    code: ErrorCode::Validation,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_empty_link_parts() {
+        for (from, to, relation) in [("", "b", "r"), ("a", "", "r"), ("a", "b", "")] {
+            assert!(matches!(
+                LinkInfo {
+                    from: from.into(),
+                    to: to.into(),
+                    relation: relation.into(),
+                    weight: None,
+                }
+                .validate(),
+                Err(SkbError {
+                    code: ErrorCode::Validation,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_negative_weight() {
+        assert!(matches!(
+            LinkInfo {
+                from: "a".into(),
+                to: "b".into(),
+                relation: "r".into(),
+                weight: Some(-0.1),
+            }
+            .validate(),
+            Err(SkbError {
+                code: ErrorCode::Validation,
+                ..
+            })
+        ));
+    }
 }

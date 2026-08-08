@@ -4,9 +4,10 @@ use crate::embed::Embed;
 use crate::error::{ErrorCode, SkbError};
 use crate::tokenize::Tokenize;
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ReindexResult {
     pub documents_processed: usize,
     pub chunks_created: usize,
@@ -14,7 +15,7 @@ pub struct ReindexResult {
     pub entities_extracted: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
 pub struct ReindexRequest {
     /// Only report what a reindex would do, without mutating the database.
     #[serde(default)]
@@ -103,6 +104,25 @@ pub async fn reindex(
         result.documents_processed += 1;
         result.chunks_created += chunks.len();
         result.tokens_total += chunks.iter().map(|c| c.token_count).sum::<usize>();
+    }
+
+    if !dry_run {
+        // Record the resolved model/tokenizer metadata (spec §5.4). The
+        // fingerprint comparison already happened in `KnowledgeBase::open`;
+        // after a successful rebuild the stored values are refreshed.
+        db.set_meta("embedding_model", &config.embedding.model)
+            .await?;
+        db.set_meta("embedding_dimension", &embedder.dimension().to_string())
+            .await?;
+        db.set_meta(
+            "embedding_max_input_tokens",
+            &config.embedding.max_input_tokens.to_string(),
+        )
+        .await?;
+        db.set_meta("schema_version", "1").await?;
+        let source = crate::tokenizer_source_for(config);
+        let meta = crate::tokenizer_fingerprint(&source, &tokenizer.config_json()?)?;
+        crate::save_tokenizer_meta(db, config, &source, &meta).await?;
     }
 
     Ok(result)

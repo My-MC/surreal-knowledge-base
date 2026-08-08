@@ -87,7 +87,7 @@ fn core_search(query: &str, mode: &str) -> Value {
         let kb = skb_core::KnowledgeBase::open(config).await.unwrap();
         let req = skb_core::search::SearchRequest {
             query: query.into(),
-            mode: Some(mode.into()),
+            mode: Some(mode.parse().unwrap()),
             top_k: Some(5),
             graph_expand: None,
             filter: None,
@@ -106,7 +106,14 @@ fn core_list() -> Value {
     config.storage.path = dir.join("db");
     rt.block_on(async {
         let kb = skb_core::KnowledgeBase::open(config).await.unwrap();
-        let docs = kb.list_documents(10, 0, None).await.unwrap();
+        let docs = kb
+            .list_documents(&skb_core::crud::ListQuery {
+                limit: Some(10),
+                offset: Some(0),
+                order: None,
+            })
+            .await
+            .unwrap();
         serde_json::to_value(docs).unwrap()
     })
 }
@@ -204,6 +211,20 @@ fn contract_config_set_updates_existing_config() {
     assert!(config.contains("search = { rrf_k = 42 }"));
     let shown = run_skb(&["config", "show"], None);
     assert_eq!(shown["search"]["rrf_k"], 42);
+}
+
+#[test]
+fn contract_config_env_override() {
+    setup_config();
+    let output = Command::new(skb_binary())
+        .args(["config", "show"])
+        .env("SKB_SEARCH_TOP_K", "42")
+        .current_dir(test_dir())
+        .output()
+        .expect("failed to run skb config show");
+    assert!(output.status.success());
+    let val: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(val["search"]["top_k"], 42);
 }
 
 #[test]

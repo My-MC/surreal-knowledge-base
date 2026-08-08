@@ -104,7 +104,7 @@ fn bench_tokenize(c: &mut Criterion) {
 }
 
 fn bench_embed(c: &mut Criterion) {
-    let mock = MockEmbedder { dimension: 1024 };
+    let mock = MockEmbedder;
     let texts: Vec<String> = (0..32)
         .map(|i| generate_text(2000).replace("[0]", &format!("[batch_{i}]")))
         .collect();
@@ -215,7 +215,7 @@ fn bench_search(c: &mut Criterion) {
     for mode in &["vector", "keyword", "hybrid"] {
         let req = SearchRequest {
             query: "database vector search".into(),
-            mode: Some(mode.to_string()),
+            mode: Some(mode.parse().unwrap()),
             top_k: Some(10),
             graph_expand: None,
             filter: None,

@@ -4953,6 +4953,7 @@ dependencies = [
 name = "skb-core"
 version = "0.1.0"
 dependencies = [
+ "ahash 0.8.12",
  "anyhow",
  "base64 0.23.0",
  "criterion",
@@ -4981,6 +4982,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "rmcp",
+ "schemars",
  "serde",
  "serde_json",
  "skb-core",
