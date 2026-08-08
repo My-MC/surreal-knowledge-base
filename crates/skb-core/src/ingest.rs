@@ -300,12 +300,8 @@ async fn store_and_index(
 
     let mut entities = Vec::new();
     for (cid, chunk) in chunk_ids.iter().zip(chunks.iter()) {
-        graph::index_chunk_entities_in_transaction(tx, cid, &chunk.content).await?;
-        entities.extend(
-            graph::extract_entities(&chunk.content)
-                .into_iter()
-                .map(|entity| entity.name),
-        );
+        let names = graph::index_chunk_entities_in_transaction(tx, cid, &chunk.content).await?;
+        entities.extend(names);
     }
     // Heading hierarchy: sections become part-of their nearest ancestor.
     graph::link_section_hierarchy(tx, &doc.content).await?;
@@ -482,11 +478,13 @@ fn is_pdf_bytes(bytes: &[u8]) -> bool {
 /// primary PDF-bomb defense; parsing and extraction run on blocking threads
 /// under a wall-clock timeout so a slow document cannot hang the request.
 async fn extract_pdf_checked(bytes: &[u8]) -> Result<String, SkbError> {
+    let start = Instant::now();
+    let shared = std::sync::Arc::new(bytes.to_vec());
     let doc = tokio::time::timeout(
         Duration::from_secs(MAX_PROCESS_SECONDS),
         tokio::task::spawn_blocking({
-            let bytes = bytes.to_vec();
-            move || lopdf::Document::load_mem(&bytes)
+            let shared = shared.clone();
+            move || lopdf::Document::load_mem(&shared)
         }),
     )
     .await
@@ -501,12 +499,15 @@ async fn extract_pdf_checked(bytes: &[u8]) -> Result<String, SkbError> {
         ));
     }
     // The extraction itself is synchronous and cannot be cancelled; the
-    // timeout bounds how long the caller waits.
+    // timeout bounds how long the caller waits. Parse and extraction share
+    // one MAX_PROCESS_SECONDS budget so a slow parse cannot be followed by a
+    // full second timeout.
+    let remaining = Duration::from_secs(MAX_PROCESS_SECONDS).saturating_sub(start.elapsed());
     let text = tokio::time::timeout(
-        Duration::from_secs(MAX_PROCESS_SECONDS),
+        remaining,
         tokio::task::spawn_blocking({
-            let bytes = bytes.to_vec();
-            move || pdf_extract::extract_text_from_mem(&bytes)
+            let shared = shared.clone();
+            move || pdf_extract::extract_text_from_mem(&shared)
         }),
     )
     .await
@@ -608,6 +609,17 @@ fn check_size(len: u64, config: &Config) -> Result<(), SkbError> {
 /// - size-limited streaming read; the whole fetch (all redirect hops) is
 ///   bounded by one MAX_PROCESS_SECONDS deadline
 fn fetch_url(url_str: &str, config: &Config) -> Result<(Vec<u8>, Option<String>), SkbError> {
+    fetch_url_with_validator(url_str, config, validate_url_host)
+}
+
+/// Shared implementation of `fetch_url`; the host validator is injected so
+/// tests can exercise redirect and size-limit handling against a loopback
+/// server without tripping the SSRF guard (which rejects loopback).
+fn fetch_url_with_validator(
+    url_str: &str,
+    config: &Config,
+    validate: impl Fn(&Url) -> Result<(), SkbError>,
+) -> Result<(Vec<u8>, Option<String>), SkbError> {
     let max_bytes = max_upload_bytes(config);
     let deadline = Instant::now() + Duration::from_secs(MAX_PROCESS_SECONDS);
 
@@ -622,7 +634,7 @@ fn fetch_url(url_str: &str, config: &Config) -> Result<(Vec<u8>, Option<String>)
         }
         let url = Url::parse(&current)
             .map_err(|e| SkbError::new(ErrorCode::Validation, format!("invalid url: {e}")))?;
-        validate_url_host(&url)?;
+        validate(&url)?;
 
         let agent = ureq::Agent::config_builder()
             .max_redirects(0)
@@ -667,7 +679,13 @@ fn fetch_url(url_str: &str, config: &Config) -> Result<(Vec<u8>, Option<String>)
             .with_config()
             .limit(max_bytes + 1)
             .read_to_vec()
-            .map_err(|e| SkbError::new(ErrorCode::Io, format!("read url: {e}")))?;
+            .map_err(|e| {
+                if e.to_string().contains("larger than request limit") {
+                    SkbError::new(ErrorCode::Validation, "response exceeds max file size")
+                } else {
+                    SkbError::new(ErrorCode::Io, format!("read url: {e}"))
+                }
+            })?;
         if body.len() as u64 > max_bytes {
             return Err(SkbError::new(
                 ErrorCode::Validation,
@@ -746,6 +764,8 @@ pub fn is_blocked_ip(ip: IpAddr) -> bool {
                 || v6.is_unicast_link_local()
                 || is_documentation_v6(v6)
                 || is_nat64_v6(v6)
+                || is_6to4_v6(v6)
+                || is_teredo_v6(v6)
             {
                 return true;
             }
@@ -805,6 +825,17 @@ fn is_nat64_v6(v6: std::net::Ipv6Addr) -> bool {
         && s[3] == 0
         && s[4] == 0
         && s[5] == 0
+}
+
+/// 2002::/16 — 6to4 (lower 32 bits embed an IPv4 destination).
+fn is_6to4_v6(v6: std::net::Ipv6Addr) -> bool {
+    v6.segments()[0] == 0x2002
+}
+
+/// 2001::/32 — Teredo (lower 32 bits embed an IPv4 destination, obfuscated).
+fn is_teredo_v6(v6: std::net::Ipv6Addr) -> bool {
+    let s = v6.segments();
+    s[0] == 0x2001 && s[1] == 0x0000
 }
 
 fn base64_decode_checked(b64: &str, config: &Config) -> Result<Vec<u8>, SkbError> {
@@ -871,6 +902,7 @@ async fn doc_exists(db: &Db, sha256: &str) -> Result<bool, SkbError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
 
     #[test]
     fn upload_requires_exactly_one_source() {
@@ -949,7 +981,13 @@ mod tests {
             let ip: IpAddr = ip.parse().unwrap();
             assert!(is_blocked_ip(ip), "{ip} should be blocked");
         }
-        let extra_v6: Vec<&str> = vec!["2001:db8::1", "64:ff9b::c000:0201", "64:ff9b::7f00:1"];
+        let extra_v6: Vec<&str> = vec![
+            "2001:db8::1",
+            "64:ff9b::c000:0201",
+            "64:ff9b::7f00:1",
+            "2002:7f00:0001::",
+            "2001:0000:0:0:0:0:0101:0101",
+        ];
         for ip in extra_v6 {
             let ip: IpAddr = ip.parse().unwrap();
             assert!(is_blocked_ip(ip), "{ip} should be blocked");
@@ -1023,6 +1061,63 @@ mod tests {
         let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, big);
         assert!(matches!(
             base64_decode_checked(&b64, &config),
+            Err(SkbError {
+                code: ErrorCode::Validation,
+                ..
+            })
+        ));
+    }
+
+    /// Serve an HTTP response repeatedly on a loopback listener in a background
+    /// thread, returning the base URL.
+    fn serve_repeatedly(response: &'static str, times: usize) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(times) {
+                let mut stream = stream.unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        format!("http://{addr}/x")
+    }
+
+    #[test]
+    fn fetch_url_rejects_too_many_redirects() {
+        // A 302 pointing back at itself never terminates; the manual redirect
+        // loop must cap at MAX_REDIRECTS.
+        let url = serve_repeatedly(
+            "HTTP/1.1 302 Found\r\nlocation: /self\r\ncontent-length: 0\r\n\r\n",
+            MAX_REDIRECTS + 1,
+        );
+        let config = Config::default();
+        assert!(matches!(
+            fetch_url_with_validator(&url, &config, |_| Ok(())),
+            Err(SkbError {
+                code: ErrorCode::Io,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn fetch_url_rejects_body_over_size_limit() {
+        // A body larger than upload.max_file_mb must be rejected with a
+        // Validation error by the streaming size cap.
+        let body = "x".repeat(2 * 1024 * 1024);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let url = serve_repeatedly(Box::leak(response.into_boxed_str()), 1);
+        let mut config = Config::default();
+        config.upload.max_file_mb = 1;
+        assert!(matches!(
+            fetch_url_with_validator(&url, &config, |_| Ok(())),
             Err(SkbError {
                 code: ErrorCode::Validation,
                 ..

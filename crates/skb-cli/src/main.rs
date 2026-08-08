@@ -26,9 +26,9 @@ enum Commands {
     Upload {
         #[arg(long)]
         path: Option<String>,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "path")]
         url: Option<String>,
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["path", "url"])]
         stdin: bool,
         #[arg(long)]
         title: Option<String>,
@@ -194,7 +194,7 @@ async fn async_main() -> std::process::ExitCode {
     let fmt = cli.format.clone();
 
     match run(&cli).await {
-        Ok(()) => std::process::ExitCode::SUCCESS,
+        Ok(code) => std::process::ExitCode::from(code),
         Err(e) => {
             emit_error(&fmt, &e);
             std::process::ExitCode::from(exit_code_of(&e))
@@ -227,7 +227,7 @@ fn exit_code_of(e: &anyhow::Error) -> u8 {
         .unwrap_or(1)
 }
 
-async fn run(cli: &Cli) -> Result<()> {
+async fn run(cli: &Cli) -> Result<u8> {
     let fmt = cli.format.clone();
     match &cli.command {
         Commands::List {
@@ -376,9 +376,11 @@ async fn run(cli: &Cli) -> Result<()> {
                 )?;
                 if !errors.is_empty() {
                     // The JSON payload is already on stdout; exit non-zero
-                    // without emitting a second error document.
+                    // without emitting a second error document. Returning the
+                    // code (rather than std::process::exit) lets the embedded
+                    // SurrealKv connection drop and flush normally.
                     let _ = std::io::stdout().flush();
-                    std::process::exit(1);
+                    return Ok(1);
                 }
             } else {
                 let result = kb.upload(build(path.clone(), None, None)).await?;
@@ -490,7 +492,7 @@ async fn run(cli: &Cli) -> Result<()> {
         },
     }
 
-    Ok(())
+    Ok(0)
 }
 
 /// `skb config set storage.path './db'`: write a dotted key into the writable
@@ -562,5 +564,5 @@ fn parse_scalar_item(raw: &str) -> toml_edit::Item {
 }
 
 fn cfg() -> Result<Config> {
-    Config::load().or_else(|_| Ok(Config::default()))
+    Config::load()
 }

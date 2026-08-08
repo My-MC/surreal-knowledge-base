@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::db::Db;
+use crate::db::MetaStore;
 use crate::embed::Embed;
 use crate::error::{ErrorCode, SkbError};
 use crate::tokenize::Tokenize;
@@ -107,25 +108,56 @@ pub async fn reindex(
     }
 
     if !dry_run {
-        // Record the resolved model/tokenizer metadata (spec §5.4). The
-        // fingerprint comparison already happened in `KnowledgeBase::open`;
-        // after a successful rebuild the stored values are refreshed.
-        db.set_meta("embedding_model", &config.embedding.model)
+        update_metas(db, embedder, tokenizer, config).await?;
+    }
+
+    Ok(result)
+}
+
+/// Record the resolved model/tokenizer metadata after a successful rebuild
+/// (spec §5.4 rule 3). All writes share one transaction so a partial failure
+/// cannot leave stale model/dimension/fingerprint metadata behind.
+async fn update_metas(
+    db: &Db,
+    embedder: &dyn Embed,
+    tokenizer: &dyn Tokenize,
+    config: &Config,
+) -> Result<(), SkbError> {
+    let tx = db
+        .db
+        .clone()
+        .begin()
+        .await
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex begin: {e}")))?;
+    let result = async {
+        tx.set_meta("embedding_model", &config.embedding.model)
             .await?;
-        db.set_meta("embedding_dimension", &embedder.dimension().to_string())
+        tx.set_meta("embedding_dimension", &embedder.dimension().to_string())
             .await?;
-        db.set_meta(
+        tx.set_meta(
             "embedding_max_input_tokens",
             &embedder.max_input_tokens().to_string(),
         )
         .await?;
-        db.set_meta("schema_version", "1").await?;
+        tx.set_meta("schema_version", "1").await?;
         let source = crate::tokenizer_source_for(config);
         let meta = crate::tokenizer_fingerprint(&source, &tokenizer.config_json()?)?;
-        crate::save_tokenizer_meta(db, config, &source, &meta).await?;
+        crate::save_tokenizer_meta(&tx, config, &source, &meta).await?;
+        Ok::<(), SkbError>(())
     }
-
-    Ok(result)
+    .await;
+    match result {
+        Ok(()) => {
+            tx.commit()
+                .await
+                .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex meta commit: {e}")))?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = tx.cancel().await;
+            Err(e)
+        }
+    }
 }
 
 type LocalTransaction = surrealdb::method::Transaction<surrealdb::engine::local::Db>;
@@ -181,10 +213,11 @@ async fn rebuild_document(
         chunk_ids.push(cid.to_string());
     }
 
-    let mut entities = 0;
+    let mut entities = 0usize;
     for (cid, chunk) in chunk_ids.iter().zip(chunks.iter()) {
-        entities +=
-            crate::graph::index_chunk_entities_in_transaction(tx, cid, &chunk.content).await?;
+        entities += crate::graph::index_chunk_entities_in_transaction(tx, cid, &chunk.content)
+            .await?
+            .len();
     }
     Ok(entities)
 }

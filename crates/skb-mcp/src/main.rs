@@ -96,7 +96,9 @@ impl ServerHandler for SkbServer {
         let contents: Vec<ResourceContents> = if uri == "skb://documents" {
             // Bound the response: accumulate at most MAX_DOCUMENTS_RESOURCE
             // entries so a large store cannot exhaust memory or produce an
-            // unbounded payload (spec §8.3).
+            // unbounded payload (spec §8.3). Fetch one extra page to learn
+            // whether truncation actually occurred; `truncated` is reported
+            // inside a valid JSON payload so clients can parse the resource.
             const MAX_DOCUMENTS_RESOURCE: usize = 10_000;
             let mut docs: Vec<skb_core::crud::DocumentSummary> = Vec::new();
             let mut offset = 0;
@@ -111,21 +113,19 @@ impl ServerHandler for SkbServer {
                     .map_err(err_data)?;
                 let page_len = page.len();
                 docs.extend(page);
-                if page_len < 100 || docs.len() >= MAX_DOCUMENTS_RESOURCE {
+                if page_len < 100 || docs.len() > MAX_DOCUMENTS_RESOURCE {
                     break;
                 }
                 offset += 100;
             }
-            if docs.len() > MAX_DOCUMENTS_RESOURCE {
-                docs.truncate(MAX_DOCUMENTS_RESOURCE);
-            }
-            let mut body = serde_json::to_string_pretty(&docs)
-                .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
-            if docs.len() == MAX_DOCUMENTS_RESOURCE {
-                body.push_str(&format!(
-                    "\n// truncated: resource capped at {MAX_DOCUMENTS_RESOURCE} documents"
-                ));
-            }
+            let truncated = docs.len() > MAX_DOCUMENTS_RESOURCE;
+            docs.truncate(MAX_DOCUMENTS_RESOURCE);
+            let body = serde_json::to_string_pretty(&serde_json::json!({
+                "documents": docs,
+                "truncated": truncated,
+                "limit": MAX_DOCUMENTS_RESOURCE,
+            }))
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
             vec![ResourceContents::text(body, uri)]
         } else if uri == "skb://stats" {
             let stats = kb.stats().await.map_err(err_data)?;
@@ -139,7 +139,7 @@ impl ServerHandler for SkbServer {
                     include_chunks: Some(true),
                 })
                 .await
-                .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+                .map_err(err_data)?;
             let body = serde_json::to_string_pretty(&doc)
                 .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
             vec![ResourceContents::text(body, uri)]
@@ -482,6 +482,19 @@ mod tests {
             tool_schema("skb_delete_document")["required"],
             json!(["id"])
         );
+    }
+
+    #[test]
+    fn entity_tool_requires_name_and_kind() {
+        let schema = tool_schema("skb_graph_upsert_entity");
+        assert_eq!(schema["required"], json!(["name", "kind"]));
+    }
+
+    #[test]
+    fn link_tool_requires_from_to_and_relation() {
+        let schema = tool_schema("skb_graph_link");
+        assert_eq!(schema["required"], json!(["from", "to", "relation"]));
+        assert_eq!(schema["properties"]["weight"]["minimum"], 0.0);
     }
 
     #[test]
