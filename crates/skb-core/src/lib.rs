@@ -70,9 +70,16 @@ impl KnowledgeBase {
             config.resolve_embedding_settings(embedder.dimension(), embedder.max_input_tokens())?;
 
         let dimension = embedder.dimension();
-        db.migrate(dimension).await?;
 
-        let stored_model = db.get_meta("embedding_model").await?;
+        // Compare/validate stored embedding metadata BEFORE migrate so a
+        // mismatch never modifies the schema (spec §5.4). A brand-new database
+        // has no `meta` table yet (get_meta errors), which is treated as a
+        // first-open initialization path.
+        let stored_model = match db.get_meta("embedding_model").await {
+            Ok(model) => model,
+            Err(e) if e.code == ErrorCode::Db => None, // fresh store: no meta table
+            Err(e) => return Err(e),
+        };
         if let Some(ref stored) = stored_model {
             if stored != &config.embedding.model {
                 return Err(SkbError::new(
@@ -83,7 +90,46 @@ impl KnowledgeBase {
                     ),
                 ));
             }
+            // Existing store: validate any stored dimension/max_input values
+            // before operating, so a partial write cannot hide a mismatch.
+            if let Some(ref stored_dim) = db.get_meta("embedding_dimension").await? {
+                if stored_dim != &dimension.to_string() {
+                    return Err(SkbError::new(
+                        ErrorCode::ModelMismatch,
+                        format!(
+                            "config dimension: '{dimension}', stored: '{stored_dim}'. Run reindex to rebuild."
+                        ),
+                    ));
+                }
+            }
+            if let Some(ref stored_tokens) = db.get_meta("embedding_max_input_tokens").await? {
+                if stored_tokens != &config.embedding.max_input_tokens.to_string() {
+                    return Err(SkbError::new(
+                        ErrorCode::ModelMismatch,
+                        format!(
+                            "config max_input_tokens: '{}', stored: '{stored_tokens}'. Run reindex to rebuild.",
+                            config.embedding.max_input_tokens
+                        ),
+                    ));
+                }
+            }
+            // Backfill only missing values, after the present ones are
+            // confirmed consistent.
+            if db.get_meta("embedding_dimension").await?.is_none() {
+                db.set_meta("embedding_dimension", &dimension.to_string())
+                    .await?;
+            }
+            if db.get_meta("embedding_max_input_tokens").await?.is_none() {
+                db.set_meta(
+                    "embedding_max_input_tokens",
+                    &config.embedding.max_input_tokens.to_string(),
+                )
+                .await?;
+            }
+            db.migrate(dimension).await?;
         } else {
+            // New database: initialize all embedding metadata.
+            db.migrate(dimension).await?;
             db.set_meta("embedding_model", &config.embedding.model)
                 .await?;
             db.set_meta("embedding_dimension", &dimension.to_string())
