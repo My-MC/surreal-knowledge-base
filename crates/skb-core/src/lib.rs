@@ -195,7 +195,7 @@ impl KnowledgeBase {
     ) -> Result<Vec<EntityInfo>, SkbError> {
         let doc = crud::get_document(
             &self.db,
-            &crate::crud::GetDocumentRequest {
+            &GetDocumentRequest {
                 id: doc_id.to_string(),
                 include_chunks: Some(false),
             },
@@ -569,7 +569,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(sres.mode, "hybrid");
+        assert_eq!(sres.mode, SearchMode::Hybrid);
         assert!(!sres.hits.is_empty());
 
         let _ = std::fs::remove_dir_all(&path);
@@ -578,7 +578,6 @@ mod tests {
     #[tokio::test]
     async fn test_upload_rejects_multiple_sources() {
         let kb = setup().await;
-        let path = kb.config().storage.path.clone();
 
         let err = kb
             .upload(UploadRequest {
@@ -611,7 +610,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err.code, ErrorCode::Validation));
 
-        let _ = std::fs::remove_dir_all(&path);
+        cleanup(&kb);
     }
 
     #[test]

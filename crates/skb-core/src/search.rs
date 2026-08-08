@@ -56,7 +56,7 @@ pub struct SearchHit {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SearchResponse {
     pub hits: Vec<SearchHit>,
-    pub mode: String,
+    pub mode: SearchMode,
     pub elapsed_ms: u64,
 }
 
@@ -85,7 +85,7 @@ pub async fn search(
 
     Ok(SearchResponse {
         hits,
-        mode: mode.as_str().to_string(),
+        mode,
         elapsed_ms: start.elapsed().as_millis() as u64,
     })
 }

@@ -57,10 +57,10 @@ impl LinkInfo {
             ));
         }
         if let Some(weight) = self.weight {
-            if weight < 0.0 {
+            if !weight.is_finite() || weight < 0.0 {
                 return Err(SkbError::new(
                     ErrorCode::Validation,
-                    "weight must not be negative",
+                    "weight must be a finite non-negative number",
                 ));
             }
         }
