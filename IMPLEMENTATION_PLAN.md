@@ -45,7 +45,7 @@
 | 1 | `skb-core` 基盤 | 部分完了 | 設定検証、入力安全性、DTO、CRUD件数、検索応答の不足 |
 | 2 | グラフ + reindex | 部分完了 | N-hop、再ランク、dimension/HNSW/meta整合性の不足 |
 | 3 | CLI | 部分完了 | 仕様上の入力形式、glob、JSON doctor、query、progressの不足 |
-| 4 | MCP | 部分完了 | 共通JSON Schema、必須条件、progressの不足 |
+| 4 | MCP | 部分完了 | progressの不足 |
 | 5 | 契約テスト + npm | 部分完了 | MCP/CLI比較、全ターゲットE2E、upload/search smokeの不足 |
 | 6 | Skill | 部分完了 | 実装済みレスポンスとSkillの引用・エラー説明の同期が必要 |
 | 7 | 仕上げ | 進行中 | ベンチ結果の判定、日本語FTS評価、公開手順の整理が必要 |
@@ -60,7 +60,7 @@
 | Upload | path/url/content/base64の基本処理、PDF抽出、allowed_dirs | 全経路の上限、SSRF、任意バイナリ、原子性、部分失敗 | 9-3 |
 | Chunk/Graph/Search | token分割、基本抽出、vector/keyword/hybrid、単純graph expansion | heading、frontmatter/WikiLink、N-hop/re-rank、検索応答拡張 | 9-4 |
 | Reindex | ドキュメント単位のchunk置換transaction | mismatch時の起動、dimension/HNSW/meta、全体rollback、progress | 9-5 |
-| CLI/MCP | stdio MCP、主要CLI/MCP操作、resource-not-found | 共通schema、CLI parity、件数、query、JSON、progress、golden test | 9-2/9-6 |
+| CLI/MCP | stdio MCP、主要CLI/MCP操作、resource-not-found、共通DTO/JSON Schema（9-2完了） | CLI parity、件数、query、JSON、progress、golden test | 9-6 |
 | 配布/CI | 4ターゲットbuild matrix、linux smoke initialize | upload/search E2E、bunx、runtime依存、リリースゲート | 9-7 |
 
 ---
@@ -237,12 +237,14 @@ Phase 0〜8 で確定した方針（`tokenizers`、SurrealKV 組込み、ORT 静
 - fingerprint schema version、canonicalization規則、取得元、アルゴリズム/バージョン、fingerprintを`meta`に保存し、`KnowledgeBase::open`と`reindex`で比較する。
 - **完了条件**: 不正設定、環境変数上書き、model/dimension/max input mismatch、tokenizer fingerprint不一致、保存後の再起動検証が緑。
 
-### 9-2: 共通DTO・JSON Schema基盤（未着手）
+### 9-2: 共通DTO・JSON Schema基盤（完了）
 
 - Request/Response型へ`Serialize`、`Deserialize`、`JsonSchema`をderiveし、CLIとMCPが同じ型を利用する。
 - MCPの手書きschemaを廃止し、必須項目、one-of、enum、範囲制約をschemaと実行時の双方で検証する。
 - 公開APIと実装APIの引数・戻り値・エラー形式を統一する。
 - **完了条件**: MCP `tools/list`のschema検証、upload one-of、graph queryの`from`必須検証、CLI/MCP同一DTOのコンパイル・契約テストが緑。
+
+✅ 実装済み: 全DTOにJsonSchema derive、MCPの`tool_with_required`を`schema_for!`ベースに置換、`UploadRequest::validate`（one-of）、`SearchRequest`（query必須・mode enum・top_k/graph_expand範囲）、`GraphQueryRequest`（from必須・depth 1..=5・limit≥1）、`EntityInfo`/`LinkInfo`、`ListQuery`/`OrderBy`/`GetDocumentRequest`/`DeleteDocumentRequest`（公開APIの引数をDTO化）、`ReindexRequest`。CLIは同一DTOを構築。`skb list --limit 0`は`E_VALIDATION`に変更。
 
 ### 9-3: Upload安全性・原子性（部分完了）
 

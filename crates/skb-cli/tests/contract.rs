@@ -87,7 +87,7 @@ fn core_search(query: &str, mode: &str) -> Value {
         let kb = skb_core::KnowledgeBase::open(config).await.unwrap();
         let req = skb_core::search::SearchRequest {
             query: query.into(),
-            mode: Some(mode.into()),
+            mode: Some(mode.parse().unwrap()),
             top_k: Some(5),
             graph_expand: None,
             filter: None,
@@ -106,7 +106,14 @@ fn core_list() -> Value {
     config.storage.path = dir.join("db");
     rt.block_on(async {
         let kb = skb_core::KnowledgeBase::open(config).await.unwrap();
-        let docs = kb.list_documents(10, 0, None).await.unwrap();
+        let docs = kb
+            .list_documents(&skb_core::crud::ListQuery {
+                limit: Some(10),
+                offset: Some(0),
+                order: None,
+            })
+            .await
+            .unwrap();
         serde_json::to_value(docs).unwrap()
     })
 }
