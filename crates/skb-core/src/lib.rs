@@ -152,11 +152,13 @@ impl KnowledgeBase {
         // the reindex path records the new fingerprint instead.
         let tokenizer_source = tokenizer_source_for(&config);
         let tokenizer_meta = tokenizer_fingerprint(&tokenizer_source, &tokenizer.config_json()?)?;
-        if allow_mismatch {
-            save_tokenizer_meta(&db, &config, &tokenizer_source, &tokenizer_meta).await?;
-        } else {
+        if !allow_mismatch {
             sync_tokenizer_meta(&db, &config, &tokenizer_source, &tokenizer_meta).await?;
         }
+        // In allow_mismatch mode (open_for_reindex) the stored metadata is left
+        // untouched: only a successful reindex may write the new fingerprint,
+        // so a store that is opened for reindex but never rebuilt still fails
+        // the normal `open` with E_MODEL_MISMATCH (spec §9-5).
 
         tracing::info!(model=%config.embedding.model, dim=dimension, "KnowledgeBase opened");
 
@@ -1111,6 +1113,60 @@ mod tests {
             // final reopen; the persistent mismatch surfaces as the last error.
             let mut config_b = config_a;
             config_b.embedding.tokenizer = tok_b.display().to_string();
+            let err = match open_retrying(config_b).await {
+                Ok(_) => panic!("expected open to fail with a mismatch"),
+                Err(e) => e,
+            };
+            assert!(matches!(err.code, ErrorCode::ModelMismatch));
+        });
+        drop(rt);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_for_reindex_without_rebuild_still_mismatches() {
+        // Opening in allow_mismatch mode must NOT write the new fingerprint:
+        // if the store is never rebuilt, the next normal open still reports
+        // E_MODEL_MISMATCH so stale chunks are never used silently (spec §9-5).
+        let n = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::path::PathBuf::from(format!("./target/skb-test-mismatch-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tok_a = dir.join("tokenizer-a.json");
+        let tok_b = dir.join("tokenizer-b.json");
+        write_fixture_tokenizer(&tok_a, "alpha");
+        write_fixture_tokenizer(&tok_b, "beta");
+
+        let mut config_a = Config::default();
+        config_a.embedding.onnx_path = "mock".to_string();
+        config_a.embedding.dimension = 8;
+        config_a.embedding.tokenizer = tok_a.display().to_string();
+        config_a.storage.path = dir.join("db");
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            // First open with tokenizer-a: fingerprint persisted.
+            open_retrying(config_a.clone()).await.unwrap();
+
+            // open_for_reindex with tokenizer-b succeeds in allow_mismatch mode.
+            let mut config_b = config_a.clone();
+            config_b.embedding.tokenizer = tok_b.display().to_string();
+            // Absorb the same transient file-lock race as open_retrying.
+            let mut opened = None;
+            for _ in 0..8 {
+                match KnowledgeBase::open_for_reindex(config_b.clone()).await {
+                    Ok(kb) => {
+                        opened = Some(kb);
+                        break;
+                    }
+                    Err(_) => tokio::time::sleep(std::time::Duration::from_millis(150)).await,
+                }
+            }
+            opened.expect("open_for_reindex must succeed");
+
+            // But the new fingerprint was NOT recorded: a normal open still
+            // reports E_MODEL_MISMATCH (rebuild required).
             let err = match open_retrying(config_b).await {
                 Ok(_) => panic!("expected open to fail with a mismatch"),
                 Err(e) => e,
