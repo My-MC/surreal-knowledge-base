@@ -27,15 +27,16 @@ impl MetaStore for Db {
 
 impl MetaStore for surrealdb::method::Transaction<surrealdb::engine::local::Db> {
     async fn set_meta(&self, key: &str, val: &str) -> Result<(), SkbError> {
-        let query = format!(
-            "INSERT INTO meta (key, meta_value) VALUES ('{key}', '{val}') \
-             ON DUPLICATE KEY UPDATE meta_value = '{val}'"
-        );
-        self.query(&query)
-            .await
-            .map_err(|e| SkbError::new(ErrorCode::Db, format!("set_meta: {e}")))?
-            .check()
-            .map_err(|e| SkbError::new(ErrorCode::Db, format!("set_meta check: {e}")))?;
+        self.query(
+            "INSERT INTO meta (key, meta_value) VALUES ($key, $val) \
+             ON DUPLICATE KEY UPDATE meta_value = $val",
+        )
+        .bind(("key", key))
+        .bind(("val", val))
+        .await
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("set_meta: {e}")))?
+        .check()
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("set_meta check: {e}")))?;
         Ok(())
     }
 }
@@ -100,10 +101,10 @@ impl Db {
     }
 
     pub async fn get_meta(&self, key: &str) -> Result<Option<String>, SkbError> {
-        let query = format!("SELECT meta_value FROM meta WHERE key = '{key}'");
         let mut r = self
             .db
-            .query(&query)
+            .query("SELECT meta_value FROM meta WHERE key = $key")
+            .bind(("key", key))
             .await
             .map_err(|e| SkbError::new(ErrorCode::Db, format!("get_meta: {e}")))?;
         let rows: Vec<serde_json::Value> = r
@@ -115,12 +116,13 @@ impl Db {
     }
 
     pub async fn set_meta(&self, key: &str, val: &str) -> Result<(), SkbError> {
-        let query = format!(
-            "INSERT INTO meta (key, meta_value) VALUES ('{key}', '{val}') \
-             ON DUPLICATE KEY UPDATE meta_value = '{val}'"
-        );
         self.db
-            .query(&query)
+            .query(
+                "INSERT INTO meta (key, meta_value) VALUES ($key, $val) \
+                 ON DUPLICATE KEY UPDATE meta_value = $val",
+            )
+            .bind(("key", key))
+            .bind(("val", val))
             .await
             .map_err(|e| SkbError::new(ErrorCode::Db, format!("set_meta: {e}")))?
             .check()
