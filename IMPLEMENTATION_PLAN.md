@@ -272,7 +272,7 @@ Phase 0〜8 で確定した方針（`tokenizers`、SurrealKV 組込み、ORT 静
 
 ✅ 実装済み: `EntityExtractor`トレイト + `RuleBasedExtractor`（WikiLink `[[target|alias]]`、frontmatter tags/aliases、Markdownリンク、inline tag、見出し、重複排除）。見出し境界優先のチャンキング（窓内の次見出し直前で分割、`Chunk.heading`を保存・永続化）、見出し階層の`related_to("part-of")`リンク（stack 方式で祖先と接続）。`SearchHit`に`title`/`source`/`highlights`(keyword)/`matched_entities`(graph拡張)を追加。N-hop拡張（`related_to`をホップ数分追跡）と再ランク（元スコア×ホップ減衰で統合ソート）。あわせて hybrid RRF の既存バグ（`row["id"]`参照で全行が空キーに集約）を修正。
 
-### 9-5: Reindex・進捗（部分完了）
+### 9-5: Reindex・進捗（完了）
 
 - `KnowledgeBase::open` は `Db::migrate` より前に保存済みの `embedding_model` と `embedding_dimension` を現在値と比較し、mismatch時は `E_MODEL_MISMATCH` を返してschema、field、index、metaを変更しない。dimension変更はreindex経路でのみ実施し、migrateはモデル一致時または本当に不足している定義への適用に限る。
 - reindexを起動時のmodel mismatch状態から実行できる管理経路を用意する。
@@ -281,11 +281,16 @@ Phase 0〜8 で確定した方針（`tokenizers`、SurrealKV 組込み、ORT 静
 - MCP progress notificationとCLI progress barを実装する。
 - **完了条件**: dimension変更、HNSW再構築、metadata更新、途中失敗rollback、再起動復旧、progressのテストが緑。
 
-✅ 実装済み: `open` を `migrate` 前にモデル/次元比較（新規DBは `INFO FOR DB` で判定し初期化パス）、`open_for_reindex`（mismatch 状態から開く管理経路、CLI/MCP の reindex は `E_MODEL_MISMATCH` 時に自動フォールバック）。dimension 変更は (1) 単一トランザクションで旧chunk/mentions削除 + embeddingフィールド再定義 → (2) ドキュメント単位再構築 → (3) HNSWインデックス再定義 → (4) meta更新 の順で実行し、遷移直後に次元metaを更新して中断状態を常に検出可能に（再実行で完了）。`reindex` は進捗コールバック `(done, total)` を受け、MCP は progress notification（`notifications/progress`）、CLI は stderr に `reindexed n/total` を出力。
+✅ 実装済み: `open` を `migrate` 前にモデル/次元比較（新規DBは `INFO FOR DB` で判定し初期化パス）、`open_for_reindex`（mismatch 状態から開く管理経路、CLI/MCP の reindex は `E_MODEL_MISMATCH` 時に自動フォールバック）。dimension 変更は (1) 単一トランザクションで旧chunk/mentions削除 + embeddingフィールド再定義 → (2) ドキュメント単位再構築 → (3) HNSWインデックス再定義 → (4) meta更新 の順で実行し、遷移直後に次元metaを更新して中断状態を常に検出可能に（再実行で完了）。`reindex` は進捗コールバック `(done, total)` を受け、MCP は progress notification（`notifications/progress`）、CLI は stderr に `
+reindexed n/total` を出力。
 
 ※ SurrealDB 3.2.3 の制約: `DEFINE INDEX` の再構築は同一トランザクション内の未コミット DELETE を参照できないため、wipe+再定義と HNSW 再構築を分割した。中断・失敗時は必ず `E_MODEL_MISMATCH` で検出され、`reindex` 再実行で復旧する（完全 rollback は遷移トランザクション内のみ）。
 
+<<<<<<< HEAD
 ### 9-6: CLI・MCP parity（完了）
+=======
+### 9-6: CLI・MCP parity（部分完了）
+>>>>>>> parent of 5934b32 (Revert "feat: reindex consistency, mismatch recovery and progress")
 
 - CLIの複数パス、glob、`graph entity add`、`skb query`、doctor JSON、progress表示を仕様へ合わせる。
 - listの`chunk_count`、deleteの`chunks_deleted`、不存在documentの`E_DOCUMENT_NOT_FOUND`を実装する。

@@ -192,9 +192,9 @@ impl ServerHandler for SkbServer {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, rmcp::ErrorData> {
-        let result = self.handle_tool(request).await;
+        let result = self.handle_tool(request, &context).await;
         match result {
             Ok(val) => Ok(CallToolResult::success(vec![text_content(&val)]).into()),
             Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(e)]).into()),
@@ -297,7 +297,11 @@ fn all_tools() -> Result<Vec<ToolDef>, rmcp::ErrorData> {
 struct NoParams {}
 
 impl SkbServer {
-    async fn handle_tool(&self, req: CallToolRequestParams) -> Result<Value, String> {
+    async fn handle_tool(
+        &self,
+        req: CallToolRequestParams,
+        context: &rmcp::service::RequestContext<RoleServer>,
+    ) -> Result<Value, String> {
         let args = req.arguments.unwrap_or_default();
         let kb = self.kb.lock().await;
 
@@ -374,7 +378,28 @@ impl SkbServer {
             "skb_reindex" => {
                 let params: ReindexRequest = serde_json::from_value(Value::Object(args))
                     .map_err(|e| valid_err(&format!("invalid reindex parameters: {e}")))?;
-                kb.reindex(&params)
+                let progress: Option<Box<skb_core::reindex::ProgressFn>> =
+                    context.meta.get_progress_token().map(|token| {
+                        let peer = context.peer.clone();
+                        Box::new(move |done: usize, total: usize| {
+                            let peer = peer.clone();
+                            let token = token.clone();
+                            tokio::spawn(async move {
+                                let notification = rmcp::model::Notification::new(
+                                    rmcp::model::ProgressNotificationParam::new(token, done as f64)
+                                        .with_total(total as f64),
+                                );
+                                let _ = peer
+                                    .send_notification(
+                                        rmcp::model::ServerNotification::ProgressNotification(
+                                            notification,
+                                        ),
+                                    )
+                                    .await;
+                            });
+                        }) as Box<skb_core::reindex::ProgressFn>
+                    });
+                kb.reindex(&params, progress.as_deref())
                     .await
                     .map(|r| serde_json::to_value(r).unwrap_or_default())
                     .map_err(|e| format!("{e}"))
@@ -392,7 +417,16 @@ async fn main() -> Result<()> {
         .init();
 
     let config = Config::load().unwrap_or_default();
-    let kb = KnowledgeBase::open(config).await?;
+    // In a model/tokenizer mismatch state, start anyway so `skb_reindex`
+    // can rebuild the database (spec §9-5).
+    let kb = match KnowledgeBase::open(config.clone()).await {
+        Ok(kb) => kb,
+        Err(e) if e.code == skb_core::error::ErrorCode::ModelMismatch => {
+            tracing::warn!("model mismatch detected; starting for reindex");
+            KnowledgeBase::open_for_reindex(config).await?
+        }
+        Err(e) => return Err(e.into()),
+    };
     let server = SkbServer::new(kb);
 
     tracing::info!("MCP server starting (stdio)");
