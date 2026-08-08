@@ -115,11 +115,14 @@ jobs:
           chmod +x npm/packages/linux-x64/bin/skb-mcp
       - name: Check shared library dependencies
         run: |
-          ldd npm/packages/linux-x64/bin/skb-mcp
-          ldd npm/packages/linux-x64/bin/skb-mcp 2>&1 | (! grep -q libonnxruntime)
-          ldd npm/packages/linux-x64/bin/skb-mcp 2>&1 | (! grep -q libssl)
-          ldd npm/packages/linux-x64/bin/skb-mcp 2>&1 | (! grep -q libcrypto)
-          ldd npm/packages/linux-x64/bin/skb-mcp 2>&1 | (! grep -q libstdc++)
+          BIN=npm/packages/linux-x64/bin/skb-mcp
+          ldd "$BIN"
+          for lib in libonnxruntime libssl libcrypto libstdc++; do
+            if ldd "$BIN" 2>&1 | grep -q "$lib"; then
+              echo "unexpected dynamic dependency: $lib"
+              exit 1
+            fi
+          done
       - name: Check GLIBC floor
         run: |
           echo "Max GLIBC version required:"
@@ -180,10 +183,12 @@ jobs:
           BIN=npm-out/packages/linux-arm64/bin/skb-mcp
           chmod +x "$BIN"
           ldd "$BIN"
-          ldd "$BIN" 2>&1 | (! grep -q libonnxruntime)
-          ldd "$BIN" 2>&1 | (! grep -q libssl)
-          ldd "$BIN" 2>&1 | (! grep -q libcrypto)
-          ldd "$BIN" 2>&1 | (! grep -q libstdc++)
+          for lib in libonnxruntime libssl libcrypto libstdc++; do
+            if ldd "$BIN" 2>&1 | grep -q "$lib"; then
+              echo "unexpected dynamic dependency: $lib"
+              exit 1
+            fi
+          done
       - name: MCP E2E flow (initialize -> tools/list -> upload -> search)
         run: |
           cat > skb.toml << EOF
@@ -211,7 +216,10 @@ jobs:
           BIN=npm-out/packages/darwin-arm64/bin/skb-mcp
           chmod +x "$BIN"
           otool -L "$BIN"
-          otool -L "$BIN" 2>&1 | (! grep -q libonnxruntime)
+          if otool -L "$BIN" 2>&1 | grep -q libonnxruntime; then
+            echo "libonnxruntime must not be linked"
+            exit 1
+          fi
       - name: MCP E2E flow (initialize -> tools/list -> upload -> search)
         run: |
           cat > skb.toml << EOF
