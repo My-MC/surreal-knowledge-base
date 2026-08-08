@@ -51,10 +51,6 @@ pub async fn reindex(
         .get_meta("embedding_dimension")
         .await?
         .and_then(|v| v.parse::<usize>().ok());
-    let stored_model = db.get_meta("embedding_model").await?;
-    let model_changed = stored_model
-        .as_deref()
-        .is_some_and(|m| m != config.embedding.model);
     let dimension_changed = stored_dim.is_some_and(|d| d != dimension);
 
     // Get all documents
@@ -157,9 +153,9 @@ pub async fn reindex(
         update_metas(db, embedder, tokenizer, config).await?;
     } else {
         result = rebuild_all(db, embedder, tokenizer, config, &docs, progress).await?;
-        if model_changed {
-            update_metas(db, embedder, tokenizer, config).await?;
-        }
+        // Always refresh metadata after a successful rebuild: even a
+        // tokenizer-only change must record the new fingerprint (§5.4).
+        update_metas(db, embedder, tokenizer, config).await?;
     }
 
     Ok(result)
