@@ -6,6 +6,10 @@ pub trait Embed: Send + Sync {
     fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, SkbError>;
 }
 
+/// Dimension of the mock embedder; treated as the model's detected dimension
+/// so that explicit `embedding.dimension` values are validated against it.
+pub const MOCK_EMBEDDER_DIMENSION: usize = 8;
+
 pub struct MockEmbedder {
     pub dimension: usize,
 }
