@@ -390,20 +390,29 @@ pub(crate) async fn sync_tokenizer_meta(
 }
 
 /// Persist the tokenizer metadata unconditionally (used after a successful
-/// reindex, spec §5.4 rule 3).
-pub(crate) async fn save_tokenizer_meta(
-    db: &Db,
+/// reindex, spec §5.4 rule 3). Generic over the store so it can run inside a
+/// transaction.
+pub(crate) async fn save_tokenizer_meta<S: crate::db::MetaStore>(
+    store: &S,
     config: &Config,
     source: &str,
     meta: &TokenizerMeta,
 ) -> Result<(), SkbError> {
-    db.set_meta("tokenizer", &config.embedding.tokenizer)
+    store
+        .set_meta("tokenizer", &config.embedding.tokenizer)
         .await?;
-    db.set_meta("tokenizer_source", source).await?;
-    db.set_meta("tokenizer_algorithm", &meta.algorithm).await?;
-    db.set_meta("tokenizer_fingerprint_schema", TOKENIZER_FINGERPRINT_SCHEMA)
+    store.set_meta("tokenizer_source", source).await?;
+    store
+        .set_meta("tokenizer_algorithm", &meta.algorithm)
         .await?;
-    db.set_meta("tokenizer_fingerprint", &meta.fingerprint)
+    store
+        .set_meta("tokenizer_version", &meta.tokenizers_version)
+        .await?;
+    store
+        .set_meta("tokenizer_fingerprint_schema", TOKENIZER_FINGERPRINT_SCHEMA)
+        .await?;
+    store
+        .set_meta("tokenizer_fingerprint", &meta.fingerprint)
         .await?;
     Ok(())
 }

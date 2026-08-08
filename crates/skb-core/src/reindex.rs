@@ -263,27 +263,47 @@ async fn rebuild_all(
 }
 
 /// Record the resolved model/tokenizer metadata after a successful rebuild
-/// (spec §5.4 rule 3).
+/// (spec §5.4 rule 3). All writes share one transaction so a partial failure
+/// cannot leave stale model/dimension/fingerprint metadata behind.
 async fn update_metas(
     db: &Db,
     embedder: &dyn Embed,
     tokenizer: &dyn Tokenize,
     config: &Config,
 ) -> Result<(), SkbError> {
-    db.set_meta("embedding_model", &config.embedding.model)
+    let tx = db
+        .db
+        .clone()
+        .begin()
+        .await
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex begin: {e}")))?;
+    let result = async {
+        tx.set_meta("embedding_model", &config.embedding.model)
+            .await?;
+        tx.set_meta("embedding_dimension", &embedder.dimension().to_string())
+            .await?;
+        tx.set_meta(
+            "embedding_max_input_tokens",
+            &embedder.max_input_tokens().to_string(),
+        )
         .await?;
-    db.set_meta("embedding_dimension", &embedder.dimension().to_string())
-        .await?;
-    db.set_meta(
-        "embedding_max_input_tokens",
-        &config.embedding.max_input_tokens.to_string(),
-    )
-    .await?;
-    db.set_meta("schema_version", "1").await?;
-    let source = crate::tokenizer_source_for(config);
-    let meta = crate::tokenizer_fingerprint(&source, &tokenizer.config_json()?)?;
-    crate::save_tokenizer_meta(db, config, &source, &meta).await?;
-    Ok(())
+        tx.set_meta("schema_version", "1").await?;
+        let source = crate::tokenizer_source_for(config);
+        let meta = crate::tokenizer_fingerprint(&source, &tokenizer.config_json()?)?;
+        crate::save_tokenizer_meta(&tx, config, &source, &meta).await?;
+        Ok::<(), SkbError>(())
+    }
+    .await;
+    match result {
+        Ok(()) => tx
+            .commit()
+            .await
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex meta commit: {e}"))),
+        Err(e) => {
+            let _ = tx.cancel().await;
+            Err(e)
+        }
+    }
 }
 
 /// Replace one document's chunks and mentions within the supplied transaction.
