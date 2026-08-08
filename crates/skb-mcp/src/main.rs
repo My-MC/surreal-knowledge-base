@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, GetPromptRequestParams,
@@ -11,10 +11,13 @@ use rmcp::model::{
 use rmcp::service::serve_server;
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::transport::io::stdio;
+use schemars::JsonSchema;
 use serde_json::{json, Value};
 use skb_core::config::Config;
+use skb_core::crud::{DeleteDocumentRequest, GetDocumentRequest, ListQuery};
 use skb_core::graph::{EntityInfo, GraphQueryRequest, LinkInfo};
 use skb_core::ingest::UploadRequest;
+use skb_core::reindex::ReindexRequest;
 use skb_core::search::SearchRequest;
 use skb_core::KnowledgeBase;
 use std::sync::Arc;
@@ -57,88 +60,7 @@ impl ServerHandler for SkbServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, rmcp::ErrorData> {
-        let tools = vec![
-            tool(
-                "skb_upload",
-                "Upload document (path, url, content, or content_base64)",
-                &[
-                    ("path", "string"),
-                    ("url", "string"),
-                    ("content", "string"),
-                    ("content_base64", "string"),
-                    ("title", "string"),
-                    ("tags", "string"),
-                    ("metadata", "object"),
-                    ("force", "boolean"),
-                ],
-            ),
-            tool(
-                "skb_search",
-                "Search documents (hybrid, vector, or keyword)",
-                &[
-                    ("query", "string"),
-                    ("mode", "string"),
-                    ("top_k", "integer"),
-                    ("graph_expand", "integer"),
-                    ("filter", "object"),
-                ],
-            ),
-            tool(
-                "skb_list_documents",
-                "List all documents",
-                &[
-                    ("limit", "integer"),
-                    ("offset", "integer"),
-                    ("order", "string"),
-                ],
-            ),
-            tool(
-                "skb_get_document",
-                "Get document details",
-                &[("id", "string"), ("include_chunks", "boolean")],
-            ),
-            tool(
-                "skb_delete_document",
-                "Delete a document",
-                &[("id", "string")],
-            ),
-            tool("skb_stats", "Show statistics", &[]),
-            tool(
-                "skb_graph_query",
-                "Query knowledge graph",
-                &[
-                    ("from", "string"),
-                    ("relation", "string"),
-                    ("depth", "integer"),
-                    ("limit", "integer"),
-                ],
-            ),
-            tool(
-                "skb_graph_upsert_entity",
-                "Create or update entity",
-                &[
-                    ("name", "string"),
-                    ("kind", "string"),
-                    ("description", "string"),
-                ],
-            ),
-            tool(
-                "skb_graph_link",
-                "Link two entities",
-                &[
-                    ("from", "string"),
-                    ("to", "string"),
-                    ("relation", "string"),
-                    ("weight", "number"),
-                ],
-            ),
-            tool_optional(
-                "skb_reindex",
-                "Reindex all documents",
-                &[("dry_run", "boolean")],
-            ),
-        ];
-        Ok(ListToolsResult::with_all_items(tools))
+        Ok(ListToolsResult::with_all_items(all_tools()?))
     }
 
     async fn list_resources(
@@ -172,9 +94,23 @@ impl ServerHandler for SkbServer {
         let kb = self.kb.lock().await;
         let uri = request.uri.clone();
         let contents: Vec<ResourceContents> = if uri == "skb://documents" {
-            let docs = kb.list_documents(100, 0, None).await.map_err(err_data)?;
-            let body = serde_json::to_string_pretty(&docs)
-                .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+            // Bound the response: accumulate at most MAX_DOCUMENTS_RESOURCE
+            // entries so a large store cannot exhaust memory or produce an
+            // unbounded payload (spec §8.3). `document_snapshot` handles the
+            // paging internally, so the lock is acquired once instead of being
+            // re-taken per page; `truncated` is reported inside a valid JSON
+            // payload.
+            const MAX_DOCUMENTS_RESOURCE: usize = 10_000;
+            let (docs, truncated) = kb
+                .document_snapshot(MAX_DOCUMENTS_RESOURCE)
+                .await
+                .map_err(err_data)?;
+            let body = serde_json::to_string_pretty(&serde_json::json!({
+                "documents": docs,
+                "truncated": truncated,
+                "limit": MAX_DOCUMENTS_RESOURCE,
+            }))
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
             vec![ResourceContents::text(body, uri)]
         } else if uri == "skb://stats" {
             let stats = kb.stats().await.map_err(err_data)?;
@@ -183,9 +119,12 @@ impl ServerHandler for SkbServer {
             vec![ResourceContents::text(body, uri)]
         } else if let Some(id) = uri.strip_prefix("skb://documents/") {
             let doc = kb
-                .get_document(id, true)
+                .get_document(&GetDocumentRequest {
+                    id: id.to_string(),
+                    include_chunks: Some(true),
+                })
                 .await
-                .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+                .map_err(err_data)?;
             let body = serde_json::to_string_pretty(&doc)
                 .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
             vec![ResourceContents::text(body, uri)]
@@ -244,13 +183,32 @@ impl ServerHandler for SkbServer {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, rmcp::ErrorData> {
-        let result = self.handle_tool(request).await;
+        let result = self.handle_tool(request, &context).await;
         match result {
             Ok(val) => Ok(CallToolResult::success(vec![text_content(&val)]).into()),
             Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(e)]).into()),
         }
+    }
+}
+
+async fn send_progress(
+    peer: rmcp::service::Peer<RoleServer>,
+    token: rmcp::model::ProgressToken,
+    done: usize,
+    total: usize,
+) {
+    let notification = rmcp::model::Notification::new(
+        rmcp::model::ProgressNotificationParam::new(token, done as f64).with_total(total as f64),
+    );
+    if let Err(e) = peer
+        .send_notification(rmcp::model::ServerNotification::ProgressNotification(
+            notification,
+        ))
+        .await
+    {
+        tracing::warn!(error = %e, "progress notification send failed");
     }
 }
 
@@ -270,68 +228,95 @@ fn valid_err(msg: &str) -> String {
     skb_core::error::SkbError::new(skb_core::error::ErrorCode::Validation, msg.to_string())
         .to_string()
 }
-
-fn tool(
+/// Build a tool definition whose input schema is generated from a shared
+/// `skb-core` DTO (the same type the CLI serializes). Hand-written schemas are
+/// intentionally avoided so CLI and MCP can never drift apart. A conversion
+/// failure is a programmer error and is surfaced as an MCP protocol error.
+fn tool_def(
     name: &'static str,
     desc: &'static str,
-    params: &[(&'static str, &'static str)],
-) -> ToolDef {
-    tool_with_required(name, desc, params, params.len() <= 1)
+    schema: schemars::Schema,
+) -> Result<ToolDef, rmcp::ErrorData> {
+    let value = schema.to_value();
+    let input_schema = serde_json::from_value::<rmcp::model::JsonObject>(value).map_err(|e| {
+        rmcp::ErrorData::internal_error(
+            format!("internal error: generated schema for '{name}' is not an object: {e}"),
+            None,
+        )
+    })?;
+    Ok(ToolDef::new(name, desc, input_schema))
 }
 
-fn tool_optional(
-    name: &'static str,
-    desc: &'static str,
-    params: &[(&'static str, &'static str)],
-) -> ToolDef {
-    tool_with_required(name, desc, params, false)
+fn all_tools() -> Result<Vec<ToolDef>, rmcp::ErrorData> {
+    Ok(vec![
+        tool_def(
+            "skb_upload",
+            "Upload a document. Exactly one of path, url, content, content_base64 is required",
+            schemars::schema_for!(UploadRequest),
+        )?,
+        tool_def(
+            "skb_search",
+            "Search documents (hybrid, vector, or keyword)",
+            schemars::schema_for!(SearchRequest),
+        )?,
+        tool_def(
+            "skb_list_documents",
+            "List all documents",
+            schemars::schema_for!(ListQuery),
+        )?,
+        tool_def(
+            "skb_get_document",
+            "Get document details",
+            schemars::schema_for!(GetDocumentRequest),
+        )?,
+        tool_def(
+            "skb_delete_document",
+            "Delete a document",
+            schemars::schema_for!(DeleteDocumentRequest),
+        )?,
+        tool_def(
+            "skb_stats",
+            "Show statistics",
+            schemars::schema_for!(NoParams),
+        )?,
+        tool_def(
+            "skb_graph_query",
+            "Query knowledge graph",
+            schemars::schema_for!(GraphQueryRequest),
+        )?,
+        tool_def(
+            "skb_graph_upsert_entity",
+            "Create or update entity",
+            schemars::schema_for!(EntityInfo),
+        )?,
+        tool_def(
+            "skb_graph_link",
+            "Link two entities",
+            schemars::schema_for!(LinkInfo),
+        )?,
+        tool_def(
+            "skb_reindex",
+            "Reindex all documents",
+            schemars::schema_for!(ReindexRequest),
+        )?,
+    ])
 }
 
-fn tool_with_required(
-    name: &'static str,
-    desc: &'static str,
-    params: &[(&'static str, &'static str)],
-    required_single: bool,
-) -> ToolDef {
-    let mut props = serde_json::Map::new();
-    for (pname, ptype) in params {
-        props.insert(pname.to_string(), json!({"type": *ptype}));
-    }
-    let required: Vec<Value> = if required_single {
-        params.iter().map(|(n, _)| json!(n)).collect()
-    } else {
-        vec![]
-    };
-    let input_schema = json!({
-        "type": "object",
-        "properties": props,
-        "required": required,
-    });
-    let input_schema =
-        serde_json::from_value::<rmcp::model::JsonObject>(input_schema).unwrap_or_default();
-    ToolDef::new(name, desc, input_schema)
-}
+/// Degenerate request type for tools without parameters (`skb_stats`).
+#[derive(JsonSchema)]
+struct NoParams {}
 
 impl SkbServer {
-    async fn handle_tool(&self, req: CallToolRequestParams) -> Result<Value, String> {
+    async fn handle_tool(
+        &self,
+        req: CallToolRequestParams,
+        context: &rmcp::service::RequestContext<RoleServer>,
+    ) -> Result<Value, String> {
         let args = req.arguments.unwrap_or_default();
         let kb = self.kb.lock().await;
 
         match req.name.as_ref() {
             "skb_upload" => {
-                let has_source = [
-                    args.get("path"),
-                    args.get("url"),
-                    args.get("content"),
-                    args.get("content_base64"),
-                ]
-                .iter()
-                .any(|v| v.is_some_and(|value| !value.is_null()));
-                if !has_source {
-                    return Err(valid_err(
-                        "skb_upload requires one of: path, url, content, content_base64",
-                    ));
-                }
                 let params: UploadRequest = serde_json::from_value(Value::Object(args))
                     .map_err(|e| valid_err(&format!("invalid upload parameters: {e}")))?;
                 kb.upload(params)
@@ -340,9 +325,6 @@ impl SkbServer {
                     .map_err(|e| format!("{e}"))
             }
             "skb_search" => {
-                if !args.contains_key("query") {
-                    return Err(valid_err("skb_search requires 'query'"));
-                }
                 let params: SearchRequest = serde_json::from_value(Value::Object(args))
                     .map_err(|e| valid_err(&format!("invalid search parameters: {e}")))?;
                 kb.search(params)
@@ -351,37 +333,25 @@ impl SkbServer {
                     .map_err(|e| format!("{e}"))
             }
             "skb_list_documents" => {
-                let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
-                let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                let order = args
-                    .get("order")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                kb.list_documents(limit, offset, order)
+                let params: ListQuery = serde_json::from_value(Value::Object(args))
+                    .map_err(|e| valid_err(&format!("invalid list parameters: {e}")))?;
+                kb.list_documents(&params)
                     .await
                     .map(|r| serde_json::to_value(r).unwrap_or_default())
                     .map_err(|e| format!("{e}"))
             }
             "skb_get_document" => {
-                let id = args.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                if id.is_empty() {
-                    return Err(valid_err("skb_get_document requires 'id'"));
-                }
-                let include_chunks = args
-                    .get("include_chunks")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                kb.get_document(id, include_chunks)
+                let params: GetDocumentRequest = serde_json::from_value(Value::Object(args))
+                    .map_err(|e| valid_err(&format!("invalid get parameters: {e}")))?;
+                kb.get_document(&params)
                     .await
                     .map(|r| serde_json::to_value(r).unwrap_or_default())
                     .map_err(|e| format!("{e}"))
             }
             "skb_delete_document" => {
-                let id = args.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                if id.is_empty() {
-                    return Err(valid_err("skb_delete_document requires 'id'"));
-                }
-                kb.delete_document(id)
+                let params: DeleteDocumentRequest = serde_json::from_value(Value::Object(args))
+                    .map_err(|e| valid_err(&format!("invalid delete parameters: {e}")))?;
+                kb.delete_document(&params)
                     .await
                     .map(|r| serde_json::to_value(r).unwrap_or_default())
                     .map_err(|e| format!("{e}"))
@@ -416,51 +386,72 @@ impl SkbServer {
                     .map_err(|e| format!("{e}"))
             }
             "skb_reindex" => {
-                let req = reindex_request(&args);
-                kb.reindex(&req)
-                    .await
+                let params: ReindexRequest = serde_json::from_value(Value::Object(args))
+                    .map_err(|e| valid_err(&format!("invalid reindex parameters: {e}")))?;
+                // Throttle progress notifications so a slow client cannot
+                // accumulate an unbounded number of in-flight sends: emit at
+                // most one per PROGRESS_EVERY documents, always the final one.
+                // A bounded channel + single worker serializes sends and
+                // backpressures the callback. `try_send` returns the message
+                // on a full channel, so the final notification is always
+                // retained even under backpressure.
+                const PROGRESS_EVERY: usize = 10;
+                let (progress, worker_handle) = match context.meta.get_progress_token() {
+                    Some(token) => {
+                        let (tx, mut rx) =
+                            tokio::sync::mpsc::channel::<(usize, usize)>(PROGRESS_EVERY * 2);
+                        let peer = context.peer.clone();
+                        let worker_token = token.clone();
+                        // Holds the latest (done, total) that could not be
+                        // queued because the channel was full. The worker sends
+                        // it after the channel closes so the final notification
+                        // is never dropped under backpressure.
+                        let pending_final: std::sync::Arc<
+                            std::sync::Mutex<Option<(usize, usize)>>,
+                        > = std::sync::Arc::new(std::sync::Mutex::new(None));
+                        let worker_final = pending_final.clone();
+                        let handle = tokio::spawn(async move {
+                            while let Some((done, total)) = rx.recv().await {
+                                send_progress(peer.clone(), worker_token.clone(), done, total)
+                                    .await;
+                            }
+                            let last = {
+                                let mut guard = worker_final.lock().unwrap();
+                                guard.take()
+                            };
+                            if let Some((done, total)) = last {
+                                send_progress(peer.clone(), worker_token.clone(), done, total)
+                                    .await;
+                            }
+                        });
+                        let callback: Box<skb_core::reindex::ProgressFn> =
+                            Box::new(move |done: usize, total: usize| {
+                                if done != total && !done.is_multiple_of(PROGRESS_EVERY) {
+                                    return;
+                                }
+                                if tx.try_send((done, total)).is_err() && done == total {
+                                    *pending_final.lock().unwrap() = Some((done, total));
+                                }
+                            });
+                        (Some(callback), Some(handle))
+                    }
+                    None => (None, None),
+                };
+                let result = kb.reindex(&params, progress.as_deref()).await;
+                // Drop the callback (releasing the sender) so the worker's
+                // channel closes, then wait for it to flush every queued
+                // notification — including the final done == total — before
+                // returning the tool result.
+                drop(progress);
+                if let Some(handle) = worker_handle {
+                    let _ = handle.await;
+                }
+                result
                     .map(|r| serde_json::to_value(r).unwrap_or_default())
                     .map_err(|e| format!("{e}"))
             }
             name => Err(format!("unknown tool: {name}")),
         }
-    }
-}
-
-fn reindex_request(args: &serde_json::Map<String, Value>) -> skb_core::reindex::ReindexRequest {
-    skb_core::reindex::ReindexRequest {
-        dry_run: args
-            .get("dry_run")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn reindex_tool_has_optional_dry_run() {
-        let tool = tool_optional(
-            "skb_reindex",
-            "Reindex all documents",
-            &[("dry_run", "boolean")],
-        );
-        let schema = serde_json::to_value(tool.input_schema).unwrap();
-        assert_eq!(schema["required"], serde_json::json!([]));
-    }
-
-    #[test]
-    fn reindex_request_defaults_dry_run_to_false() {
-        let args = serde_json::Map::new();
-        assert!(!reindex_request(&args).dry_run);
-    }
-
-    #[test]
-    fn reindex_request_preserves_explicit_dry_run() {
-        let args = serde_json::from_value(serde_json::json!({"dry_run": true})).unwrap();
-        assert!(reindex_request(&args).dry_run);
     }
 }
 
@@ -471,8 +462,17 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let config = Config::load().unwrap_or_default();
-    let kb = KnowledgeBase::open(config).await?;
+    let config = Config::load().context("failed to load config")?;
+    // In a model/tokenizer mismatch state, start anyway so `skb_reindex`
+    // can rebuild the database (spec §9-5).
+    let kb = match KnowledgeBase::open(config.clone()).await {
+        Ok(kb) => kb,
+        Err(e) if e.code == skb_core::error::ErrorCode::ModelMismatch => {
+            tracing::warn!("model mismatch detected; starting for reindex");
+            KnowledgeBase::open_for_reindex(config).await?
+        }
+        Err(e) => return Err(e.into()),
+    };
     let server = SkbServer::new(kb);
 
     tracing::info!("MCP server starting (stdio)");
@@ -481,4 +481,121 @@ async fn main() -> Result<()> {
     running.waiting().await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tool_schema(name: &str) -> Value {
+        let tools = all_tools().unwrap();
+        let tool = tools
+            .iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("tool {name} not found"));
+        serde_json::to_value(&tool.input_schema).unwrap()
+    }
+
+    #[test]
+    fn every_tool_schema_is_a_valid_object() {
+        for tool in all_tools().unwrap() {
+            let value = serde_json::to_value(&tool.input_schema).unwrap();
+            assert_eq!(value["type"], json!("object"), "tool: {}", tool.name);
+            assert!(
+                value["properties"].is_object() || value["properties"].is_null(),
+                "tool {} must have object properties",
+                tool.name
+            );
+            assert!(
+                value["required"].is_array() || value["required"].is_null(),
+                "tool: {}",
+                tool.name
+            );
+        }
+    }
+
+    #[test]
+    fn upload_tool_has_one_of_with_four_sources() {
+        let schema = tool_schema("skb_upload");
+        let one_of = schema["oneOf"].as_array().expect("oneOf missing");
+        assert_eq!(one_of.len(), 4);
+        assert!(one_of.iter().any(|e| e["required"] == json!(["path"])));
+        assert!(one_of.iter().any(|e| e["required"] == json!(["url"])));
+        assert!(one_of.iter().any(|e| e["required"] == json!(["content"])));
+        assert!(one_of
+            .iter()
+            .any(|e| e["required"] == json!(["content_base64"])));
+    }
+
+    #[test]
+    fn search_tool_requires_query_and_enumerates_mode() {
+        let schema = tool_schema("skb_search");
+        assert_eq!(schema["required"], json!(["query"]));
+        assert_eq!(
+            schema["$defs"]["SearchMode"]["enum"],
+            json!(["hybrid", "vector", "keyword"])
+        );
+        assert_eq!(schema["properties"]["top_k"]["minimum"], 1);
+    }
+
+    #[test]
+    fn graph_query_tool_requires_from_with_depth_range() {
+        let schema = tool_schema("skb_graph_query");
+        assert_eq!(schema["required"], json!(["from"]));
+        assert_eq!(schema["properties"]["depth"]["minimum"], 1);
+        assert_eq!(schema["properties"]["depth"]["maximum"], 5);
+    }
+
+    #[test]
+    fn get_and_delete_tools_require_id() {
+        assert_eq!(tool_schema("skb_get_document")["required"], json!(["id"]));
+        assert_eq!(
+            tool_schema("skb_delete_document")["required"],
+            json!(["id"])
+        );
+    }
+
+    #[test]
+    fn entity_tool_requires_name_and_kind() {
+        let schema = tool_schema("skb_graph_upsert_entity");
+        assert_eq!(schema["required"], json!(["name", "kind"]));
+    }
+
+    #[test]
+    fn link_tool_requires_from_to_and_relation() {
+        let schema = tool_schema("skb_graph_link");
+        assert_eq!(schema["required"], json!(["from", "to", "relation"]));
+        assert_eq!(schema["properties"]["weight"]["minimum"], 0.0);
+    }
+
+    #[test]
+    fn list_tool_has_no_required_fields() {
+        let schema = tool_schema("skb_list_documents");
+        assert!(
+            schema["required"].is_null() || schema["required"] == json!([]),
+            "list must have no required fields"
+        );
+    }
+
+    #[test]
+    fn reindex_tool_has_optional_dry_run() {
+        let schema = tool_schema("skb_reindex");
+        assert!(
+            schema["required"].is_null() || schema["required"] == json!([]),
+            "reindex must have no required fields"
+        );
+        assert_eq!(schema["properties"]["dry_run"]["type"], json!("boolean"));
+    }
+
+    #[test]
+    fn reindex_request_defaults_dry_run_to_false() {
+        let params: ReindexRequest = serde_json::from_value(json!({})).unwrap();
+        assert!(!params.dry_run);
+    }
+
+    #[test]
+    fn reindex_request_preserves_explicit_dry_run() {
+        let params: ReindexRequest = serde_json::from_value(json!({"dry_run": true})).unwrap();
+        assert!(params.dry_run);
+    }
 }

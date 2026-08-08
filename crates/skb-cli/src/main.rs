@@ -1,12 +1,14 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use skb_core::config::Config;
+use skb_core::crud::{DeleteDocumentRequest, GetDocumentRequest, ListQuery, OrderBy};
 use skb_core::graph::{EntityInfo, GraphQueryRequest, LinkInfo};
 use skb_core::ingest::UploadRequest;
 use skb_core::search::SearchRequest;
 use skb_core::KnowledgeBase;
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{Read, Write};
+use std::str::FromStr;
 
 #[derive(Parser)]
 #[command(name = "skb", version, about = "Surreal Knowledge Base CLI")]
@@ -20,10 +22,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Upload a document
+    /// Upload documents (multiple paths, glob patterns, --recursive for dirs)
     Upload {
-        #[arg(long)]
-        path: Option<String>,
+        #[arg(help = "files or glob patterns to upload")]
+        paths: Vec<String>,
         #[arg(long)]
         url: Option<String>,
         #[arg(long)]
@@ -38,7 +40,7 @@ enum Commands {
         metadata: Option<String>,
         #[arg(long, help = "upload all files under a directory path")]
         recursive: bool,
-        #[arg(long, help = "read base64-encoded content from stdin")]
+        #[arg(long, conflicts_with_all = ["paths", "url"], requires = "stdin", help = "read base64-encoded content from stdin")]
         base64: bool,
     },
     /// Search documents
@@ -86,6 +88,8 @@ enum Commands {
         #[arg(long, help = "report what a reindex would do without mutating")]
         dry_run: bool,
     },
+    /// Execute raw SurrealQL (advanced; not available via MCP)
+    Query { surql: String },
     /// Configuration management
     Config {
         #[command(subcommand)]
@@ -192,7 +196,7 @@ async fn async_main() -> std::process::ExitCode {
     let fmt = cli.format.clone();
 
     match run(&cli).await {
-        Ok(()) => std::process::ExitCode::SUCCESS,
+        Ok(code) => std::process::ExitCode::from(code),
         Err(e) => {
             emit_error(&fmt, &e);
             std::process::ExitCode::from(exit_code_of(&e))
@@ -225,7 +229,7 @@ fn exit_code_of(e: &anyhow::Error) -> u8 {
         .unwrap_or(1)
 }
 
-async fn run(cli: &Cli) -> Result<()> {
+async fn run(cli: &Cli) -> Result<u8> {
     let fmt = cli.format.clone();
     match &cli.command {
         Commands::List {
@@ -234,12 +238,24 @@ async fn run(cli: &Cli) -> Result<()> {
             order,
         } => {
             let kb = KnowledgeBase::open(cfg()?).await?;
-            let docs = kb.list_documents(*limit, *offset, order.clone()).await?;
+            let order = order.as_deref().map(OrderBy::from_str).transpose()?;
+            let docs = kb
+                .list_documents(&ListQuery {
+                    limit: Some(*limit),
+                    offset: Some(*offset),
+                    order,
+                })
+                .await?;
             output(&docs, &fmt)?;
         }
         Commands::Get { id, chunks } => {
             let kb = KnowledgeBase::open(cfg()?).await?;
-            let doc = kb.get_document(id, *chunks).await?;
+            let doc = kb
+                .get_document(&GetDocumentRequest {
+                    id: id.clone(),
+                    include_chunks: Some(*chunks),
+                })
+                .await?;
             output(&doc, &fmt)?;
         }
         Commands::Delete { id, yes } => {
@@ -247,7 +263,9 @@ async fn run(cli: &Cli) -> Result<()> {
                 anyhow::bail!("use --yes to confirm deletion of {id}");
             }
             let kb = KnowledgeBase::open(cfg()?).await?;
-            let result = kb.delete_document(id).await?;
+            let result = kb
+                .delete_document(&DeleteDocumentRequest { id: id.clone() })
+                .await?;
             output(&result, &fmt)?;
         }
         Commands::Stats => {
@@ -256,12 +274,51 @@ async fn run(cli: &Cli) -> Result<()> {
             output(&stats, &fmt)?;
         }
         Commands::Doctor => {
-            let kb = KnowledgeBase::open(cfg()?).await?;
+            // In a model/tokenizer mismatch state the normal open refuses to
+            // operate; `doctor` must still run to diagnose the mismatch, so
+            // fall back to the diagnostic load path (read-only) (§9-5).
+            let config = cfg()?;
+            let kb = match KnowledgeBase::open(config.clone()).await {
+                Ok(kb) => kb,
+                Err(e) if e.code == skb_core::error::ErrorCode::ModelMismatch => {
+                    KnowledgeBase::open_for_reindex(config).await?
+                }
+                Err(e) => return Err(e.into()),
+            };
             let report = kb.doctor().await?;
-            println!("{report}");
+            if fmt == "table" {
+                println!("=== SKB Doctor ===");
+                println!(
+                    "DB connection: {}",
+                    if report.db_connected {
+                        "[OK]"
+                    } else {
+                        "[FAIL]"
+                    }
+                );
+                println!("Embedding dim: {}", report.embedding_dimension);
+                println!("Tokenizer vocab: {}", report.tokenizer_vocab);
+                println!("Model: {}", report.model);
+                println!("Schema ver: {}", report.schema_version);
+                for error in &report.errors {
+                    println!("[ERROR] {error}");
+                }
+                if report.is_healthy() {
+                    println!("Status: healthy");
+                } else {
+                    println!("Status: {} problem(s) found", report.errors.len());
+                }
+            } else {
+                output(&report, &fmt)?;
+            }
+        }
+        Commands::Query { surql } => {
+            let kb = KnowledgeBase::open(cfg()?).await?;
+            let result = kb.query_surql(surql).await?;
+            output(&result, &fmt)?;
         }
         Commands::Upload {
-            path,
+            paths,
             url,
             stdin,
             title,
@@ -271,6 +328,17 @@ async fn run(cli: &Cli) -> Result<()> {
             recursive,
             base64,
         } => {
+            // Exactly one input source may be given (spec §12.3); a conflict
+            // between --stdin, --url, and paths is rejected before opening the
+            // database or expanding paths.
+            let active_sources = [*stdin, url.is_some(), !paths.is_empty()]
+                .into_iter()
+                .filter(|present| *present)
+                .count();
+            if active_sources > 1 {
+                anyhow::bail!("specify exactly one of --stdin, --url, or paths, not several");
+            }
+
             let kb = KnowledgeBase::open(cfg()?).await?;
             let meta: HashMap<String, String> = metadata
                 .as_ref()
@@ -278,28 +346,61 @@ async fn run(cli: &Cli) -> Result<()> {
                 .transpose()?
                 .unwrap_or_default();
 
-            // Expand a directory path into individual files when --recursive.
-            let mut paths: Vec<String> = Vec::new();
-            if *recursive {
-                if let Some(p) = path {
-                    let p = std::path::Path::new(p);
-                    if p.is_dir() {
-                        for entry in collect_files(p)? {
-                            paths.push(entry.display().to_string());
+            // Expand positional paths: glob patterns, and directories when
+            // --recursive (spec §12.2: 複数・glob・--recursive).
+            let mut expanded: Vec<String> = Vec::new();
+            for pattern in paths {
+                if pattern.contains(['*', '?', '[']) {
+                    let entries = glob::glob(pattern)
+                        .map_err(|e| anyhow::anyhow!("invalid glob '{pattern}': {e}"))?;
+                    let mut matched = false;
+                    for entry in entries {
+                        let path = entry.map_err(|e| anyhow::anyhow!("glob '{pattern}': {e}"))?;
+                        matched = true;
+                        if *recursive && path.is_dir() {
+                            for file in collect_files(&path)? {
+                                expanded.push(file.display().to_string());
+                            }
+                        } else if path.is_dir() {
+                            anyhow::bail!(
+                                "no files to upload: matched directory '{}'; use --recursive",
+                                path.display()
+                            );
+                        } else if path.is_file() {
+                            expanded.push(path.display().to_string());
                         }
-                    } else {
-                        paths.push(p.display().to_string());
+                    }
+                    if !matched {
+                        anyhow::bail!("no files match '{pattern}'");
                     }
                 } else {
-                    anyhow::bail!("--recursive requires --path to a directory");
+                    let path = std::path::Path::new(pattern);
+                    if *recursive && path.is_dir() {
+                        for file in collect_files(path)? {
+                            expanded.push(file.display().to_string());
+                        }
+                    } else if path.is_dir() {
+                        anyhow::bail!("no files to upload: input is a directory; use --recursive");
+                    } else {
+                        expanded.push(pattern.clone());
+                    }
                 }
-            } else if let Some(p) = path {
-                paths.push(p.clone());
+            }
+            // A glob matching only directories (non-recursive) leaves `expanded`
+            // empty even though the user did provide inputs; report that with a
+            // dedicated message instead of the misleading "no input" error.
+            if !paths.is_empty() && expanded.is_empty() {
+                anyhow::bail!(
+                    "no files to upload: matched entries are directories; use --recursive"
+                );
             }
 
-            let build = |p: Option<String>, c: Option<String>, b64: Option<String>| UploadRequest {
+            let build = |p: Option<String>,
+                         u: Option<String>,
+                         c: Option<String>,
+                         b64: Option<String>| UploadRequest {
                 path: p,
-                url: url.clone(),
+                url: u,
                 content: c,
                 content_base64: b64,
                 title: title.clone(),
@@ -309,27 +410,67 @@ async fn run(cli: &Cli) -> Result<()> {
             };
 
             if *stdin {
-                let mut content = String::new();
-                if *base64 {
-                    let mut raw = Vec::new();
-                    std::io::stdin().read_to_end(&mut raw)?;
-                    content = String::from_utf8(raw)?;
-                    let result = kb.upload(build(None, None, Some(content))).await?;
-                    output(&result, &fmt)?;
+                // Bound stdin reads by upload.max_file_mb (spec §12.3).
+                let max = kb.config().upload.max_file_mb.saturating_mul(1024 * 1024);
+                let read_cap = max.saturating_add(1);
+                let mut raw = Vec::new();
+                std::io::stdin().take(read_cap).read_to_end(&mut raw)?;
+                if raw.len() as u64 > max {
+                    anyhow::bail!("stdin exceeds upload.max_file_mb");
+                }
+                let content = String::from_utf8(raw)?;
+                let req = if *base64 {
+                    build(None, None, None, Some(content))
                 } else {
-                    std::io::stdin().read_to_string(&mut content)?;
-                    let result = kb.upload(build(None, Some(content), None)).await?;
-                    output(&result, &fmt)?;
-                }
-            } else if !paths.is_empty() {
-                let mut results = Vec::new();
-                for p in paths {
-                    results.push(kb.upload(build(Some(p), None, None)).await?);
-                }
-                output(&results, &fmt)?;
-            } else {
-                let result = kb.upload(build(path.clone(), None, None)).await?;
+                    build(None, None, Some(content), None)
+                };
+                let result = kb.upload(req).await?;
                 output(&result, &fmt)?;
+            } else if expanded.len() > 1 {
+                // Multi-input uploads: successful uploads are committed and
+                // returned in `results`, failures are aggregated in `errors`
+                // (spec §12.3). A single input keeps the direct UploadResult
+                // shape with top-level document_id/status fields.
+                let mut results: Vec<serde_json::Value> = Vec::new();
+                let mut errors: Vec<serde_json::Value> = Vec::new();
+                for p in expanded {
+                    match kb.upload(build(Some(p.clone()), None, None, None)).await {
+                        Ok(result) => results.push(serde_json::to_value(result)?),
+                        Err(e) => errors.push(serde_json::json!({
+                            "input": p,
+                            "error": skb_core::error::ErrorCode::from_std(&e)
+                                .map(|c| c.code_str().to_string())
+                                .unwrap_or_else(|| "E_INTERNAL".to_string()),
+                            "message": format!("{e:#}"),
+                        })),
+                    }
+                }
+                // Multi-input uploads always report {results, errors}; any
+                // failure makes the command exit non-zero so callers can
+                // detect partial failure (spec §12.3).
+                output(
+                    &serde_json::json!({ "results": results, "errors": errors }),
+                    &fmt,
+                )?;
+                if !errors.is_empty() {
+                    // The JSON payload is already on stdout; exit non-zero
+                    // without emitting a second error document. Returning the
+                    // code (rather than std::process::exit) lets the embedded
+                    // SurrealKv connection drop and flush normally.
+                    let _ = std::io::stdout().flush();
+                    return Ok(1);
+                }
+            } else if url.is_some() {
+                // Single URL upload keeps the direct UploadResult shape.
+                let result = kb.upload(build(None, url.clone(), None, None)).await?;
+                output(&result, &fmt)?;
+            } else if expanded.len() == 1 {
+                // Single input keeps the direct UploadResult shape.
+                let p = expanded.into_iter().next().expect("len == 1");
+                let result = kb.upload(build(Some(p), None, None, None)).await?;
+                output(&result, &fmt)?;
+            } else {
+                anyhow::bail!("no input: provide paths, --url, or --stdin");
             }
         }
         Commands::Search {
@@ -356,7 +497,7 @@ async fn run(cli: &Cli) -> Result<()> {
                 .collect::<Result<_, _>>()?;
             let req = SearchRequest {
                 query: query.clone(),
-                mode: Some(mode.clone()),
+                mode: Some(mode.parse()?),
                 top_k: Some(*top_k),
                 graph_expand: *graph_expand,
                 filter: if filter.is_empty() {
@@ -417,9 +558,25 @@ async fn run(cli: &Cli) -> Result<()> {
             }
         }
         Commands::Reindex { dry_run } => {
-            let kb = KnowledgeBase::open(cfg()?).await?;
+            // A model/dimension/tokenizer mismatch blocks normal open; reindex
+            // is the management path out of that state (spec §9-5).
+            let config = cfg()?;
+            let kb = match KnowledgeBase::open(config.clone()).await {
+                Ok(kb) => kb,
+                Err(e) if e.code == skb_core::error::ErrorCode::ModelMismatch => {
+                    KnowledgeBase::open_for_reindex(config).await?
+                }
+                Err(e) => return Err(e.into()),
+            };
             let req = skb_core::reindex::ReindexRequest { dry_run: *dry_run };
-            let result = kb.reindex(&req).await?;
+            let progress = |done: usize, total: usize| {
+                eprint!("\rreindexed {done}/{total}");
+                let _ = std::io::Write::flush(&mut std::io::stderr());
+            };
+            let result = kb.reindex(&req, Some(&progress)).await?;
+            // The progress callback printed a partial line; terminate it so
+            // the shell prompt does not appear on the same line.
+            eprintln!();
             output(&result, &fmt)?;
         }
         Commands::Config { cmd } => match cmd {
@@ -437,7 +594,7 @@ async fn run(cli: &Cli) -> Result<()> {
         },
     }
 
-    Ok(())
+    Ok(0)
 }
 
 /// `skb config set storage.path './db'`: write a dotted key into the writable
@@ -509,5 +666,22 @@ fn parse_scalar_item(raw: &str) -> toml_edit::Item {
 }
 
 fn cfg() -> Result<Config> {
-    Config::load().or_else(|_| Ok(Config::default()))
+    Config::load()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn upload_base64_requires_stdin() {
+        assert!(Cli::try_parse_from(["skb", "upload", "--base64"]).is_err());
+        assert!(Cli::try_parse_from(["skb", "upload", "--base64", "a.md"]).is_err());
+        assert!(
+            Cli::try_parse_from(["skb", "upload", "--base64", "--url", "https://x.example/a"])
+                .is_err()
+        );
+        assert!(Cli::try_parse_from(["skb", "upload", "--base64", "--stdin"]).is_ok());
+    }
 }

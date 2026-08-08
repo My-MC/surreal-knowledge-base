@@ -215,7 +215,7 @@ fn bench_search(c: &mut Criterion) {
     for mode in &["vector", "keyword", "hybrid"] {
         let req = SearchRequest {
             query: "database vector search".into(),
-            mode: Some(mode.to_string()),
+            mode: Some(mode.parse().unwrap()),
             top_k: Some(10),
             graph_expand: None,
             filter: None,

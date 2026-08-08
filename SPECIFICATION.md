@@ -283,6 +283,16 @@ LLM 抽出は `EntityExtractor` トレイトの差し替え実装として将来
    - `meta` テーブルを新モデル情報で更新。
 3. チャンク長のみの変更も、既存ドキュメントへの反映には同じ `reindex` が必要（新規アップロード分には即時反映される）。
 
+> **依存更新時の fingerprint 互換性（§5.4 規則 3 の運用）**: `tokenizers` クレートまたは
+> serde_json 等のシリアライザを更新し、同じ `tokenizer.json` に対する canonical JSON 出力が
+> 変わった場合、schema version（`TOKENIZER_FINGERPRINT_SCHEMA`）が同一でも fingerprint は
+> 変化し `E_MODEL_MISMATCH` になる。fingerprint には `tokenizers` のバージョン（`tokenizer_version`）
+> も含まれるため、`tokenizers` のメジャー/マイナー更新は通常この不一致を引き起こす。
+> 対応手順: (a) 影響のない変更か fingerprint 差の確認、(b) canonicalization 規則や対象フィールドを
+> 変えた場合のみ `TOKENIZER_FINGERPRINT_SCHEMA` を更新、(c) 利用者は `skb reindex` を実行する。
+> `tokenizer_version` / `tokenizer_fingerprint_schema` は `meta` に保存されるため `skb doctor`
+> で確認できる。
+
 ※ reindex は全件再処理のため、大規模データでは長時間化する。進捗通知（§7.1）に対応する。
 
 ---
@@ -312,29 +322,29 @@ impl KnowledgeBase {
 
     // 資料管理
     pub async fn upload(&self, req: UploadRequest) -> Result<UploadResult>;
-    pub async fn list_documents(&self, q: ListQuery) -> Result<Page<DocumentSummary>>;
-    pub async fn get_document(&self, id: &str, opts: GetOptions) -> Result<DocumentDetail>;
-    pub async fn delete_document(&self, id: &str) -> Result<DeleteResult>;
+    pub async fn list_documents(&self, q: &ListQuery) -> Result<Vec<DocumentSummary>>;
+    pub async fn get_document(&self, req: &GetDocumentRequest) -> Result<DocumentDetail>;
+    pub async fn delete_document(&self, req: &DeleteDocumentRequest) -> Result<DeleteResult>;
 
     // 検索
     pub async fn search(&self, req: SearchRequest) -> Result<SearchResponse>;
 
     // グラフ
-    pub async fn graph_query(&self, req: GraphQueryRequest) -> Result<GraphQueryResponse>;
-    pub async fn upsert_entity(&self, req: EntityRequest) -> Result<Entity>;
-    pub async fn link(&self, req: LinkRequest) -> Result<LinkResult>;
+    pub async fn graph_query(&self, req: &GraphQueryRequest) -> Result<GraphQueryResponse>;
+    pub async fn upsert_entity(&self, entity: &EntityInfo) -> Result<()>;
+    pub async fn link_entities(&self, link: &LinkInfo) -> Result<()>;
 
     // 管理
     pub async fn stats(&self) -> Result<Stats>;
     pub async fn doctor(&self) -> Result<DoctorReport>;  // 環境診断
-    pub async fn reindex(&self, req: ReindexRequest) -> Result<ReindexResult>; // モデル/チャンク設定変更の全件反映（§5.4）
+    pub async fn reindex(&self, req: &ReindexRequest, progress: Option<&ProgressFn>) -> Result<ReindexResult>; // モデル/チャンク設定変更の全件反映（§5.4）
 }
 ```
 
 - すべての Request/Response 型は `Serialize`/`Deserialize`/`JsonSchema` を derive し、**CLI の JSON 入出力と MCP ツールスキーマの双方をこの型から生成**する。
 - 非同期（`tokio`）。長時間処理（upload）は内部で進捗コールバックを受け取れる設計とし、MCP では progress notification、CLI ではプログレスバーへ写像する。
 
-上記は v1 の目標API契約である。共通 `JsonSchema`、進捗コールバック、CLI/MCPの同一DTOは Phase 9-2、9-6 の完了条件で検証する。
+上記は v1 の目標API契約である。全 Request/Response 型は `Serialize`/`Deserialize`/`JsonSchema` を derive し、MCP ツールスキーマは CLI と同じ `skb-core` DTO から自動生成される（Phase 9-2 完了）。進捗コールバック（Phase 9-5 完了）と CLI/MCP のゴールデン契約テスト（Phase 9-6 完了）も実装済みである。
 
 ### 7.2 設定
 
@@ -396,7 +406,7 @@ v1 では stdio トランスポートのみを提供する。HTTP トランス�
 |---|---|---|---|
 | 1 | `skb_upload` | 資料をアップロード | `path?`, `url?`, `content?`, `content_base64?`, `title?`, `tags?`, `metadata?`, `force?` |
 | 2 | `skb_search` | 検索 | `query`, `mode?=hybrid`, `top_k?=10`, `filter?`, `graph_expand?=0` |
-| 3 | `skb_list_documents` | 一覧 | `limit?=50`, `offset?=0`, `order?=updated_desc` |
+| 3 | `skb_list_documents` | 一覧 | `limit?=50`, `offset?=0`, `order?=created_desc`（`created_desc` / `created_asc` / `title_asc` / `title_desc`） |
 | 4 | `skb_get_document` | 取得 | `id`, `include_chunks?=false` |
 | 5 | `skb_delete_document` | 削除 | `id` |
 | 6 | `skb_graph_query` | グラフ探索 | `from`（entity名 or document id）, `relation?`, `depth?=1`, `limit?=50` |

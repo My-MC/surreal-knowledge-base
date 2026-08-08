@@ -3,5 +3,8 @@ resolver = "2"
 members = ["crates/skb-core", "crates/skb-cli", "crates/skb-mcp"]
 exclude = ["spike"]
 
+[workspace.dependencies]
+schemars = { version = "1.2", features = ["derive"] }
+
 [profile.release]
 strip = "symbols"
