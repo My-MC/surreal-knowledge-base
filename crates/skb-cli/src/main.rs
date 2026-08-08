@@ -426,6 +426,15 @@ async fn run(cli: &Cli) -> Result<()> {
                     let _ = std::io::stdout().flush();
                     std::process::exit(1);
                 }
+            } else if url.is_some() {
+                // Single URL upload keeps the direct UploadResult shape.
+                let result = kb.upload(build(None, None, None)).await?;
+                output(&result, &fmt)?;
+            } else if expanded.len() == 1 {
+                // Single input keeps the direct UploadResult shape.
+                let p = expanded.into_iter().next().expect("len == 1");
+                let result = kb.upload(build(Some(p), None, None)).await?;
+                output(&result, &fmt)?;
             } else {
                 anyhow::bail!("no input: provide paths, --url, or --stdin");
             }

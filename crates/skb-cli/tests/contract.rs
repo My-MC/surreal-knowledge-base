@@ -360,17 +360,17 @@ fn contract_upload_glob_and_multiple_paths() {
     let pattern = format!("{}/*.md", docs.display());
     let val = run_skb(&["upload", &pattern], None);
     assert_eq!(
-        val.as_array().unwrap().len(),
+        val["results"].as_array().unwrap().len(),
         2,
         "glob must match both md files"
     );
+    assert_eq!(val["errors"].as_array().unwrap().len(), 0);
 
+    // A single input keeps the direct UploadResult shape (no results/errors
+    // wrapper); multi-input uploads always report {results, errors}.
     let val = run_skb(&["upload", docs.join("c.txt").to_str().unwrap()], None);
-    assert_eq!(
-        val.as_array().unwrap().len(),
-        1,
-        "multiple/positional paths"
-    );
+    assert_eq!(val["status"], "created");
+    assert!(val["document_id"].is_string());
 
     let list = run_skb(&["list"], None);
     assert_eq!(list.as_array().unwrap().len(), 3);
