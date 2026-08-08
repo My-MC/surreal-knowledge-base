@@ -7,7 +7,7 @@ use skb_core::ingest::UploadRequest;
 use skb_core::search::SearchRequest;
 use skb_core::KnowledgeBase;
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::str::FromStr;
 
 #[derive(Parser)]
@@ -364,13 +364,18 @@ async fn run(cli: &Cli) -> Result<()> {
                         })),
                     }
                 }
-                if errors.is_empty() {
-                    output(&results, &fmt)?;
-                } else {
-                    output(
-                        &serde_json::json!({ "results": results, "errors": errors }),
-                        &fmt,
-                    )?;
+                // Multi-input uploads always report {results, errors}; any
+                // failure makes the command exit non-zero so callers can
+                // detect partial failure (spec §12.3).
+                output(
+                    &serde_json::json!({ "results": results, "errors": errors }),
+                    &fmt,
+                )?;
+                if !errors.is_empty() {
+                    // The JSON payload is already on stdout; exit non-zero
+                    // without emitting a second error document.
+                    let _ = std::io::stdout().flush();
+                    std::process::exit(1);
                 }
             } else {
                 let result = kb.upload(build(path.clone(), None, None)).await?;
