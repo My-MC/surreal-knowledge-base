@@ -657,5 +657,5 @@ fn parse_scalar_item(raw: &str) -> toml_edit::Item {
 }
 
 fn cfg() -> Result<Config> {
-    Config::load().or_else(|_| Ok(Config::default()))
+    Config::load()
 }

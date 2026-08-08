@@ -320,7 +320,11 @@ impl Config {
         if self.search.top_k > crate::search::MAX_TOP_K {
             return Err(SkbError::new(
                 ErrorCode::Validation,
-                format!("search.top_k must be at most {}", crate::search::MAX_TOP_K),
+                format!(
+                    "search.top_k ({}) must be at most {}",
+                    self.search.top_k,
+                    crate::search::MAX_TOP_K
+                ),
             ));
         }
         if self.search.rrf_k == 0 {
