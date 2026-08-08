@@ -462,25 +462,9 @@ async fn run(cli: &Cli) -> Result<()> {
             }
         }
         Commands::Reindex { dry_run } => {
-            // A model/dimension/tokenizer mismatch blocks normal open; reindex
-            // is the management path out of that state (spec §9-5).
-            let config = cfg()?;
-            let kb = match KnowledgeBase::open(config.clone()).await {
-                Ok(kb) => kb,
-                Err(e) if e.code == skb_core::error::ErrorCode::ModelMismatch => {
-                    KnowledgeBase::open_for_reindex(config).await?
-                }
-                Err(e) => return Err(e.into()),
-            };
+            let kb = KnowledgeBase::open(cfg()?).await?;
             let req = skb_core::reindex::ReindexRequest { dry_run: *dry_run };
-            let progress = |done: usize, total: usize| {
-                eprint!("\rreindexed {done}/{total}");
-                let _ = std::io::Write::flush(&mut std::io::stderr());
-            };
-            let result = kb.reindex(&req, Some(&progress)).await?;
-            if !*dry_run {
-                eprintln!();
-            }
+            let result = kb.reindex(&req).await?;
             output(&result, &fmt)?;
         }
         Commands::Config { cmd } => match cmd {
