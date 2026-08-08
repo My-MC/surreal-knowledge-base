@@ -40,7 +40,7 @@ enum Commands {
         metadata: Option<String>,
         #[arg(long, help = "upload all files under a directory path")]
         recursive: bool,
-        #[arg(long, help = "read base64-encoded content from stdin")]
+        #[arg(long, conflicts_with_all = ["path", "url"], requires = "stdin", help = "read base64-encoded content from stdin")]
         base64: bool,
     },
     /// Search documents
@@ -581,4 +581,39 @@ fn parse_scalar_item(raw: &str) -> toml_edit::Item {
 
 fn cfg() -> Result<Config> {
     Config::load()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn upload_base64_requires_stdin() {
+        assert!(Cli::try_parse_from(["skb", "upload", "--base64"]).is_err());
+        assert!(Cli::try_parse_from(["skb", "upload", "--base64", "--path", "a.md"]).is_err());
+        assert!(
+            Cli::try_parse_from(["skb", "upload", "--base64", "--url", "https://x.example/a"])
+                .is_err()
+        );
+        assert!(Cli::try_parse_from(["skb", "upload", "--base64", "--stdin"]).is_ok());
+    }
+
+    #[test]
+    fn upload_rejects_multiple_input_sources() {
+        assert!(Cli::try_parse_from(["skb", "upload", "--path", "a.md", "--stdin"]).is_err());
+        assert!(Cli::try_parse_from([
+            "skb",
+            "upload",
+            "--path",
+            "a.md",
+            "--url",
+            "https://x.example/a"
+        ])
+        .is_err());
+        assert!(
+            Cli::try_parse_from(["skb", "upload", "--url", "https://x.example/a", "--stdin"])
+                .is_err()
+        );
+    }
 }
