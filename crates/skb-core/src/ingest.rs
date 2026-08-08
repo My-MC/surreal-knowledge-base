@@ -729,7 +729,12 @@ fn is_documentation_v6(v6: std::net::Ipv6Addr) -> bool {
 /// 64:ff9b::/96 — NAT64 well-known prefix (maps to IPv4 destinations).
 fn is_nat64_v6(v6: std::net::Ipv6Addr) -> bool {
     let s = v6.segments();
-    s[0] == 0x64 && s[1] == 0xff9b && s[2] == 0 && s[3] == 0
+    s[0] == 0x64
+        && s[1] == 0xff9b
+        && s[2] == 0
+        && s[3] == 0
+        && s[4] == 0
+        && s[5] == 0
 }
 
 fn base64_decode_checked(b64: &str, config: &Config) -> Result<Vec<u8>, SkbError> {
@@ -878,6 +883,14 @@ mod tests {
         for ip in extra_v6 {
             let ip: IpAddr = ip.parse().unwrap();
             assert!(is_blocked_ip(ip), "{ip} should be blocked");
+        }
+        // Only the complete 64:ff9b::/96 prefix is NAT64; an address with a
+        // non-zero segment inside the prefix must not match.
+        let not_nat64: Vec<&str> = vec!["64:ff9b:0:0:1::1", "64:ff9b:0:1::c000:0201"];
+        for ip in not_nat64 {
+            let v6: std::net::Ipv6Addr = ip.parse().unwrap();
+            assert!(!is_nat64_v6(v6), "{ip} must not match NAT64 /96");
+            assert!(!is_blocked_ip(v6.into()), "{ip} should be allowed");
         }
         let allowed: Vec<&str> = vec!["8.8.8.8", "1.1.1.1", "93.184.216.34", "2606:4700::1111"];
         for ip in allowed {
