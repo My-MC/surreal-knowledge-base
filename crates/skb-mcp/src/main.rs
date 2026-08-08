@@ -397,7 +397,7 @@ impl SkbServer {
                     context.meta.get_progress_token().map(|token| {
                         let peer = context.peer.clone();
                         Box::new(move |done: usize, total: usize| {
-                            if done != total && done % PROGRESS_EVERY != 0 {
+                            if done != total && !done.is_multiple_of(PROGRESS_EVERY) {
                                 return;
                             }
                             let peer = peer.clone();
