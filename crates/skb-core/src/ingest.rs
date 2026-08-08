@@ -619,7 +619,7 @@ impl ureq::unversioned::resolver::Resolver for SafeResolver {
         config: &ureq::config::Config,
         timeout: ureq::unversioned::transport::NextTimeout,
     ) -> Result<ureq::unversioned::resolver::ResolvedSocketAddrs, ureq::Error> {
-        use ureq::unversioned::resolver::{DefaultResolver, Resolver};
+        use ureq::unversioned::resolver::DefaultResolver;
         let addrs = DefaultResolver::default().resolve(uri, config, timeout)?;
         let mut result = self.empty();
         for addr in addrs.iter() {
