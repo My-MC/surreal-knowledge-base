@@ -20,10 +20,38 @@ pub const MAX_PROCESS_SECONDS: u64 = 30;
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[schemars(extend("oneOf" = [
-    {"required": ["path"]},
-    {"required": ["url"]},
-    {"required": ["content"]},
-    {"required": ["content_base64"]},
+    {
+        "required": ["path"],
+        "properties": {
+            "url": {"type": "null"},
+            "content": {"type": "null"},
+            "content_base64": {"type": "null"}
+        }
+    },
+    {
+        "required": ["url"],
+        "properties": {
+            "path": {"type": "null"},
+            "content": {"type": "null"},
+            "content_base64": {"type": "null"}
+        }
+    },
+    {
+        "required": ["content"],
+        "properties": {
+            "path": {"type": "null"},
+            "url": {"type": "null"},
+            "content_base64": {"type": "null"}
+        }
+    },
+    {
+        "required": ["content_base64"],
+        "properties": {
+            "path": {"type": "null"},
+            "url": {"type": "null"},
+            "content": {"type": "null"}
+        }
+    },
 ]))]
 pub struct UploadRequest {
     pub path: Option<String>,
@@ -97,7 +125,7 @@ pub async fn upload(
 ) -> Result<UploadResult, SkbError> {
     req.validate()?;
     let force = req.force.unwrap_or(false);
-    let doc = extract_document_data(req, config)?;
+    let doc = extract_document_data(req, config).await?;
     let existed = doc_exists(db, &doc.sha256).await?;
     if !force && existed {
         return Ok(UploadResult {
@@ -180,27 +208,21 @@ async fn store_and_index(
     embeddings: &[Vec<f32>],
     replace_existing: bool,
 ) -> Result<(String, Vec<String>), SkbError> {
+    let mut document_id: Option<String> = None;
     if replace_existing {
+        // Preserve the document's id (upsert semantics, spec §4.2): update the
+        // existing record in place and only replace chunks/mentions.
         let did = doc_id_by_sha(tx, &doc.sha256).await?;
+        document_id = Some(format!("document:{did}"));
         let record = surrealdb::types::RecordId::new("document", did);
         tx.query(
-            "DELETE FROM mentions WHERE in.document = $document; \
-             DELETE FROM chunk WHERE document = $document; \
-             DELETE $document;",
+            "UPDATE $document SET title = $title, source = $source, \
+             source_type = $source_type, sha256 = $sha256, content = $content, \
+             mime = $mime, tags = $tags, metadata = $metadata; \
+             DELETE FROM mentions WHERE in.document = $document; \
+             DELETE FROM chunk WHERE document = $document;",
         )
-        .bind(("document", record))
-        .await
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("upload replace: {e}")))?
-        .check()
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("upload replace check: {e}")))?;
-    }
-
-    let sql = "CREATE document SET title = $title, source = $source, \
-               source_type = $source_type, sha256 = $sha256, content = $content, \
-               mime = $mime, tags = $tags, metadata = $metadata \
-               RETURN string::concat('document:', meta::id(id)) AS did";
-    let mut r = tx
-        .query(sql)
+        .bind(("document", record.clone()))
         .bind(("title", doc.title.clone()))
         .bind(("source", doc.source.clone()))
         .bind(("source_type", doc.source_type.clone()))
@@ -210,17 +232,41 @@ async fn store_and_index(
         .bind(("tags", doc.tags.clone()))
         .bind(("metadata", doc.metadata.clone()))
         .await
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("upload doc: {e}")))?
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("upload replace: {e}")))?
         .check()
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("upload doc check: {e}")))?;
-    let rows: Vec<serde_json::Value> = r
-        .take(0)
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("upload doc take: {e}")))?;
-    let doc_id = rows
-        .first()
-        .and_then(|v| v["did"].as_str())
-        .ok_or_else(|| SkbError::new(ErrorCode::Db, "failed to get document id"))?
-        .to_string();
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("upload replace check: {e}")))?;
+    }
+
+    let doc_id = if let Some(existing) = document_id {
+        // Force re-upload keeps the existing record's id (upsert semantics).
+        existing
+    } else {
+        let sql = "CREATE document SET title = $title, source = $source, \
+                   source_type = $source_type, sha256 = $sha256, content = $content, \
+                   mime = $mime, tags = $tags, metadata = $metadata \
+                   RETURN string::concat('document:', meta::id(id)) AS did";
+        let mut r = tx
+            .query(sql)
+            .bind(("title", doc.title.clone()))
+            .bind(("source", doc.source.clone()))
+            .bind(("source_type", doc.source_type.clone()))
+            .bind(("sha256", doc.sha256.clone()))
+            .bind(("content", doc.content.clone()))
+            .bind(("mime", doc.mime.clone()))
+            .bind(("tags", doc.tags.clone()))
+            .bind(("metadata", doc.metadata.clone()))
+            .await
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("upload doc: {e}")))?
+            .check()
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("upload doc check: {e}")))?;
+        let rows: Vec<serde_json::Value> = r
+            .take(0)
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("upload doc take: {e}")))?;
+        rows.first()
+            .and_then(|v| v["did"].as_str())
+            .ok_or_else(|| SkbError::new(ErrorCode::Db, "failed to get document id"))?
+            .to_string()
+    };
     let document = surrealdb::types::RecordId::new("document", record_key(&doc_id)?);
 
     let chunk_sql = "CREATE chunk SET document = $document, idx = $idx, \
@@ -292,33 +338,45 @@ fn record_key(doc_id: &str) -> Result<&str, SkbError> {
         .ok_or_else(|| SkbError::new(ErrorCode::Db, "unexpected document id format"))
 }
 
-fn extract_document_data(req: UploadRequest, config: &Config) -> Result<DocumentData, SkbError> {
+async fn extract_document_data(
+    req: UploadRequest,
+    config: &Config,
+) -> Result<DocumentData, SkbError> {
     enum RawInput {
         Text(String),
         Bytes(Vec<u8>),
     }
 
+    // Filesystem and network reads must not block the async runtime; they run
+    // on a blocking thread (spawn_blocking) so the MCP server stays responsive
+    // while a large file or slow URL is being fetched (spec §12.3).
     let (raw, source, source_type, file_title, content_type_hint) = if let Some(path) = &req.path {
-        let path = std::path::Path::new(path);
-        validate_path(path, config)?;
-        let meta = std::fs::metadata(path)
-            .map_err(|e| SkbError::new(ErrorCode::Io, format!("stat file: {e}")))?;
-        check_size(meta.len(), config)?;
-        let bytes = read_file_bytes(path)?;
+        let source = path.clone();
+        let path = std::path::PathBuf::from(path);
         let ft = path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("untitled")
             .to_string();
-        (
-            RawInput::Bytes(bytes),
-            path.display().to_string(),
-            "file".to_string(),
-            ft,
-            None,
-        )
+        let config = config.clone();
+        let raw = tokio::task::spawn_blocking(move || -> Result<RawInput, SkbError> {
+            validate_path(&path, &config)?;
+            let meta = std::fs::metadata(&path)
+                .map_err(|e| SkbError::new(ErrorCode::Io, format!("stat file: {e}")))?;
+            check_size(meta.len(), &config)?;
+            let bytes = read_file_bytes(&path)?;
+            Ok(RawInput::Bytes(bytes))
+        })
+        .await
+        .map_err(|e| SkbError::new(ErrorCode::Io, format!("file read join: {e}")))??;
+        (raw, source, "file".to_string(), ft, None)
     } else if let Some(url) = &req.url {
-        let (bytes, content_type) = fetch_url(url, config)?;
+        let url_fetch = url.clone();
+        let config = config.clone();
+        let (bytes, content_type) =
+            tokio::task::spawn_blocking(move || fetch_url(&url_fetch, &config))
+                .await
+                .map_err(|e| SkbError::new(ErrorCode::Io, format!("url fetch join: {e}")))??;
         (
             RawInput::Bytes(bytes),
             url.clone(),
@@ -362,7 +420,7 @@ fn extract_document_data(req: UploadRequest, config: &Config) -> Result<Document
             (extract_text(&text, &source), mime_hint)
         }
         RawInput::Bytes(bytes) => {
-            extract_from_bytes(&bytes, &source, mime_hint.as_deref(), config)?
+            extract_from_bytes(&bytes, &source, mime_hint.as_deref(), config).await?
         }
     };
     check_size(content.len() as u64, config)?;
@@ -389,7 +447,7 @@ fn extract_document_data(req: UploadRequest, config: &Config) -> Result<Document
 
 /// Decode base64 as arbitrary binary (spec §12.2) and classify it: PDF by
 /// magic bytes, text by UTF-8 validity, anything else is rejected.
-fn extract_from_bytes(
+async fn extract_from_bytes(
     bytes: &[u8],
     source: &str,
     mime_hint: Option<&str>,
@@ -398,7 +456,7 @@ fn extract_from_bytes(
     check_size(bytes.len() as u64, config)?;
     let is_pdf = is_pdf_bytes(bytes) || mime_hint == Some("application/pdf");
     if is_pdf {
-        let text = extract_pdf_checked(bytes)?;
+        let text = extract_pdf_checked(bytes).await?;
         return Ok((text, Some("application/pdf".to_string())));
     }
     match std::str::from_utf8(bytes) {
@@ -420,11 +478,21 @@ fn is_pdf_bytes(bytes: &[u8]) -> bool {
 }
 
 /// Extract PDF text with resource guards: page count, wall-clock time and
-/// output size (PDF bomb mitigation, spec §12.3).
-fn extract_pdf_checked(bytes: &[u8]) -> Result<String, SkbError> {
-    let start = Instant::now();
-    let doc = lopdf::Document::load_mem(bytes)
-        .map_err(|e| SkbError::new(ErrorCode::Io, format!("pdf parse: {e}")))?;
+/// output size (PDF bomb mitigation, spec §12.3). The page-count check is the
+/// primary PDF-bomb defense; parsing and extraction run on blocking threads
+/// under a wall-clock timeout so a slow document cannot hang the request.
+async fn extract_pdf_checked(bytes: &[u8]) -> Result<String, SkbError> {
+    let doc = tokio::time::timeout(
+        Duration::from_secs(MAX_PROCESS_SECONDS),
+        tokio::task::spawn_blocking({
+            let bytes = bytes.to_vec();
+            move || lopdf::Document::load_mem(&bytes)
+        }),
+    )
+    .await
+    .map_err(|_| SkbError::new(ErrorCode::Validation, "pdf parsing exceeded time limit"))?
+    .map_err(|e| SkbError::new(ErrorCode::Io, format!("pdf parse join: {e}")))?
+    .map_err(|e| SkbError::new(ErrorCode::Io, format!("pdf parse: {e}")))?;
     let pages = doc.get_pages().len();
     if pages > MAX_PDF_PAGES {
         return Err(SkbError::new(
@@ -432,20 +500,19 @@ fn extract_pdf_checked(bytes: &[u8]) -> Result<String, SkbError> {
             format!("pdf has {pages} pages, limit is {MAX_PDF_PAGES}"),
         ));
     }
-    if start.elapsed() > Duration::from_secs(MAX_PROCESS_SECONDS) {
-        return Err(SkbError::new(
-            ErrorCode::Validation,
-            "pdf parsing exceeded time limit",
-        ));
-    }
-    let text = pdf_extract::extract_text_from_mem(bytes)
-        .map_err(|e| SkbError::new(ErrorCode::Io, format!("pdf extract: {e}")))?;
-    if start.elapsed() > Duration::from_secs(MAX_PROCESS_SECONDS) {
-        return Err(SkbError::new(
-            ErrorCode::Validation,
-            "pdf extraction exceeded time limit",
-        ));
-    }
+    // The extraction itself is synchronous and cannot be cancelled; the
+    // timeout bounds how long the caller waits.
+    let text = tokio::time::timeout(
+        Duration::from_secs(MAX_PROCESS_SECONDS),
+        tokio::task::spawn_blocking({
+            let bytes = bytes.to_vec();
+            move || pdf_extract::extract_text_from_mem(&bytes)
+        }),
+    )
+    .await
+    .map_err(|_| SkbError::new(ErrorCode::Validation, "pdf extraction exceeded time limit"))?
+    .map_err(|e| SkbError::new(ErrorCode::Io, format!("pdf extract join: {e}")))?
+    .map_err(|e| SkbError::new(ErrorCode::Io, format!("pdf extract: {e}")))?;
     Ok(text)
 }
 
@@ -509,16 +576,10 @@ fn html_to_text(html: &str) -> String {
 }
 
 fn read_file_bytes(path: &std::path::Path) -> Result<Vec<u8>, SkbError> {
-    let start = Instant::now();
-    let bytes =
-        std::fs::read(path).map_err(|e| SkbError::new(ErrorCode::Io, format!("read file: {e}")))?;
-    if start.elapsed() > Duration::from_secs(MAX_PROCESS_SECONDS) {
-        return Err(SkbError::new(
-            ErrorCode::Validation,
-            "file read exceeded time limit",
-        ));
-    }
-    Ok(bytes)
+    // `std::fs::read` is synchronous; a wall-clock check after it completes
+    // cannot interrupt the read, so it is intentionally omitted here. Size
+    // guarding happens before the read in the caller (spec §12.3).
+    std::fs::read(path).map_err(|e| SkbError::new(ErrorCode::Io, format!("read file: {e}")))
 }
 
 fn max_upload_bytes(config: &Config) -> u64 {
@@ -544,23 +605,32 @@ fn check_size(len: u64, config: &Config) -> Result<(), SkbError> {
 /// - DNS resolution validated before every request (private/loopback/
 ///   link-local/multicast/metadata addresses are rejected)
 /// - redirects are followed manually, re-validating each hop
-/// - size-limited streaming read, connect/global timeouts
+/// - size-limited streaming read; the whole fetch (all redirect hops) is
+///   bounded by one MAX_PROCESS_SECONDS deadline
 fn fetch_url(url_str: &str, config: &Config) -> Result<(Vec<u8>, Option<String>), SkbError> {
     let max_bytes = max_upload_bytes(config);
-    let agent = ureq::Agent::config_builder()
-        .max_redirects(0)
-        .http_status_as_error(false)
-        .timeout_connect(Some(Duration::from_secs(10)))
-        .timeout_global(Some(Duration::from_secs(MAX_PROCESS_SECONDS)))
-        .build()
-        .new_agent();
+    let deadline = Instant::now() + Duration::from_secs(MAX_PROCESS_SECONDS);
 
     let mut current = url_str.to_string();
     for _ in 0..=MAX_REDIRECTS {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(SkbError::new(
+                ErrorCode::Validation,
+                "url fetch exceeded time limit",
+            ));
+        }
         let url = Url::parse(&current)
             .map_err(|e| SkbError::new(ErrorCode::Validation, format!("invalid url: {e}")))?;
         validate_url_host(&url)?;
 
+        let agent = ureq::Agent::config_builder()
+            .max_redirects(0)
+            .http_status_as_error(false)
+            .timeout_connect(Some(Duration::from_secs(10)))
+            .timeout_global(Some(remaining))
+            .build()
+            .new_agent();
         let mut resp = agent
             .get(&current)
             .call()
@@ -729,7 +799,12 @@ fn is_documentation_v6(v6: std::net::Ipv6Addr) -> bool {
 /// 64:ff9b::/96 — NAT64 well-known prefix (maps to IPv4 destinations).
 fn is_nat64_v6(v6: std::net::Ipv6Addr) -> bool {
     let s = v6.segments();
-    s[0] == 0x64 && s[1] == 0xff9b && s[2] == 0 && s[3] == 0
+    s[0] == 0x64
+        && s[1] == 0xff9b
+        && s[2] == 0
+        && s[3] == 0
+        && s[4] == 0
+        && s[5] == 0
 }
 
 fn base64_decode_checked(b64: &str, config: &Config) -> Result<Vec<u8>, SkbError> {
@@ -878,6 +953,14 @@ mod tests {
         for ip in extra_v6 {
             let ip: IpAddr = ip.parse().unwrap();
             assert!(is_blocked_ip(ip), "{ip} should be blocked");
+        }
+        // Only the complete 64:ff9b::/96 prefix is NAT64; an address with a
+        // non-zero segment inside the prefix must not match.
+        let not_nat64: Vec<&str> = vec!["64:ff9b:0:0:1::1", "64:ff9b:0:1::c000:0201"];
+        for ip in not_nat64 {
+            let v6: std::net::Ipv6Addr = ip.parse().unwrap();
+            assert!(!is_nat64_v6(v6), "{ip} must not match NAT64 /96");
+            assert!(!is_blocked_ip(v6.into()), "{ip} should be allowed");
         }
         let allowed: Vec<&str> = vec!["8.8.8.8", "1.1.1.1", "93.184.216.34", "2606:4700::1111"];
         for ip in allowed {

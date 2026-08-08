@@ -28,6 +28,12 @@ use std::sync::Arc;
 /// the canonicalization rules or the covered fields change.
 pub const TOKENIZER_FINGERPRINT_SCHEMA: &str = "1";
 
+/// `tokenizers` crate version the fingerprint is bound to. Keep in sync with
+/// `crates/skb-core/Cargo.toml`; bumping `tokenizers` (or the serializer)
+/// changes the canonical JSON output, so a fingerprint mismatch is expected and
+/// users must `skb reindex` (§5.4 rule 3).
+pub const TOKENIZER_CRATE_VERSION: &str = "0.23";
+
 pub struct KnowledgeBase {
     db: Db,
     embedder: Arc<dyn Embed>,
@@ -129,6 +135,16 @@ impl KnowledgeBase {
             )
             .await?;
             db.set_meta("schema_version", "1").await?;
+        } else {
+            // Backfill embedding_max_input_tokens for stores created before the
+            // key existed; it is read by doctor and dimension/mismatch checks.
+            if db.get_meta("embedding_max_input_tokens").await?.is_none() {
+                db.set_meta(
+                    "embedding_max_input_tokens",
+                    &config.embedding.max_input_tokens.to_string(),
+                )
+                .await?;
+            }
         }
 
         // Tokenizer fingerprint: compute, then compare against the stored
@@ -348,6 +364,7 @@ fn resolve_tokenizer_path(config: &Config) -> Result<std::path::PathBuf, SkbErro
 pub(crate) struct TokenizerMeta {
     fingerprint: String,
     algorithm: String,
+    tokenizers_version: String,
 }
 
 /// Resolved tokenizer acquisition source used for fingerprinting: the model id
@@ -375,6 +392,7 @@ pub(crate) fn tokenizer_fingerprint(
         .to_string();
     let canonical = serde_json::to_string(&serde_json::json!({
         "schema": TOKENIZER_FINGERPRINT_SCHEMA,
+        "tokenizers": TOKENIZER_CRATE_VERSION,
         "source": source,
         "algorithm": algorithm,
         "config": config,
@@ -395,6 +413,7 @@ pub(crate) fn tokenizer_fingerprint(
     Ok(TokenizerMeta {
         fingerprint,
         algorithm,
+        tokenizers_version: TOKENIZER_CRATE_VERSION.to_string(),
     })
 }
 
@@ -415,26 +434,38 @@ pub(crate) async fn sync_tokenizer_meta(
                 "tokenizer fingerprint mismatch. Run reindex to rebuild with the new tokenizer.",
             ));
         }
-        return Ok(());
+        // Fingerprint matches: write the accompanying metadata back
+        // idempotently so stale/missing tokenizer, tokenizer_source and
+        // tokenizer_algorithm values from older stores are refreshed.
+        return save_tokenizer_meta(db, config, source, meta).await;
     }
     save_tokenizer_meta(db, config, source, meta).await
 }
 
 /// Persist the tokenizer metadata unconditionally (used after a successful
-/// reindex, spec §5.4 rule 3).
-pub(crate) async fn save_tokenizer_meta(
-    db: &Db,
+/// reindex, spec §5.4 rule 3). Generic over the store so it can run inside a
+/// transaction.
+pub(crate) async fn save_tokenizer_meta<S: crate::db::MetaStore>(
+    store: &S,
     config: &Config,
     source: &str,
     meta: &TokenizerMeta,
 ) -> Result<(), SkbError> {
-    db.set_meta("tokenizer", &config.embedding.tokenizer)
+    store
+        .set_meta("tokenizer", &config.embedding.tokenizer)
         .await?;
-    db.set_meta("tokenizer_source", source).await?;
-    db.set_meta("tokenizer_algorithm", &meta.algorithm).await?;
-    db.set_meta("tokenizer_fingerprint_schema", TOKENIZER_FINGERPRINT_SCHEMA)
+    store.set_meta("tokenizer_source", source).await?;
+    store
+        .set_meta("tokenizer_algorithm", &meta.algorithm)
         .await?;
-    db.set_meta("tokenizer_fingerprint", &meta.fingerprint)
+    store
+        .set_meta("tokenizer_version", &meta.tokenizers_version)
+        .await?;
+    store
+        .set_meta("tokenizer_fingerprint_schema", TOKENIZER_FINGERPRINT_SCHEMA)
+        .await?;
+    store
+        .set_meta("tokenizer_fingerprint", &meta.fingerprint)
         .await?;
     Ok(())
 }
@@ -451,6 +482,10 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    fn is_upload_source(name: &str) -> bool {
+        matches!(name, "path" | "url" | "content" | "content_base64")
+    }
 
     fn mock_config() -> Config {
         let n = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -563,6 +598,24 @@ mod tests {
             Ok(_) => panic!("expected open to fail"),
             Err(e) => e,
         }
+    }
+
+    /// Open and drop a KnowledgeBase, retrying transient embedded-SurrealKv
+    /// file-lock failures instead of relying on a fixed sleep. Only used for
+    /// in-process reopen sequences in tests.
+    async fn open_retrying(config: Config) -> Result<KnowledgeBase, SkbError> {
+        const ATTEMPTS: usize = 8;
+        let mut last = None;
+        for _ in 0..ATTEMPTS {
+            match KnowledgeBase::open(config.clone()).await {
+                Ok(kb) => return Ok(kb),
+                Err(e) => {
+                    last = Some(e);
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                }
+            }
+        }
+        Err(last.expect("ATTEMPTS is non-zero"))
     }
 
     #[tokio::test]
@@ -1072,22 +1125,27 @@ mod tests {
         config_a.storage.path = dir.join("db");
 
         // Closing an embedded SurrealKv releases its file lock asynchronously
-        // (the connection router task runs the datastore shutdown), so a short
-        // yield is needed before reopening the same path in-process.
+        // (the connection router task runs the datastore shutdown), so a reopen
+        // of the same path in-process may transiently fail on the file lock.
+        // open_retrying absorbs that race with bounded retries instead of a
+        // fixed sleep (test stability on slow CI).
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             // First open: fingerprint persisted.
-            KnowledgeBase::open(config_a.clone()).await.unwrap();
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            open_retrying(config_a.clone()).await.unwrap();
 
             // Restart with the same tokenizer: consistent.
-            KnowledgeBase::open(config_a.clone()).await.unwrap();
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            open_retrying(config_a.clone()).await.unwrap();
 
             // Different tokenizer file: E_MODEL_MISMATCH (reindex required).
+            // open_retrying also absorbs the transient file-lock race on this
+            // final reopen; the persistent mismatch surfaces as the last error.
             let mut config_b = config_a;
             config_b.embedding.tokenizer = tok_b.display().to_string();
-            let err = open_expecting_error(config_b).await;
+            let err = match open_retrying(config_b).await {
+                Ok(_) => panic!("expected open to fail with a mismatch"),
+                Err(e) => e,
+            };
             assert!(matches!(err.code, ErrorCode::ModelMismatch));
         });
         drop(rt);
@@ -1511,6 +1569,28 @@ mod tests {
         assert!(one_of
             .iter()
             .any(|e| e["required"] == serde_json::json!(["content_base64"])));
+        // Each oneOf branch must null out the alternative input sources so the
+        // branches are mutually exclusive (spec §12.3, one source only).
+        for e in one_of.iter() {
+            let required = e["required"].as_array().unwrap();
+            let required_name = required[0].as_str().unwrap();
+            let nulled = e["properties"]
+                .as_object()
+                .unwrap()
+                .iter()
+                .filter(|(name, _)| {
+                    name.as_str() != required_name && is_upload_source(name.as_str())
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                nulled.len(),
+                3,
+                "branch {required_name} must null 3 sources"
+            );
+            for (_, schema) in nulled {
+                assert_eq!(schema["type"], serde_json::json!("null"));
+            }
+        }
     }
 
     #[test]
