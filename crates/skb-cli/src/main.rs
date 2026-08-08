@@ -196,7 +196,7 @@ async fn async_main() -> std::process::ExitCode {
     let fmt = cli.format.clone();
 
     match run(&cli).await {
-        Ok(()) => std::process::ExitCode::SUCCESS,
+        Ok(code) => std::process::ExitCode::from(code),
         Err(e) => {
             emit_error(&fmt, &e);
             std::process::ExitCode::from(exit_code_of(&e))
@@ -229,7 +229,7 @@ fn exit_code_of(e: &anyhow::Error) -> u8 {
         .unwrap_or(1)
 }
 
-async fn run(cli: &Cli) -> Result<()> {
+async fn run(cli: &Cli) -> Result<u8> {
     let fmt = cli.format.clone();
     match &cli.command {
         Commands::List {
@@ -358,10 +358,31 @@ async fn run(cli: &Cli) -> Result<()> {
                     }
                 }
             }
+            // A glob matching only directories (non-recursive) leaves `expanded`
+            // empty even though the user did provide inputs; report that with a
+            // dedicated message instead of the misleading "no input" error.
+            if !paths.is_empty() && expanded.is_empty() {
+                anyhow::bail!(
+                    "no files to upload: matched entries are directories; use --recursive"
+                );
+            }
 
-            let build = |p: Option<String>, c: Option<String>, b64: Option<String>| UploadRequest {
+            // Exactly one input source may be given (spec §12.3); a conflict
+            // between --stdin, --url, and paths is rejected before any work.
+            let active_sources = [*stdin, url.is_some(), !paths.is_empty()]
+                .into_iter()
+                .filter(|present| *present)
+                .count();
+            if active_sources > 1 {
+                anyhow::bail!("specify exactly one of --stdin, --url, or paths, not several");
+            }
+
+            let build = |p: Option<String>,
+                         u: Option<String>,
+                         c: Option<String>,
+                         b64: Option<String>| UploadRequest {
                 path: p,
-                url: url.clone(),
+                url: u,
                 content: c,
                 content_base64: b64,
                 title: title.clone(),
@@ -381,7 +402,7 @@ async fn run(cli: &Cli) -> Result<()> {
                         anyhow::bail!("stdin exceeds upload.max_file_mb");
                     }
                     let content = String::from_utf8(raw)?;
-                    let result = kb.upload(build(None, None, Some(content))).await?;
+                    let result = kb.upload(build(None, None, None, Some(content))).await?;
                     output(&result, &fmt)?;
                 } else {
                     let mut content = String::new();
@@ -391,7 +412,7 @@ async fn run(cli: &Cli) -> Result<()> {
                     if content.len() as u64 > max {
                         anyhow::bail!("stdin exceeds upload.max_file_mb");
                     }
-                    let result = kb.upload(build(None, Some(content), None)).await?;
+                    let result = kb.upload(build(None, None, Some(content), None)).await?;
                     output(&result, &fmt)?;
                 }
             } else if expanded.len() > 1 {
@@ -402,7 +423,7 @@ async fn run(cli: &Cli) -> Result<()> {
                 let mut results: Vec<serde_json::Value> = Vec::new();
                 let mut errors: Vec<serde_json::Value> = Vec::new();
                 for p in expanded {
-                    match kb.upload(build(Some(p.clone()), None, None)).await {
+                    match kb.upload(build(Some(p.clone()), None, None, None)).await {
                         Ok(result) => results.push(serde_json::to_value(result)?),
                         Err(e) => errors.push(serde_json::json!({
                             "input": p,
@@ -422,18 +443,20 @@ async fn run(cli: &Cli) -> Result<()> {
                 )?;
                 if !errors.is_empty() {
                     // The JSON payload is already on stdout; exit non-zero
-                    // without emitting a second error document.
+                    // without emitting a second error document. Returning the
+                    // code (rather than std::process::exit) lets the embedded
+                    // SurrealKv connection drop and flush normally.
                     let _ = std::io::stdout().flush();
-                    std::process::exit(1);
+                    return Ok(1);
                 }
             } else if url.is_some() {
                 // Single URL upload keeps the direct UploadResult shape.
-                let result = kb.upload(build(None, None, None)).await?;
+                let result = kb.upload(build(None, url.clone(), None, None)).await?;
                 output(&result, &fmt)?;
             } else if expanded.len() == 1 {
                 // Single input keeps the direct UploadResult shape.
                 let p = expanded.into_iter().next().expect("len == 1");
-                let result = kb.upload(build(Some(p), None, None)).await?;
+                let result = kb.upload(build(Some(p), None, None, None)).await?;
                 output(&result, &fmt)?;
             } else {
                 anyhow::bail!("no input: provide paths, --url, or --stdin");
@@ -560,7 +583,7 @@ async fn run(cli: &Cli) -> Result<()> {
         },
     }
 
-    Ok(())
+    Ok(0)
 }
 
 /// `skb config set storage.path './db'`: write a dotted key into the writable

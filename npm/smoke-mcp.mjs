@@ -82,8 +82,14 @@ const up = await request("tools/call", {
 });
 assert(!up.result?.isError, "skb_upload must succeed");
 const upText = up.result?.content?.[0]?.text ?? "";
-assert(upText.includes('"status": "created"'), "skb_upload must create the document");
-assert(upText.includes("smoke-doc"), "skb_upload must echo the title");
+let upJson;
+try {
+  upJson = JSON.parse(upText);
+} catch {
+  assert(false, `skb_upload must return JSON, got: ${upText}`);
+}
+assert(upJson.status === "created", "skb_upload must create the document");
+assert(upJson.title === "smoke-doc", "skb_upload must echo the title");
 
 const search = await request("tools/call", {
   name: "skb_search",
