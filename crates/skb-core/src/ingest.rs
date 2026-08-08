@@ -23,6 +23,7 @@ pub const MAX_PROCESS_SECONDS: u64 = 30;
     {
         "required": ["path"],
         "properties": {
+            "path": {"type": "string"},
             "url": {"type": "null"},
             "content": {"type": "null"},
             "content_base64": {"type": "null"}
@@ -32,6 +33,7 @@ pub const MAX_PROCESS_SECONDS: u64 = 30;
         "required": ["url"],
         "properties": {
             "path": {"type": "null"},
+            "url": {"type": "string"},
             "content": {"type": "null"},
             "content_base64": {"type": "null"}
         }
@@ -41,6 +43,7 @@ pub const MAX_PROCESS_SECONDS: u64 = 30;
         "properties": {
             "path": {"type": "null"},
             "url": {"type": "null"},
+            "content": {"type": "string"},
             "content_base64": {"type": "null"}
         }
     },
@@ -49,7 +52,8 @@ pub const MAX_PROCESS_SECONDS: u64 = 30;
         "properties": {
             "path": {"type": "null"},
             "url": {"type": "null"},
-            "content": {"type": "null"}
+            "content": {"type": "null"},
+            "content_base64": {"type": "string"}
         }
     },
 ]))]
