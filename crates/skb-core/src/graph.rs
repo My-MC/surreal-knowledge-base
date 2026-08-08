@@ -554,6 +554,20 @@ pub async fn expand_search_hits(
             frontier.extend(next);
         }
 
+        // Dedup the frontier by entity name, keeping the best (closest hop =
+        // highest decay) score, so the chunk query below runs once per entity.
+        let mut best: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+        for (entity, decay) in frontier {
+            best.entry(entity)
+                .and_modify(|d| {
+                    if decay > *d {
+                        *d = decay;
+                    }
+                })
+                .or_insert(decay);
+        }
+        let frontier: Vec<(String, f64)> = best.into_iter().collect();
+
         // Chunks mentioning any frontier entity; scores are the origin hit's
         // score decayed by hop distance (spec §6 re-rank).
         for (entity, decay) in frontier {
