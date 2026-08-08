@@ -97,7 +97,7 @@ pub async fn upload(
 ) -> Result<UploadResult, SkbError> {
     req.validate()?;
     let force = req.force.unwrap_or(false);
-    let doc = extract_document_data(req, config)?;
+    let doc = extract_document_data(req, config).await?;
     let existed = doc_exists(db, &doc.sha256).await?;
     if !force && existed {
         return Ok(UploadResult {
@@ -180,27 +180,21 @@ async fn store_and_index(
     embeddings: &[Vec<f32>],
     replace_existing: bool,
 ) -> Result<(String, Vec<String>), SkbError> {
+    let mut document_id: Option<String> = None;
     if replace_existing {
+        // Preserve the document's id (upsert semantics, spec §4.2): update the
+        // existing record in place and only replace chunks/mentions.
         let did = doc_id_by_sha(tx, &doc.sha256).await?;
+        document_id = Some(format!("document:{did}"));
         let record = surrealdb::types::RecordId::new("document", did);
         tx.query(
-            "DELETE FROM mentions WHERE in.document = $document; \
-             DELETE FROM chunk WHERE document = $document; \
-             DELETE $document;",
+            "UPDATE $document SET title = $title, source = $source, \
+             source_type = $source_type, sha256 = $sha256, content = $content, \
+             mime = $mime, tags = $tags, metadata = $metadata; \
+             DELETE FROM mentions WHERE in.document = $document; \
+             DELETE FROM chunk WHERE document = $document;",
         )
-        .bind(("document", record))
-        .await
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("upload replace: {e}")))?
-        .check()
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("upload replace check: {e}")))?;
-    }
-
-    let sql = "CREATE document SET title = $title, source = $source, \
-               source_type = $source_type, sha256 = $sha256, content = $content, \
-               mime = $mime, tags = $tags, metadata = $metadata \
-               RETURN string::concat('document:', meta::id(id)) AS did";
-    let mut r = tx
-        .query(sql)
+        .bind(("document", record.clone()))
         .bind(("title", doc.title.clone()))
         .bind(("source", doc.source.clone()))
         .bind(("source_type", doc.source_type.clone()))
@@ -210,17 +204,41 @@ async fn store_and_index(
         .bind(("tags", doc.tags.clone()))
         .bind(("metadata", doc.metadata.clone()))
         .await
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("upload doc: {e}")))?
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("upload replace: {e}")))?
         .check()
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("upload doc check: {e}")))?;
-    let rows: Vec<serde_json::Value> = r
-        .take(0)
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("upload doc take: {e}")))?;
-    let doc_id = rows
-        .first()
-        .and_then(|v| v["did"].as_str())
-        .ok_or_else(|| SkbError::new(ErrorCode::Db, "failed to get document id"))?
-        .to_string();
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("upload replace check: {e}")))?;
+    }
+
+    let doc_id = if let Some(existing) = document_id {
+        // Force re-upload keeps the existing record's id (upsert semantics).
+        existing
+    } else {
+        let sql = "CREATE document SET title = $title, source = $source, \
+                   source_type = $source_type, sha256 = $sha256, content = $content, \
+                   mime = $mime, tags = $tags, metadata = $metadata \
+                   RETURN string::concat('document:', meta::id(id)) AS did";
+        let mut r = tx
+            .query(sql)
+            .bind(("title", doc.title.clone()))
+            .bind(("source", doc.source.clone()))
+            .bind(("source_type", doc.source_type.clone()))
+            .bind(("sha256", doc.sha256.clone()))
+            .bind(("content", doc.content.clone()))
+            .bind(("mime", doc.mime.clone()))
+            .bind(("tags", doc.tags.clone()))
+            .bind(("metadata", doc.metadata.clone()))
+            .await
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("upload doc: {e}")))?
+            .check()
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("upload doc check: {e}")))?;
+        let rows: Vec<serde_json::Value> = r
+            .take(0)
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("upload doc take: {e}")))?;
+        rows.first()
+            .and_then(|v| v["did"].as_str())
+            .ok_or_else(|| SkbError::new(ErrorCode::Db, "failed to get document id"))?
+            .to_string()
+    };
     let document = surrealdb::types::RecordId::new("document", record_key(&doc_id)?);
 
     let chunk_sql = "CREATE chunk SET document = $document, idx = $idx, \
@@ -290,7 +308,10 @@ fn record_key(doc_id: &str) -> Result<&str, SkbError> {
         .ok_or_else(|| SkbError::new(ErrorCode::Db, "unexpected document id format"))
 }
 
-fn extract_document_data(req: UploadRequest, config: &Config) -> Result<DocumentData, SkbError> {
+async fn extract_document_data(
+    req: UploadRequest,
+    config: &Config,
+) -> Result<DocumentData, SkbError> {
     enum RawInput {
         Text(String),
         Bytes(Vec<u8>),
@@ -360,7 +381,7 @@ fn extract_document_data(req: UploadRequest, config: &Config) -> Result<Document
             (extract_text(&text, &source), mime_hint)
         }
         RawInput::Bytes(bytes) => {
-            extract_from_bytes(&bytes, &source, mime_hint.as_deref(), config)?
+            extract_from_bytes(&bytes, &source, mime_hint.as_deref(), config).await?
         }
     };
     check_size(content.len() as u64, config)?;
@@ -387,7 +408,7 @@ fn extract_document_data(req: UploadRequest, config: &Config) -> Result<Document
 
 /// Decode base64 as arbitrary binary (spec §12.2) and classify it: PDF by
 /// magic bytes, text by UTF-8 validity, anything else is rejected.
-fn extract_from_bytes(
+async fn extract_from_bytes(
     bytes: &[u8],
     source: &str,
     mime_hint: Option<&str>,
@@ -396,7 +417,7 @@ fn extract_from_bytes(
     check_size(bytes.len() as u64, config)?;
     let is_pdf = is_pdf_bytes(bytes) || mime_hint == Some("application/pdf");
     if is_pdf {
-        let text = extract_pdf_checked(bytes)?;
+        let text = extract_pdf_checked(bytes).await?;
         return Ok((text, Some("application/pdf".to_string())));
     }
     match std::str::from_utf8(bytes) {
@@ -419,10 +440,19 @@ fn is_pdf_bytes(bytes: &[u8]) -> bool {
 
 /// Extract PDF text with resource guards: page count, wall-clock time and
 /// output size (PDF bomb mitigation, spec §12.3).
-fn extract_pdf_checked(bytes: &[u8]) -> Result<String, SkbError> {
+/// Extract PDF text with resource guards (spec §12.3): page count is checked
+/// synchronously first; the (uninterruptible) extraction runs on a blocking
+/// thread so a wall-clock timeout returns an error instead of hanging the
+/// request. The page-count check is the primary PDF-bomb defense.
+async fn extract_pdf_checked(bytes: &[u8]) -> Result<String, SkbError> {
     let start = Instant::now();
-    let doc = lopdf::Document::load_mem(bytes)
-        .map_err(|e| SkbError::new(ErrorCode::Io, format!("pdf parse: {e}")))?;
+    let doc = tokio::task::spawn_blocking({
+        let bytes = bytes.to_vec();
+        move || lopdf::Document::load_mem(&bytes)
+    })
+    .await
+    .map_err(|e| SkbError::new(ErrorCode::Io, format!("pdf parse join: {e}")))?
+    .map_err(|e| SkbError::new(ErrorCode::Io, format!("pdf parse: {e}")))?;
     let pages = doc.get_pages().len();
     if pages > MAX_PDF_PAGES {
         return Err(SkbError::new(
@@ -436,14 +466,19 @@ fn extract_pdf_checked(bytes: &[u8]) -> Result<String, SkbError> {
             "pdf parsing exceeded time limit",
         ));
     }
-    let text = pdf_extract::extract_text_from_mem(bytes)
-        .map_err(|e| SkbError::new(ErrorCode::Io, format!("pdf extract: {e}")))?;
-    if start.elapsed() > Duration::from_secs(MAX_PROCESS_SECONDS) {
-        return Err(SkbError::new(
-            ErrorCode::Validation,
-            "pdf extraction exceeded time limit",
-        ));
-    }
+    // The extraction itself is synchronous and cannot be cancelled; the
+    // timeout bounds how long the caller waits.
+    let text = tokio::time::timeout(
+        Duration::from_secs(MAX_PROCESS_SECONDS),
+        tokio::task::spawn_blocking({
+            let bytes = bytes.to_vec();
+            move || pdf_extract::extract_text_from_mem(&bytes)
+        }),
+    )
+    .await
+    .map_err(|_| SkbError::new(ErrorCode::Validation, "pdf extraction exceeded time limit"))?
+    .map_err(|e| SkbError::new(ErrorCode::Io, format!("pdf extract join: {e}")))?
+    .map_err(|e| SkbError::new(ErrorCode::Io, format!("pdf extract: {e}")))?;
     Ok(text)
 }
 
