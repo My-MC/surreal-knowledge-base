@@ -600,10 +600,42 @@ fn check_size(len: u64, config: &Config) -> Result<(), SkbError> {
     Ok(())
 }
 
+/// Resolver that only returns public addresses, closing the DNS-rebinding gap:
+/// the DNS answer is filtered through `is_blocked_ip` and the resulting
+/// SocketAddrs are pinned for the connection, so a host that resolves to a
+/// private/loopback/metadata IP cannot be connected to even if the answer
+/// changes between validation and connect (spec §15).
+#[derive(Debug, Default)]
+struct SafeResolver;
+
+impl ureq::unversioned::resolver::Resolver for SafeResolver {
+    fn resolve(
+        &self,
+        uri: &ureq::http::Uri,
+        config: &ureq::config::Config,
+        timeout: ureq::unversioned::transport::NextTimeout,
+    ) -> Result<ureq::unversioned::resolver::ResolvedSocketAddrs, ureq::Error> {
+        use ureq::unversioned::resolver::{DefaultResolver, Resolver};
+        let addrs = DefaultResolver::default().resolve(uri, config, timeout)?;
+        let mut result = self.empty();
+        for addr in addrs.iter() {
+            if !is_blocked_ip(addr.ip()) {
+                result.push(*addr);
+            }
+        }
+        if result.is_empty() {
+            Err(ureq::Error::HostNotFound)
+        } else {
+            Ok(result)
+        }
+    }
+}
+
 /// Fetch a URL with SSRF guards (spec §15 / §12.3):
 /// - http/https schemes only
 /// - DNS resolution validated before every request (private/loopback/
-///   link-local/multicast/metadata addresses are rejected)
+///   link-local/multicast/metadata addresses are rejected); the SafeResolver
+///   filters the DNS answer and pins the connection to validated addresses
 /// - redirects are followed manually, re-validating each hop
 /// - size-limited streaming read; the whole fetch (all redirect hops) is
 ///   bounded by one MAX_PROCESS_SECONDS deadline
@@ -624,13 +656,16 @@ fn fetch_url(url_str: &str, config: &Config) -> Result<(Vec<u8>, Option<String>)
             .map_err(|e| SkbError::new(ErrorCode::Validation, format!("invalid url: {e}")))?;
         validate_url_host(&url)?;
 
-        let agent = ureq::Agent::config_builder()
-            .max_redirects(0)
-            .http_status_as_error(false)
-            .timeout_connect(Some(Duration::from_secs(10)))
-            .timeout_global(Some(remaining))
-            .build()
-            .new_agent();
+        let agent = ureq::Agent::with_parts(
+            ureq::Agent::config_builder()
+                .max_redirects(0)
+                .http_status_as_error(false)
+                .timeout_connect(Some(Duration::from_secs(10)))
+                .timeout_global(Some(remaining))
+                .build(),
+            ureq::unversioned::transport::DefaultConnector::default(),
+            SafeResolver,
+        );
         let mut resp = agent
             .get(&current)
             .call()
@@ -661,7 +696,13 @@ fn fetch_url(url_str: &str, config: &Config) -> Result<(Vec<u8>, Option<String>)
             .headers()
             .get("content-type")
             .and_then(|v| v.to_str().ok())
-            .map(|s| s.split(';').next().unwrap_or("").trim().to_string());
+            .map(|s| {
+                s.split(';')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_ascii_lowercase()
+            });
         let body = resp
             .body_mut()
             .with_config()

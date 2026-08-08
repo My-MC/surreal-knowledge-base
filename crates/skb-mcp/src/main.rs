@@ -389,10 +389,17 @@ impl SkbServer {
             "skb_reindex" => {
                 let params: ReindexRequest = serde_json::from_value(Value::Object(args))
                     .map_err(|e| valid_err(&format!("invalid reindex parameters: {e}")))?;
+                // Throttle progress notifications so a slow client cannot
+                // accumulate an unbounded number of in-flight sends: emit at
+                // most one per PROGRESS_EVERY documents, always the final one.
+                const PROGRESS_EVERY: usize = 10;
                 let progress: Option<Box<skb_core::reindex::ProgressFn>> =
                     context.meta.get_progress_token().map(|token| {
                         let peer = context.peer.clone();
                         Box::new(move |done: usize, total: usize| {
+                            if done != total && done % PROGRESS_EVERY != 0 {
+                                return;
+                            }
                             let peer = peer.clone();
                             let token = token.clone();
                             tokio::spawn(async move {
