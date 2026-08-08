@@ -312,9 +312,9 @@ impl KnowledgeBase {
 
     // 資料管理
     pub async fn upload(&self, req: UploadRequest) -> Result<UploadResult>;
-    pub async fn list_documents(&self, q: ListQuery) -> Result<Page<DocumentSummary>>;
-    pub async fn get_document(&self, id: &str, opts: GetOptions) -> Result<DocumentDetail>;
-    pub async fn delete_document(&self, id: &str) -> Result<DeleteResult>;
+    pub async fn list_documents(&self, q: &ListQuery) -> Result<Vec<DocumentSummary>>;
+    pub async fn get_document(&self, req: &GetDocumentRequest) -> Result<DocumentDetail>;
+    pub async fn delete_document(&self, req: &DeleteDocumentRequest) -> Result<DeleteResult>;
 
     // 検索
     pub async fn search(&self, req: SearchRequest) -> Result<SearchResponse>;
@@ -396,7 +396,7 @@ v1 では stdio トランスポートのみを提供する。HTTP トランス�
 |---|---|---|---|
 | 1 | `skb_upload` | 資料をアップロード | `path?`, `url?`, `content?`, `content_base64?`, `title?`, `tags?`, `metadata?`, `force?` |
 | 2 | `skb_search` | 検索 | `query`, `mode?=hybrid`, `top_k?=10`, `filter?`, `graph_expand?=0` |
-| 3 | `skb_list_documents` | 一覧 | `limit?=50`, `offset?=0`, `order?=updated_desc` |
+| 3 | `skb_list_documents` | 一覧 | `limit?=50`, `offset?=0`, `order?=created_desc`（`created_desc` / `created_asc` / `title_asc` / `title_desc`） |
 | 4 | `skb_get_document` | 取得 | `id`, `include_chunks?=false` |
 | 5 | `skb_delete_document` | 削除 | `id` |
 | 6 | `skb_graph_query` | グラフ探索 | `from`（entity名 or document id）, `relation?`, `depth?=1`, `limit?=50` |

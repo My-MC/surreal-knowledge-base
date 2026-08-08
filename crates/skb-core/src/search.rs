@@ -32,6 +32,12 @@ impl SearchRequest {
                     "top_k must be at least 1",
                 ));
             }
+            if top_k > usize::MAX / 3 {
+                return Err(SkbError::new(
+                    ErrorCode::Validation,
+                    "top_k too large: fetch_k = top_k * 3 must not overflow",
+                ));
+            }
         }
         if let Some(depth) = self.graph_expand {
             if depth > 5 {
@@ -148,7 +154,9 @@ async fn hybrid_search(
     top_k: usize,
     rrf_k: usize,
 ) -> Result<Vec<SearchHit>, SkbError> {
-    let fetch_k = top_k * 3;
+    let fetch_k = top_k
+        .checked_mul(3)
+        .ok_or_else(|| SkbError::new(ErrorCode::Validation, "top_k too large"))?;
 
     let query_emb = embedder
         .embed_batch(&[query.to_string()])?
@@ -378,6 +386,21 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn rejects_top_k_that_overflows_fetch_k() {
+        let mut req = request("hello");
+        req.top_k = Some(usize::MAX / 3 + 1);
+        assert!(matches!(
+            req.validate(),
+            Err(SkbError {
+                code: ErrorCode::Validation,
+                ..
+            })
+        ));
+        req.top_k = Some(usize::MAX / 3);
+        assert!(req.validate().is_ok());
     }
 
     #[test]
