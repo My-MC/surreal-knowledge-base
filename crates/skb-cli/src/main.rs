@@ -447,20 +447,38 @@ async fn run(cli: &Cli) -> Result<()> {
             let kb = match KnowledgeBase::open(config.clone()).await {
                 Ok(kb) => kb,
                 Err(e) if e.code == skb_core::error::ErrorCode::ModelMismatch => {
-                    let mut last = None;
+                    // Retry the fallback open briefly: the previous handle's
+                    // SurrealKv file lock may still be releasing. Retain the
+                    // last Db error to report the real cause if all retries
+                    // fail.
+                    let mut opened = None;
+                    let mut last_error: Option<skb_core::error::SkbError> = None;
                     for _ in 0..8 {
                         match KnowledgeBase::open_for_reindex(config.clone()).await {
                             Ok(kb) => {
-                                last = Some(kb);
+                                opened = Some(kb);
                                 break;
                             }
                             Err(e) if e.code == skb_core::error::ErrorCode::Db => {
+                                last_error = Some(e);
                                 tokio::time::sleep(std::time::Duration::from_millis(150)).await;
                             }
                             Err(e) => return Err(e.into()),
                         }
                     }
-                    last.ok_or_else(|| anyhow::anyhow!("database lock was not released in time"))?
+                    match opened {
+                        Some(kb) => kb,
+                        None => {
+                            return Err(last_error
+                                .unwrap_or_else(|| {
+                                    skb_core::error::SkbError::new(
+                                        skb_core::error::ErrorCode::Db,
+                                        "database lock was not released in time",
+                                    )
+                                })
+                                .into())
+                        }
+                    }
                 }
                 Err(e) => return Err(e.into()),
             };

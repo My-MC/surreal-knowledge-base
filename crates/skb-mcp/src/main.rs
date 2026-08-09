@@ -97,33 +97,15 @@ impl ServerHandler for SkbServer {
         let contents: Vec<ResourceContents> = if uri == "skb://documents" {
             // Bound the response so a large store cannot exhaust memory or
             // produce an unbounded payload; report whether the cap was hit.
-            // The server lock is acquired per page (each list_documents call)
-            // rather than held across the whole snapshot, so concurrent tools
-            // are not starved during large paginated reads.
+            // Delegating to `document_snapshot` keeps the cap/page/truncation
+            // logic in one place; the lock is released before serialization.
             const MAX_DOCUMENTS_RESOURCE: usize = 10_000;
-            const PAGE: usize = 100;
-            let mut docs: Vec<skb_core::crud::DocumentSummary> = Vec::new();
-            let mut offset = 0;
-            loop {
-                let page = {
-                    let kb = self.kb.lock().await;
-                    kb.list_documents(&ListQuery {
-                        limit: Some(PAGE),
-                        offset: Some(offset),
-                        order: None,
-                    })
+            let (docs, truncated) = {
+                let kb = self.kb.lock().await;
+                kb.document_snapshot(MAX_DOCUMENTS_RESOURCE)
                     .await
                     .map_err(err_data)?
-                };
-                let page_len = page.len();
-                docs.extend(page);
-                if page_len < PAGE || docs.len() > MAX_DOCUMENTS_RESOURCE {
-                    break;
-                }
-                offset += PAGE;
-            }
-            let truncated = docs.len() > MAX_DOCUMENTS_RESOURCE;
-            docs.truncate(MAX_DOCUMENTS_RESOURCE);
+            };
             let body = serde_json::to_string_pretty(&serde_json::json!({
                 "documents": docs,
                 "truncated": truncated,
@@ -145,7 +127,7 @@ impl ServerHandler for SkbServer {
                     include_chunks: Some(true),
                 })
                 .await
-                .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+                .map_err(err_data)?;
             let body = serde_json::to_string_pretty(&doc)
                 .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
             vec![ResourceContents::text(body, uri)]

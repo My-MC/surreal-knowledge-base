@@ -122,11 +122,16 @@ pub async fn reindex(
             use crate::db::MetaStore;
             tx.set_meta("embedding_model", &config.embedding.model)
                 .await?;
-            tx.set_meta("embedding_dimension", &embedder.dimension().to_string())
-                .await?;
+            // Source dimension/max_input from the resolved config so the
+            // recorded values always match the initialization path in lib.rs.
+            tx.set_meta(
+                "embedding_dimension",
+                &config.embedding.dimension.to_string(),
+            )
+            .await?;
             tx.set_meta(
                 "embedding_max_input_tokens",
-                &embedder.max_input_tokens().to_string(),
+                &config.embedding.max_input_tokens.to_string(),
             )
             .await?;
             tx.set_meta("schema_version", crate::SCHEMA_VERSION).await?;

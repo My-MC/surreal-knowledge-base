@@ -110,6 +110,32 @@ impl Db {
     }
 
     pub async fn migrate(&self, embedding_dim: usize) -> Result<(), SkbError> {
+        // When the stored embedding dimension differs from the target, the
+        // existing embedding field ASSERT and HNSW index are redefined to the
+        // new dimension (a dimension change through reindex); otherwise the
+        // IF NOT EXISTS definitions below leave them untouched. A brand-new
+        // store has no meta table yet, which is not a dimension change.
+        let stored_dim = match self.get_meta("embedding_dimension").await {
+            Ok(v) => v.and_then(|s| s.parse::<usize>().ok()),
+            Err(e) if e.code == ErrorCode::Db => None, // fresh store
+            Err(e) => return Err(e),
+        };
+        if stored_dim.is_some_and(|d| d != embedding_dim) {
+            let redefine = format!(
+                "REMOVE INDEX IF EXISTS chunk_embedding_hnsw ON chunk; \
+                 REMOVE FIELD IF EXISTS embedding ON chunk; \
+                 DEFINE FIELD embedding ON chunk TYPE array<float> \
+                     ASSERT array::len($value) = {embedding_dim};"
+            );
+            self.db
+                .query(&redefine)
+                .await
+                .map_err(|e| SkbError::new(ErrorCode::Db, format!("migrate redefine: {e}")))?
+                .check()
+                .map_err(|e| {
+                    SkbError::new(ErrorCode::Db, format!("migrate redefine check: {e}"))
+                })?;
+        }
         let schema = include_str!("../../../schema/001_init.surql");
         let schema = schema.replace("{DIM}", &embedding_dim.to_string());
         self.db

@@ -750,4 +750,23 @@ mod tests {
             })
         ));
     }
+
+    #[test]
+    fn rejects_non_finite_weight() {
+        for weight in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(matches!(
+                LinkInfo {
+                    from: "a".into(),
+                    to: "b".into(),
+                    relation: "r".into(),
+                    weight: Some(weight),
+                }
+                .validate(),
+                Err(SkbError {
+                    code: ErrorCode::Validation,
+                    ..
+                })
+            ));
+        }
+    }
 }

@@ -122,9 +122,8 @@ pub struct GetDocumentRequest {
 }
 
 impl GetDocumentRequest {
-    pub fn validate(&self) -> Result<(), SkbError> {
-        validate_document_id(&self.id)?;
-        Ok(())
+    pub fn validate(&self) -> Result<surrealdb::types::RecordId, SkbError> {
+        validate_document_id(&self.id)
     }
 }
 
@@ -139,15 +138,15 @@ pub struct DeleteDocumentRequest {
 }
 
 impl DeleteDocumentRequest {
-    pub fn validate(&self) -> Result<(), SkbError> {
-        validate_document_id(&self.id)?;
+    pub fn validate(&self) -> Result<surrealdb::types::RecordId, SkbError> {
+        let record_id = validate_document_id(&self.id)?;
         if !self.confirm {
             return Err(SkbError::new(
                 ErrorCode::Validation,
                 "deletion requires confirm: true",
             ));
         }
-        Ok(())
+        Ok(record_id)
     }
 }
 
@@ -226,8 +225,7 @@ pub async fn list_documents(db: &Db, q: &ListQuery) -> Result<Vec<DocumentSummar
 }
 
 pub async fn get_document(db: &Db, req: &GetDocumentRequest) -> Result<DocumentDetail, SkbError> {
-    req.validate()?;
-    let record_id = validate_document_id(&req.id)?;
+    let record_id = req.validate()?;
     let query = "SELECT title, source, source_type, sha256, content, created_at FROM $id";
     let mut r = db
         .db
@@ -288,20 +286,32 @@ pub async fn delete_document(
     db: &Db,
     req: &DeleteDocumentRequest,
 ) -> Result<DeleteResult, SkbError> {
-    req.validate()?;
-    let record_id = validate_document_id(&req.id)?;
+    let record_id = req.validate()?;
     let query = "DELETE FROM chunk WHERE document = $id RETURN BEFORE; DELETE $id;";
     let r = db
         .db
         .query(query)
-        .bind(("id", record_id))
+        .bind(("id", record_id.clone()))
         .await
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete: {e}")))?;
-    let deleted: Vec<serde_json::Value> = r
+    let mut r = r
         .check()
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete check: {e}")))?
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete check: {e}")))?;
+    let deleted: Vec<serde_json::Value> = r
         .take(0)
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete take: {e}")))?;
+    // The `DELETE $id` statement returns the removed document (a single
+    // object, or NONE for a missing document), so report E_DOCUMENT_NOT_FOUND
+    // when nothing was deleted.
+    let doc_result: surrealdb::types::Value = r
+        .take(1)
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete doc take: {e}")))?;
+    if doc_result == surrealdb::types::Value::None {
+        return Err(SkbError::new(
+            ErrorCode::DocumentNotFound,
+            format!("not found: {}", req.id),
+        ));
+    }
 
     Ok(DeleteResult {
         document_id: req.id.clone(),

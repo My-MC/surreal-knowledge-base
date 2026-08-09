@@ -79,6 +79,9 @@ pub async fn search(
     req: SearchRequest,
 ) -> Result<SearchResponse, SkbError> {
     req.validate()?;
+    // Fallbacks for direct callers that bypass `KnowledgeBase::search` (which
+    // fills these from `config.search`). Keep them in sync with
+    // `SearchConfig::default()` when the defaults change.
     let mode = req.mode.unwrap_or(SearchMode::Hybrid);
     let top_k = req.top_k.unwrap_or(10);
     let start = std::time::Instant::now();
