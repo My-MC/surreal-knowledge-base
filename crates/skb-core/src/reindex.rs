@@ -118,7 +118,7 @@ pub async fn reindex(
             .begin()
             .await
             .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex meta begin: {e}")))?;
-        let result = async {
+        let meta_written = async {
             use crate::db::MetaStore;
             tx.set_meta("embedding_model", &config.embedding.model)
                 .await?;
@@ -136,7 +136,7 @@ pub async fn reindex(
             Ok::<(), SkbError>(())
         }
         .await;
-        match result {
+        match meta_written {
             Ok(()) => {
                 tx.commit().await.map_err(|e| {
                     SkbError::new(ErrorCode::Db, format!("reindex meta commit: {e}"))

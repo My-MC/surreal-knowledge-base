@@ -240,9 +240,13 @@ impl Config {
                 .filter(|p| !p.as_os_str().is_empty())
                 .collect();
             if dirs.is_empty() {
-                return Err(anyhow::anyhow!(
-                    "SKB_UPLOAD_ALLOWED_DIRS must contain at least one directory (got '{v}')"
-                ));
+                return Err(SkbError::new(
+                    ErrorCode::Config,
+                    format!(
+                        "SKB_UPLOAD_ALLOWED_DIRS must contain at least one directory (got '{v}')"
+                    ),
+                )
+                .into());
             }
             self.upload.allowed_dirs = dirs;
         }
@@ -381,26 +385,31 @@ impl Config {
     }
 }
 
-fn env_opt(key: &str) -> anyhow::Result<Option<String>> {
+fn env_opt(key: &str) -> Result<Option<String>, SkbError> {
     match std::env::var(key) {
         Ok(value) => Ok(Some(value)),
         Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(std::env::VarError::NotUnicode(_)) => Err(anyhow::anyhow!("{key} must be unicode")),
+        Err(std::env::VarError::NotUnicode(_)) => Err(SkbError::new(
+            ErrorCode::Config,
+            format!("{key} must be unicode"),
+        )),
     }
 }
 
 /// Parse a numeric `SKB_*` environment variable, keeping a missing variable as
 /// `None` and centralizing the key/value/error context for all numeric fields.
-fn env_parse<T>(key: &str) -> anyhow::Result<Option<T>>
+fn env_parse<T>(key: &str) -> Result<Option<T>, SkbError>
 where
     T: std::str::FromStr,
     T::Err: std::fmt::Display,
 {
     match env_opt(key)? {
-        Some(v) => v
-            .parse::<T>()
-            .map(Some)
-            .map_err(|e| anyhow::anyhow!("{key} must be a number, got '{v}': {e}")),
+        Some(v) => v.parse::<T>().map(Some).map_err(|e| {
+            SkbError::new(
+                ErrorCode::Config,
+                format!("{key} must be a number, got '{v}': {e}"),
+            )
+        }),
         None => Ok(None),
     }
 }

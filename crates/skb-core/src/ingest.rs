@@ -11,10 +11,10 @@ use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[schemars(extend("oneOf" = [
-    {"required": ["path"]},
-    {"required": ["url"]},
-    {"required": ["content"]},
-    {"required": ["content_base64"]},
+    {"required": ["path"], "properties": {"path": {"type": "string"}, "url": {"type": "null"}, "content": {"type": "null"}, "content_base64": {"type": "null"}}},
+    {"required": ["url"], "properties": {"url": {"type": "string"}, "path": {"type": "null"}, "content": {"type": "null"}, "content_base64": {"type": "null"}}},
+    {"required": ["content"], "properties": {"content": {"type": "string"}, "path": {"type": "null"}, "url": {"type": "null"}, "content_base64": {"type": "null"}}},
+    {"required": ["content_base64"], "properties": {"content_base64": {"type": "string"}, "path": {"type": "null"}, "url": {"type": "null"}, "content": {"type": "null"}}},
 ]))]
 pub struct UploadRequest {
     pub path: Option<String>,

@@ -440,12 +440,27 @@ async fn run(cli: &Cli) -> Result<()> {
         }
         Commands::Reindex { dry_run } => {
             // A model/dimension/tokenizer mismatch blocks normal open; reindex
-            // is the management path out of that state (spec §5.4).
+            // is the management path out of that state (spec §5.4). The
+            // fallback open retries briefly: the previous handle's SurrealKv
+            // file lock may still be releasing.
             let config = cfg()?;
             let kb = match KnowledgeBase::open(config.clone()).await {
                 Ok(kb) => kb,
                 Err(e) if e.code == skb_core::error::ErrorCode::ModelMismatch => {
-                    KnowledgeBase::open_for_reindex(config).await?
+                    let mut last = None;
+                    for _ in 0..8 {
+                        match KnowledgeBase::open_for_reindex(config.clone()).await {
+                            Ok(kb) => {
+                                last = Some(kb);
+                                break;
+                            }
+                            Err(e) if e.code == skb_core::error::ErrorCode::Db => {
+                                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                            }
+                            Err(e) => return Err(e.into()),
+                        }
+                    }
+                    last.ok_or_else(|| anyhow::anyhow!("database lock was not released in time"))?
                 }
                 Err(e) => return Err(e.into()),
             };

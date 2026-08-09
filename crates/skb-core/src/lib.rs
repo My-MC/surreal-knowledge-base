@@ -161,6 +161,11 @@ impl KnowledgeBase {
                 }
             }
             db.migrate(dimension).await?;
+        } else {
+            // allow_mismatch on an existing store (open_for_reindex): skip the
+            // mismatch checks, but still apply the schema (embedding field and
+            // indexes) for the target dimension so reindex can rebuild.
+            db.migrate(dimension).await?;
         }
 
         // Tokenizer fingerprint: compute, then compare against the stored
@@ -235,19 +240,22 @@ impl KnowledgeBase {
         let mut docs = Vec::new();
         let mut offset = 0;
         loop {
+            // Request only the remaining allowance so an exact-max store does
+            // not trigger an extra empty page fetch.
+            let want = PAGE.min(max + 1 - docs.len());
             let page = self
                 .list_documents(&ListQuery {
-                    limit: Some(PAGE),
+                    limit: Some(want),
                     offset: Some(offset),
                     order: None,
                 })
                 .await?;
             let page_len = page.len();
             docs.extend(page);
-            if page_len < PAGE || docs.len() > max {
+            if page_len < want || docs.len() > max {
                 break;
             }
-            offset += PAGE;
+            offset += want;
         }
         let truncated = docs.len() > max;
         docs.truncate(max);
@@ -380,12 +388,12 @@ pub(crate) fn tokenizer_fingerprint(
         .and_then(|v| v.as_str())
         .unwrap_or("unknown")
         .to_string();
-    let canonical = serde_json::to_string(&serde_json::json!({
+    let canonical = serde_json::to_string(&sort_json_keys(&serde_json::json!({
         "schema": TOKENIZER_FINGERPRINT_SCHEMA,
         "source": source,
         "algorithm": algorithm,
         "config": config,
-    }))
+    })))
     .map_err(|e| {
         SkbError::new(
             ErrorCode::Tokenize,
@@ -403,6 +411,25 @@ pub(crate) fn tokenizer_fingerprint(
         fingerprint,
         algorithm,
     })
+}
+
+/// Recursively sort JSON object keys so the fingerprint is independent of
+/// serde_json's `preserve_order` feature (or any insertion-order differences).
+fn sort_json_keys(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut sorted: Vec<(String, serde_json::Value)> = map
+                .iter()
+                .map(|(k, v)| (k.clone(), sort_json_keys(v)))
+                .collect();
+            sorted.sort_by(|a, b| a.0.cmp(&b.0));
+            serde_json::Value::Object(sorted.into_iter().collect())
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(sort_json_keys).collect())
+        }
+        other => other.clone(),
+    }
 }
 
 /// Compare the computed tokenizer fingerprint against `meta` and persist it on
