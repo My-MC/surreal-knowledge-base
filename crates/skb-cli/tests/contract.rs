@@ -81,7 +81,7 @@ fn core_search(query: &str, mode: &str) -> Value {
     let dir = test_dir();
     let mut config = skb_core::config::Config::default();
     config.embedding.onnx_path = "mock".to_string();
-    config.embedding.dimension = 8;
+    config.embedding.dimension = skb_core::embed::MOCK_EMBEDDER_DIMENSION;
     config.storage.path = dir.join("db");
     rt.block_on(async {
         let kb = skb_core::KnowledgeBase::open(config).await.unwrap();
@@ -102,7 +102,7 @@ fn core_list() -> Value {
     let dir = test_dir();
     let mut config = skb_core::config::Config::default();
     config.embedding.onnx_path = "mock".to_string();
-    config.embedding.dimension = 8;
+    config.embedding.dimension = skb_core::embed::MOCK_EMBEDDER_DIMENSION;
     config.storage.path = dir.join("db");
     rt.block_on(async {
         let kb = skb_core::KnowledgeBase::open(config).await.unwrap();
@@ -123,7 +123,7 @@ fn core_stats() -> Value {
     let dir = test_dir();
     let mut config = skb_core::config::Config::default();
     config.embedding.onnx_path = "mock".to_string();
-    config.embedding.dimension = 8;
+    config.embedding.dimension = skb_core::embed::MOCK_EMBEDDER_DIMENSION;
     config.storage.path = dir.join("db");
     rt.block_on(async {
         let kb = skb_core::KnowledgeBase::open(config).await.unwrap();

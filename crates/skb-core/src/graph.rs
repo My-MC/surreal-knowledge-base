@@ -197,11 +197,15 @@ pub async fn upsert_entity(db: &Db, entity: &EntityInfo) -> Result<(), SkbError>
 pub async fn link(db: &Db, link: &LinkInfo) -> Result<(), SkbError> {
     link.validate()?;
     let weight = link.weight.unwrap_or(1.0);
+    // Trim from/to so they resolve to the same normalized entity IDs used by
+    // upsert_entity (" Rust " links to entity:⟨Rust⟩).
+    let from = link.from.trim();
+    let to = link.to.trim();
     let sql = "RELATE $from->related_to->$to SET relation = $relation, weight = $weight";
     db.db
         .query(sql)
-        .bind(("from", entity_record_id(&link.from)?))
-        .bind(("to", entity_record_id(&link.to)?))
+        .bind(("from", entity_record_id(from)?))
+        .bind(("to", entity_record_id(to)?))
         .bind(("relation", link.relation.clone()))
         .bind(("weight", weight))
         .await
@@ -498,7 +502,10 @@ pub async fn expand_search_hits(
         .map(|h| (h.document_id.clone(), h.chunk_idx))
         .collect();
 
-    for hit in hits.iter().take(3) {
+    // Expansion starts from the top hits only, bounding the number of queries
+    // and the search latency (spec §6).
+    const MAX_EXPAND_ORIGINS: usize = 3;
+    for hit in hits.iter().take(MAX_EXPAND_ORIGINS) {
         let origin_score = hit.score.max(0.0);
 
         // Hop 1: entities mentioned by this chunk.

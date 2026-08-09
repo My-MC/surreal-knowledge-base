@@ -154,7 +154,7 @@ async fn keyword_search(db: &Db, query: &str, top_k: usize) -> Result<Vec<Search
     let sql = format!(
         "SELECT content, idx, meta::id(document) AS document, \
          document.title AS title, document.source AS source, search::score(0) AS score \
-         FROM chunk WHERE content @@ $q ORDER BY score DESC LIMIT {top_k}"
+         FROM chunk WHERE content @0@ $q ORDER BY score DESC LIMIT {top_k}"
     );
 
     let mut r = db
@@ -211,7 +211,7 @@ async fn hybrid_search(
         "SELECT content, idx, meta::id(id) AS chunk_id, \
          meta::id(document) AS document, \
          document.title AS title, document.source AS source, search::score(0) AS score \
-         FROM chunk WHERE content @@ $q ORDER BY score DESC LIMIT {fetch_k}"
+         FROM chunk WHERE content @0@ $q ORDER BY score DESC LIMIT {fetch_k}"
     );
     let mut r = db
         .db
@@ -308,12 +308,18 @@ async fn hybrid_search(
         .collect())
 }
 
-/// Terms from `terms` that actually occur in `content`; `None` when none do.
+/// Terms from `terms` that actually occur as words in `content`; `None` when
+/// none do. Words are split with the same delimiter rule as `match_terms`, so
+/// "go" does not match "google".
 fn present_terms(content: &str, terms: &[String]) -> Option<Vec<String>> {
     let lower = content.to_lowercase();
+    let words: std::collections::HashSet<&str> = lower
+        .split(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
+        .filter(|w| !w.is_empty())
+        .collect();
     let present: Vec<String> = terms
         .iter()
-        .filter(|t| lower.contains(t.as_str()))
+        .filter(|t| words.contains(t.as_str()))
         .cloned()
         .collect();
     (!present.is_empty()).then_some(present)

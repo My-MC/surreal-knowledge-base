@@ -157,19 +157,18 @@ fn setup_side(root: &std::path::Path, name: &str) -> std::path::PathBuf {
     let dir = root.join(name);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
+    let db_path = dir.join("db").display().to_string().replace('\\', "/");
     let config = format!(
         r#"search = {{ rrf_k = 10 }}
 
 [embedding]
 onnx_path = "mock"
-dimension = 8
+dimension = {}
 
 [storage]
-path = "{}"
+path = "{db_path}"
 "#,
-        // Forward slashes so the path is a valid TOML basic string on Windows
-        // (backslashes would be invalid escapes).
-        dir.join("db").display().to_string().replace('\\', "/")
+        skb_core::embed::MOCK_EMBEDDER_DIMENSION,
     );
     std::fs::write(dir.join("skb.toml"), config).unwrap();
     dir
