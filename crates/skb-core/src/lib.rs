@@ -227,7 +227,9 @@ impl KnowledgeBase {
 
         if graph_expand > 0 && !resp.hits.is_empty() {
             // Enrich original hits with their chunk's entities, then merge the
-            // expanded hits and re-rank everything by score (spec §6).
+            // expanded hits. Direct hits always fill top_k first — expanded
+            // hits only take the remaining slots — so graph expansion can
+            // never displace the primary results (spec §6).
             let (expanded, origin_entities) =
                 graph::expand_search_hits(&self.db, &resp.hits, graph_expand).await?;
             for hit in resp.hits.iter_mut() {
@@ -239,13 +241,30 @@ impl KnowledgeBase {
                     hit.matched_entities = Some(entities);
                 }
             }
-            resp.hits.extend(expanded);
-            resp.hits.sort_by(|a, b| {
+            let mut direct = std::mem::take(&mut resp.hits);
+            direct.sort_by(|a, b| {
                 b.score
                     .partial_cmp(&a.score)
                     .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.document_id.cmp(&b.document_id))
+                    .then_with(|| a.chunk_idx.cmp(&b.chunk_idx))
             });
-            resp.hits.truncate(top_k);
+            let mut expanded = expanded;
+            expanded.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.document_id.cmp(&b.document_id))
+                    .then_with(|| a.chunk_idx.cmp(&b.chunk_idx))
+            });
+            let direct_count = direct.len().min(top_k);
+            let mut merged: Vec<_> = direct.into_iter().take(direct_count).collect();
+            merged.extend(
+                expanded
+                    .into_iter()
+                    .take(top_k.saturating_sub(direct_count)),
+            );
+            resp.hits = merged;
         }
 
         Ok(resp)

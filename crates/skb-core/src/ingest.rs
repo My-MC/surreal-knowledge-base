@@ -360,7 +360,11 @@ async fn extract_document_data(
             .to_string();
         let config = config.clone();
         let raw = tokio::task::spawn_blocking(move || -> Result<RawInput, SkbError> {
-            validate_path(&path, &config)?;
+            // Resolve and validate in one step: the canonicalized path
+            // returned here is used for all subsequent operations so a
+            // symlink swapped between validation and read cannot escape
+            // `allowed_dirs` (TOCTOU).
+            let path = validate_path(&path, &config)?;
             let meta = std::fs::metadata(&path)
                 .map_err(|e| SkbError::new(ErrorCode::Io, format!("stat file: {e}")))?;
             check_size(meta.len(), &config)?;
@@ -506,7 +510,7 @@ async fn extract_pdf_checked(bytes: &[u8]) -> Result<String, SkbError> {
     let permit = pdf_semaphore()
         .acquire_owned()
         .await
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("pdf semaphore: {e}")))?;
+        .map_err(|e| SkbError::new(ErrorCode::Io, format!("pdf semaphore: {e}")))?;
     let shared = std::sync::Arc::new(bytes.to_vec());
     let job = tokio::task::spawn_blocking(move || -> Result<String, String> {
         let _permit = permit;
@@ -665,6 +669,28 @@ fn fetch_url_with_validator(
     let max_bytes = max_upload_bytes(config);
     let deadline = Instant::now() + Duration::from_secs(MAX_PROCESS_SECONDS);
 
+    // Build the agent once and reuse it across redirect hops so the
+    // connection pool and TLS session are not re-created per hop; the
+    // remaining total time is enforced by the deadline check below.
+    let agent = if use_safe_resolver {
+        ureq::Agent::with_parts(
+            ureq::Agent::config_builder()
+                .max_redirects(0)
+                .http_status_as_error(false)
+                .timeout_connect(Some(Duration::from_secs(10)))
+                .build(),
+            ureq::unversioned::transport::DefaultConnector::default(),
+            SafeResolver,
+        )
+    } else {
+        ureq::Agent::config_builder()
+            .max_redirects(0)
+            .http_status_as_error(false)
+            .timeout_connect(Some(Duration::from_secs(10)))
+            .build()
+            .new_agent()
+    };
+
     let mut current = url_str.to_string();
     for _ in 0..=MAX_REDIRECTS {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -678,26 +704,6 @@ fn fetch_url_with_validator(
             .map_err(|e| SkbError::new(ErrorCode::Validation, format!("invalid url: {e}")))?;
         validate(&url)?;
 
-        let agent = if use_safe_resolver {
-            ureq::Agent::with_parts(
-                ureq::Agent::config_builder()
-                    .max_redirects(0)
-                    .http_status_as_error(false)
-                    .timeout_connect(Some(Duration::from_secs(10)))
-                    .timeout_global(Some(remaining))
-                    .build(),
-                ureq::unversioned::transport::DefaultConnector::default(),
-                SafeResolver,
-            )
-        } else {
-            ureq::Agent::config_builder()
-                .max_redirects(0)
-                .http_status_as_error(false)
-                .timeout_connect(Some(Duration::from_secs(10)))
-                .timeout_global(Some(remaining))
-                .build()
-                .new_agent()
-        };
         let mut resp = agent
             .get(&current)
             .call()
@@ -913,20 +919,22 @@ fn base64_decode_checked(b64: &str, config: &Config) -> Result<Vec<u8>, SkbError
     Ok(bytes)
 }
 
-fn validate_path(path: &std::path::Path, config: &Config) -> Result<(), SkbError> {
-    let allowed = &config.upload.allowed_dirs;
-    if allowed.is_empty() {
-        return Ok(());
-    }
+fn validate_path(path: &std::path::Path, config: &Config) -> Result<std::path::PathBuf, SkbError> {
+    // Always canonicalize so callers use the same resolved path for every
+    // subsequent operation (no re-resolution TOCTOU window).
     let canonical = path
         .canonicalize()
         .map_err(|e| SkbError::new(ErrorCode::Io, format!("resolve path: {e}")))?;
+    let allowed = &config.upload.allowed_dirs;
+    if allowed.is_empty() {
+        return Ok(canonical);
+    }
     for dir in allowed {
         let can_dir = dir
             .canonicalize()
             .map_err(|e| SkbError::new(ErrorCode::Io, format!("resolve allowed dir: {e}")))?;
         if canonical.starts_with(&can_dir) {
-            return Ok(());
+            return Ok(canonical);
         }
     }
     Err(SkbError::new(

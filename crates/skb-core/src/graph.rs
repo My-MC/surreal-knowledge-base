@@ -170,14 +170,18 @@ fn entity_record_id(name: &str) -> Result<RecordId, SkbError> {
 /// Insert-or-update an entity, addressed by its deterministic id (`entity:⟨name⟩`).
 pub async fn upsert_entity(db: &Db, entity: &EntityInfo) -> Result<(), SkbError> {
     entity.validate()?;
+    // Persist trimmed names/kinds so " Rust " and "Rust" resolve to the same
+    // entity (validation already rejects blank values after trimming).
+    let name = entity.name.trim().to_string();
+    let kind = entity.kind.trim().to_string();
     let sql = "INSERT INTO entity (id, name, kind, description) \
                VALUES ($id, $name, $kind, $description) \
                ON DUPLICATE KEY UPDATE description = $description";
     db.db
         .query(sql)
-        .bind(("id", entity_record_id(&entity.name)?))
-        .bind(("name", entity.name.clone()))
-        .bind(("kind", entity.kind.clone()))
+        .bind(("id", entity_record_id(&name)?))
+        .bind(("name", name))
+        .bind(("kind", kind))
         .bind((
             "description",
             entity.description.clone().unwrap_or_default(),
@@ -226,24 +230,6 @@ pub async fn link_chunk_to_entity(
         .await
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("link chunk: {e}")))?;
     Ok(())
-}
-
-/// Extract entities from a chunk, upsert each into the `entity` table, and relate
-/// a `chunk ->mentions-> entity` edge so graph expansion can find related chunks.
-/// Returns the number of entities linked.
-pub async fn index_chunk_entities(
-    db: &Db,
-    chunk_id: &str,
-    chunk_content: &str,
-) -> Result<usize, SkbError> {
-    let entities = extract_entities(chunk_content);
-    let mut linked = 0;
-    for entity in entities.iter() {
-        upsert_entity(db, entity).await?;
-        link_chunk_to_entity(db, chunk_id, &entity.name).await?;
-        linked += 1;
-    }
-    Ok(linked)
 }
 
 /// Index a chunk's entities and mentions edges inside an existing transaction.
@@ -543,12 +529,21 @@ pub async fn expand_search_hits(
         }
 
         // Hops 2..: follow related_to edges with distance decay.
+        // Cap the frontier so a densely connected graph cannot blow up the
+        // number of queries or the search latency.
+        const MAX_FRONTIER: usize = 200;
         let mut visited: HashSet<String> = HashSet::new();
         for hop in 2..=max_expand {
+            if frontier.len() >= MAX_FRONTIER {
+                break;
+            }
             let mut next: Vec<(String, f64)> = Vec::new();
             for (entity, _) in frontier.iter() {
                 if !visited.insert(entity.clone()) {
                     continue;
+                }
+                if frontier.len() + next.len() >= MAX_FRONTIER {
+                    break;
                 }
                 let decay = 1.0 / hop as f64;
                 let esql =
@@ -806,7 +801,11 @@ fn parse_inline_list(rest: &str) -> Option<Vec<String>> {
 
 /// The text between the leading `---` markers, if present.
 fn frontmatter_body(content: &str) -> Option<&str> {
-    let rest = content.strip_prefix("---")?;
+    // The opening marker must be a full `---` line (followed by a newline),
+    // otherwise a horizontal rule would be misread as frontmatter.
+    let rest = content
+        .strip_prefix("---\n")
+        .or_else(|| content.strip_prefix("---\r\n"))?;
     let end = rest.find("\n---")?;
     Some(&rest[..end])
 }

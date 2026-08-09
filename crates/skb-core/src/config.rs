@@ -254,11 +254,22 @@ impl Config {
                 .with_context(|| format!("SKB_UPLOAD_MAX_FILE_MB must be a number, got '{v}'"))?;
         }
         if let Some(v) = env_opt("SKB_UPLOAD_ALLOWED_DIRS")? {
-            self.upload.allowed_dirs = v
+            if v.trim().is_empty() {
+                return Err(anyhow::anyhow!(
+                    "SKB_UPLOAD_ALLOWED_DIRS must not be empty (got '{v}')"
+                ));
+            }
+            let dirs: Vec<PathBuf> = v
                 .split(',')
                 .map(|part| PathBuf::from(part.trim()))
                 .filter(|p| !p.as_os_str().is_empty())
                 .collect();
+            if dirs.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "SKB_UPLOAD_ALLOWED_DIRS must contain at least one directory (got '{v}')"
+                ));
+            }
+            self.upload.allowed_dirs = dirs;
         }
         Ok(())
     }
@@ -572,11 +583,17 @@ mod tests {
         std::fs::create_dir_all(&home).unwrap();
         let _home = EnvGuard::set("HOME", home.to_str().unwrap());
         // Also chdir into the empty dir so a ./skb.toml in the crate cwd
-        // cannot be discovered; restore the original directory afterwards.
-        let original = std::env::current_dir().unwrap();
+        // cannot be discovered; an RAII guard restores the directory even if
+        // the load panics.
+        struct CwdGuard(std::path::PathBuf);
+        impl Drop for CwdGuard {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.0);
+            }
+        }
+        let _cwd = CwdGuard(std::env::current_dir().unwrap());
         std::env::set_current_dir(&home).unwrap();
         let config = Config::load().unwrap();
-        std::env::set_current_dir(original).unwrap();
         assert_eq!(config.embedding.model, "env-only-model");
         let _ = std::fs::remove_dir_all(&home);
     }

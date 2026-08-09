@@ -52,6 +52,15 @@ pub async fn reindex(
         .await?
         .and_then(|v| v.parse::<usize>().ok());
     let dimension_changed = stored_dim.is_some_and(|d| d != dimension);
+    // A previous dimension-change reindex was interrupted mid-rebuild: the
+    // marker is still set and the stored dimension already matches, so a
+    // re-run must finish rebuilding chunks AND ensure the HNSW index exists.
+    let recovering = db
+        .get_meta("reindex_in_progress")
+        .await?
+        .as_deref()
+        .is_some_and(|v| v == "1")
+        && !dimension_changed;
 
     // Get all documents
     let find =
@@ -139,24 +148,15 @@ pub async fn reindex(
             .await?;
         result = rebuild_all(db, embedder, tokenizer, config, &docs, progress).await?;
         // 2. Rebuild the HNSW index over the fresh new-dimension chunks.
-        let tx = db
-            .db
-            .clone()
-            .begin()
-            .await
-            .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex begin: {e}")))?;
-        let indexed = redefine_index(&tx, dimension).await;
-        match indexed {
-            Ok(()) => {
-                tx.commit()
-                    .await
-                    .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex commit: {e}")))?;
-            }
-            Err(e) => {
-                let _ = tx.cancel().await;
-                return Err(e);
-            }
-        }
+        redefine_index_transaction(db, dimension).await?;
+        update_metas(db, embedder, tokenizer, config).await?;
+    } else if recovering {
+        // An interrupted dimension-change reindex left the marker set but the
+        // stored dimension already matches: the wipe/transition committed but
+        // chunks were only partially rebuilt. Rebuild everything, then ensure
+        // the HNSW index exists (it may be missing from the interruption).
+        result = rebuild_all(db, embedder, tokenizer, config, &docs, progress).await?;
+        redefine_index_transaction(db, dimension).await?;
         update_metas(db, embedder, tokenizer, config).await?;
     } else {
         result = rebuild_all(db, embedder, tokenizer, config, &docs, progress).await?;
@@ -205,6 +205,14 @@ async fn transition_dimension(tx: &LocalTransaction, dimension: usize) -> Result
 /// embeddings of the target dimension). Runs after the rebuild so its scan
 /// only sees committed, correct-dimension vectors.
 async fn redefine_index(tx: &LocalTransaction, dimension: usize) -> Result<(), SkbError> {
+    // Remove a possibly-existing index first so recovery from an interrupted
+    // reindex can recreate it even when `DEFINE INDEX` would otherwise fail
+    // on an existing definition.
+    tx.query("REMOVE INDEX IF EXISTS chunk_embedding_hnsw ON chunk;")
+        .await
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex index remove: {e}")))?
+        .check()
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex index remove check: {e}")))?;
     let sql = format!(
         "DEFINE INDEX chunk_embedding_hnsw ON chunk \
          FIELDS embedding HNSW DIMENSION {dimension} DIST COSINE;"
@@ -215,6 +223,30 @@ async fn redefine_index(tx: &LocalTransaction, dimension: usize) -> Result<(), S
         .check()
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex index check: {e}")))?;
     Ok(())
+}
+
+/// Rebuild the HNSW index inside its own transaction (commit on success,
+/// cancel on failure), so callers do not duplicate the begin/commit handling.
+async fn redefine_index_transaction(db: &Db, dimension: usize) -> Result<(), SkbError> {
+    let tx = db
+        .db
+        .clone()
+        .begin()
+        .await
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex begin: {e}")))?;
+    let indexed = redefine_index(&tx, dimension).await;
+    match indexed {
+        Ok(()) => {
+            tx.commit()
+                .await
+                .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex commit: {e}")))?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = tx.cancel().await;
+            Err(e)
+        }
+    }
 }
 
 /// Rebuild every document's chunks and mentions, one transaction per document
@@ -279,8 +311,12 @@ async fn rebuild_all(
         result.documents_processed += 1;
         result.chunks_created += chunks.len();
         result.tokens_total += chunks.iter().map(|c| c.token_count).sum::<usize>();
+        // The final (total, total) notification is emitted once by the caller
+        // after the rebuild completes; skip it here to avoid duplicates.
         if let Some(report) = progress {
-            report(i + 1, total);
+            if i + 1 < total {
+                report(i + 1, total);
+            }
         }
     }
     result.entities_extracted = all_entity_names.len();

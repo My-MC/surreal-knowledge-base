@@ -112,6 +112,13 @@ impl McpClient {
         }
     }
 
+    /// Send a JSON-RPC notification (no id, no response expected).
+    fn notify(&mut self, method: &str, params: Value) {
+        let msg = json!({"jsonrpc": "2.0", "method": method, "params": params});
+        writeln!(self.stdin, "{msg}").unwrap();
+        self.stdin.flush().unwrap();
+    }
+
     fn initialize(&mut self) {
         let resp = self.send(
             "initialize",
@@ -122,7 +129,7 @@ impl McpClient {
             }),
         );
         assert!(resp["result"].is_object(), "initialize failed: {resp}");
-        let _ = self.send("notifications/initialized", json!({}));
+        self.notify("notifications/initialized", json!({}));
     }
 
     /// Call a tool and return the parsed JSON payload of its text content.
