@@ -14,6 +14,8 @@ pub const MAX_TOP_K: usize = 1000;
 pub struct SearchRequest {
     pub query: String,
     pub mode: Option<SearchMode>,
+    // The 1000 literal mirrors MAX_TOP_K (schemars range attributes accept
+    // literals only); keep them in sync.
     #[schemars(range(min = 1, max = 1000))]
     pub top_k: Option<usize>,
     #[schemars(range(min = 0, max = 5))]
@@ -391,6 +393,21 @@ mod tests {
     }
 
     #[test]
+    fn rejects_top_k_above_max() {
+        let mut req = request("hello");
+        req.top_k = Some(MAX_TOP_K + 1);
+        assert!(matches!(
+            req.validate(),
+            Err(SkbError {
+                code: ErrorCode::Validation,
+                ..
+            })
+        ));
+        req.top_k = Some(MAX_TOP_K);
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
     fn rejects_graph_expand_beyond_five() {
         let mut req = request("hello");
         req.graph_expand = Some(6);
@@ -413,6 +430,10 @@ mod tests {
             serde_json::json!(["hybrid", "vector", "keyword"])
         );
         assert_eq!(value["properties"]["top_k"]["minimum"], 1);
+        assert_eq!(
+            value["properties"]["top_k"]["maximum"], MAX_TOP_K as u64,
+            "schema top_k maximum must track MAX_TOP_K"
+        );
         assert_eq!(value["properties"]["graph_expand"]["maximum"], 5);
     }
 }

@@ -111,8 +111,11 @@ impl KnowledgeBase {
             }
             // Existing store: validate any stored dimension/max_input values
             // before operating, so a partial write cannot hide a mismatch.
-            if let Some(ref stored_dim) = db.get_meta("embedding_dimension").await? {
-                if stored_dim != &dimension.to_string() {
+            // Each value is fetched once and reused for validation and the
+            // missing-value backfill below.
+            let expected_dim = dimension.to_string();
+            match db.get_meta("embedding_dimension").await? {
+                Some(stored_dim) if stored_dim != expected_dim => {
                     return Err(SkbError::new(
                         ErrorCode::ModelMismatch,
                         format!(
@@ -120,30 +123,24 @@ impl KnowledgeBase {
                         ),
                     ));
                 }
+                Some(_) => {}
+                None => db.set_meta("embedding_dimension", &expected_dim).await?,
             }
-            if let Some(ref stored_tokens) = db.get_meta("embedding_max_input_tokens").await? {
-                if stored_tokens != &config.embedding.max_input_tokens.to_string() {
+            let expected_tokens = config.embedding.max_input_tokens.to_string();
+            match db.get_meta("embedding_max_input_tokens").await? {
+                Some(stored_tokens) if stored_tokens != expected_tokens => {
                     return Err(SkbError::new(
                         ErrorCode::ModelMismatch,
                         format!(
-                            "config max_input_tokens: '{}', stored: '{stored_tokens}'. Run reindex to rebuild.",
-                            config.embedding.max_input_tokens
+                            "config max_input_tokens: '{expected_tokens}', stored: '{stored_tokens}'. Run reindex to rebuild."
                         ),
                     ));
                 }
-            }
-            // Backfill only missing values, after the present ones are
-            // confirmed consistent.
-            if db.get_meta("embedding_dimension").await?.is_none() {
-                db.set_meta("embedding_dimension", &dimension.to_string())
-                    .await?;
-            }
-            if db.get_meta("embedding_max_input_tokens").await?.is_none() {
-                db.set_meta(
-                    "embedding_max_input_tokens",
-                    &config.embedding.max_input_tokens.to_string(),
-                )
-                .await?;
+                Some(_) => {}
+                None => {
+                    db.set_meta("embedding_max_input_tokens", &expected_tokens)
+                        .await?
+                }
             }
             db.migrate(dimension).await?;
         }

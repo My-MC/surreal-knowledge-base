@@ -88,6 +88,7 @@ impl OrderBy {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
 pub struct ListQuery {
+    // Mirrors MAX_TOP_K (schemars range attributes accept literals only).
     #[schemars(range(min = 1, max = 1000))]
     pub limit: Option<usize>,
     pub offset: Option<usize>,

@@ -74,7 +74,8 @@ pub struct GraphQueryRequest {
     pub relation: Option<String>,
     #[schemars(range(min = 1, max = 5))]
     pub depth: Option<usize>,
-    #[schemars(range(min = 1))]
+    // Mirrors MAX_TOP_K (schemars range attributes accept literals only).
+    #[schemars(range(min = 1, max = 1000))]
     pub limit: Option<usize>,
 }
 
@@ -99,6 +100,12 @@ impl GraphQueryRequest {
                 return Err(SkbError::new(
                     ErrorCode::Validation,
                     "limit must be at least 1",
+                ));
+            }
+            if limit > crate::search::MAX_TOP_K {
+                return Err(SkbError::new(
+                    ErrorCode::Validation,
+                    format!("limit must be at most {}", crate::search::MAX_TOP_K),
                 ));
             }
         }
