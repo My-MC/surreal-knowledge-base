@@ -27,11 +27,12 @@ fn setup_config() {
 
 [embedding]
 onnx_path = "mock"
-dimension = 8
+dimension = {}
 
 [storage]
 path = "{}"
 "#,
+        skb_core::embed::MOCK_EMBEDDER_DIMENSION,
         db_path.display()
     );
     std::fs::write(dir.join("skb.toml"), config).unwrap();
@@ -345,7 +346,10 @@ fn contract_doctor_json() {
     setup_config();
     let val = run_skb(&["doctor"], None);
     assert_eq!(val["db_connected"], true);
-    assert_eq!(val["embedding_dimension"], 8);
+    assert_eq!(
+        val["embedding_dimension"],
+        skb_core::embed::MOCK_EMBEDDER_DIMENSION
+    );
     assert!(val["errors"].as_array().unwrap().is_empty());
 }
 

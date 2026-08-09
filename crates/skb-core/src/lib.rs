@@ -285,6 +285,7 @@ impl KnowledgeBase {
         const PAGE: usize = 100;
         let mut docs = Vec::new();
         let mut offset = 0;
+        let mut hit_offset_cap = false;
         loop {
             let page = self
                 .list_documents(&ListQuery {
@@ -298,9 +299,16 @@ impl KnowledgeBase {
             if page_len < PAGE || docs.len() > max {
                 break;
             }
+            // ListQuery rejects offsets above MAX_LIST_OFFSET; stop paginating
+            // before that point and report truncation when the requested max
+            // cannot be fully evaluated within the supported offset range.
+            if offset + PAGE > crate::crud::MAX_LIST_OFFSET {
+                hit_offset_cap = true;
+                break;
+            }
             offset += PAGE;
         }
-        let truncated = docs.len() > max;
+        let truncated = docs.len() > max || (hit_offset_cap && docs.len() < max);
         docs.truncate(max);
         Ok((docs, truncated))
     }

@@ -510,12 +510,21 @@ pub async fn expand_search_hits(
 
         // Hop 1: entities mentioned by this chunk.
         let sql = "SELECT ->mentions->entity.name AS e \
-                   FROM chunk WHERE idx = $idx AND meta::id(document) = $document";
+                   FROM chunk WHERE document = $document AND idx = $idx";
+        // `document_id` is "document:<key>"; strip the table prefix so the
+        // bound RecordId matches the record (and the document,idx index).
+        let document = hit
+            .document_id
+            .split_once(':')
+            .map(|(table, key)| surrealdb::types::RecordId::new(table, key))
+            .unwrap_or_else(|| {
+                surrealdb::types::RecordId::new("document", hit.document_id.as_str())
+            });
         let mut r = db
             .db
             .query(sql)
+            .bind(("document", document))
             .bind(("idx", hit.chunk_idx as i64))
-            .bind(("document", hit.document_id.clone()))
             .await
             .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand: {e}")))?;
         let rows: Vec<serde_json::Value> = r

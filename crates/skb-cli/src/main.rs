@@ -576,10 +576,12 @@ async fn run(cli: &Cli) -> Result<u8> {
                 eprint!("\rreindexed {done}/{total}");
                 let _ = std::io::Write::flush(&mut std::io::stderr());
             };
-            let result = kb.reindex(&req, Some(&progress)).await?;
+            let result = kb.reindex(&req, Some(&progress)).await;
             // The progress callback printed a partial line; terminate it so
-            // the shell prompt does not appear on the same line.
+            // the shell prompt does not appear on the same line, including on
+            // the error path.
             eprintln!();
+            let result = result?;
             output(&result, &fmt)?;
         }
         Commands::Config { cmd } => match cmd {

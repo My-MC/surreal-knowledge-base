@@ -319,6 +319,8 @@ pub struct KnowledgeBase { /* db, embedder, tokenizer, config */ }
 
 impl KnowledgeBase {
     pub async fn open(config: Config) -> Result<Self>;
+    // モデル/次元/tokenizer 不一致でも開く。reindex による再構築専用（§9-5）
+    pub async fn open_for_reindex(config: Config) -> Result<Self>;
 
     // 資料管理
     pub async fn upload(&self, req: UploadRequest) -> Result<UploadResult>;

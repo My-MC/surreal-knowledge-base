@@ -31,8 +31,9 @@ jobs:
       - name: Serial tests (incl. golden contract tests)
         run: cargo test --workspace -- --test-threads=1
       - name: Cargo audit (dependency advisories, incl. pinned ureq)
-        run: cargo install cargo-audit --locked || true
-          cargo audit 2>/dev/null || echo "cargo audit unavailable; install it locally to run advisory checks"
+        run: |
+          cargo install cargo-audit --locked || true
+          cargo audit || echo "cargo audit unavailable; install it locally to run advisory checks"
       - name: Check no native-tls / openssl dependency
         run: |
           cargo tree -i openssl-sys 2>&1 | grep -q "did not match"

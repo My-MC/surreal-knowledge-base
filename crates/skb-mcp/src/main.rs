@@ -515,6 +515,31 @@ mod tests {
     }
 
     #[test]
+    fn tool_inventory_is_stable() {
+        let mut names: Vec<String> = all_tools()
+            .unwrap()
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "skb_delete_document",
+                "skb_get_document",
+                "skb_graph_link",
+                "skb_graph_query",
+                "skb_graph_upsert_entity",
+                "skb_list_documents",
+                "skb_reindex",
+                "skb_search",
+                "skb_stats",
+                "skb_upload",
+            ]
+        );
+    }
+
+    #[test]
     fn upload_tool_has_one_of_with_four_sources() {
         let schema = tool_schema("skb_upload");
         let one_of = schema["oneOf"].as_array().expect("oneOf missing");

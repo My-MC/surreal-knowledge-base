@@ -413,10 +413,17 @@ async fn extract_document_data(
         ));
     };
 
-    let mime_hint = mime_for(&source)
-        .or_else(|| req.title.as_deref().and_then(mime_for))
-        .or_else(|| mime_for(&file_title))
-        .or(content_type_hint);
+    // For URL inputs the server-provided Content-Type is the most reliable
+    // hint; for path/file inputs the extension is. The title/file-title
+    // fallbacks only apply when neither is available.
+    let mime_hint = if req.url.is_some() {
+        content_type_hint.or_else(|| mime_for(&source))
+    } else {
+        mime_for(&source)
+            .or_else(|| req.title.as_deref().and_then(mime_for))
+            .or_else(|| mime_for(&file_title))
+            .or(content_type_hint)
+    };
 
     let (content, mime) = match raw {
         RawInput::Text(text) => {

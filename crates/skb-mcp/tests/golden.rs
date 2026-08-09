@@ -139,7 +139,9 @@ impl McpClient {
             let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
             return Err(json!(text));
         }
-        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("tool {name} returned an unexpected shape: {resp}"));
         Ok(serde_json::from_str(text).unwrap_or(Value::String(text.to_string())))
     }
 }

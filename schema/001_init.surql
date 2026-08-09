@@ -20,6 +20,9 @@ DEFINE FIELD IF NOT EXISTS content     ON chunk TYPE string;
 DEFINE FIELD IF NOT EXISTS token_count ON chunk TYPE int;
 DEFINE FIELD IF NOT EXISTS heading     ON chunk TYPE option<string>;
 
+-- ── Per-document chunk lookups (graph expansion, deletes) ──────────
+DEFINE INDEX IF NOT EXISTS chunk_document_idx ON chunk FIELDS document, idx;
+
 -- ── Full-text index (keyword / hybrid) ──────────────
 -- 3.x dropped the `SEARCH INDEX` keyword; fulltext uses `FULLTEXT ANALYZER`.
 -- `class` tokenizer + lowercase only (ngram broke single-word BM25).

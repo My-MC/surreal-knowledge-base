@@ -2,6 +2,8 @@
 name = "skb"
 version = "0.1.0"
 edition = "2021"
+# MSRV: uses usize::is_multiple_of (stabilized 1.87); CI pins the stable toolchain.
+rust-version = "1.87"
 description = "Surreal Knowledge Base - CLI"
 
 [[bin]]

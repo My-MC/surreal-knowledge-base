@@ -7,8 +7,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Practical upper bound for search `top_k`: results are materialized in
-/// memory, and hybrid search fetches `top_k * 3` candidates. Shared by the
-/// request validation, the JSON Schema and the config validation.
+/// memory, and hybrid search fetches `top_k * 3` candidates. Used by request
+/// and config validation; the JSON Schema below carries the same values as
+/// literals (schemars attributes cannot reference constants), and the schema
+/// tests assert they stay in sync.
 pub const MAX_TOP_K: usize = 1000;
 
 /// Upper bound for graph expansion depth in one search request.
@@ -18,6 +20,7 @@ pub const MAX_GRAPH_EXPAND: usize = 5;
 pub struct SearchRequest {
     pub query: String,
     pub mode: Option<SearchMode>,
+    // Literal mirrors of MAX_TOP_K / MAX_GRAPH_EXPAND; kept in sync by tests.
     #[schemars(range(min = 1, max = 1000))]
     pub top_k: Option<usize>,
     #[schemars(range(min = 0, max = 5))]
@@ -235,52 +238,30 @@ async fn hybrid_search(
     let rrf_k = rrf_k.max(1) as f64;
     let mut scores: HashMap<String, RankedHit> = HashMap::new();
 
-    for (rank, row) in vrows.iter().enumerate() {
-        let Some(id) = row["chunk_id"].as_str().filter(|s| !s.is_empty()) else {
-            continue;
-        };
-        let content = row["content"].as_str().unwrap_or("").to_string();
-        let idx = row["idx"].as_u64().unwrap_or(0) as usize;
-        let doc = row["document"].as_str().unwrap_or("").to_string();
-        let title = row["title"].as_str().map(|s| s.to_string());
-        let source = row["source"].as_str().map(|s| s.to_string());
-        let rrf = 1.0 / (rrf_k + (rank as f64 + 1.0));
-        scores
-            .entry(id.to_string())
-            .and_modify(|e| e.score += rrf)
-            .or_insert(RankedHit {
-                score: rrf,
-                content,
-                idx,
-                document: doc,
-                title,
-                source,
-            });
-    }
-
+    // Vector and keyword result sets contribute to the same RRF scores with
+    // identical row handling; one accumulator keeps the two loops in sync.
+    let mut accumulate = |rows: &[serde_json::Value]| {
+        for (rank, row) in rows.iter().enumerate() {
+            let Some(id) = row["chunk_id"].as_str().filter(|s| !s.is_empty()) else {
+                continue;
+            };
+            let rrf = 1.0 / (rrf_k + (rank as f64 + 1.0));
+            scores
+                .entry(id.to_string())
+                .and_modify(|e| e.score += rrf)
+                .or_insert_with(|| RankedHit {
+                    score: rrf,
+                    content: row["content"].as_str().unwrap_or("").to_string(),
+                    idx: row["idx"].as_u64().unwrap_or(0) as usize,
+                    document: row["document"].as_str().unwrap_or("").to_string(),
+                    title: row["title"].as_str().map(|s| s.to_string()),
+                    source: row["source"].as_str().map(|s| s.to_string()),
+                });
+        }
+    };
+    accumulate(&vrows);
     let highlights = match_terms(query);
-    for (rank, row) in krows.iter().enumerate() {
-        let Some(id) = row["chunk_id"].as_str().filter(|s| !s.is_empty()) else {
-            continue;
-        };
-        let content = row["content"].as_str().unwrap_or("").to_string();
-        let idx = row["idx"].as_u64().unwrap_or(0) as usize;
-        let doc = row["document"].as_str().unwrap_or("").to_string();
-        let title = row["title"].as_str().map(|s| s.to_string());
-        let source = row["source"].as_str().map(|s| s.to_string());
-        let rrf = 1.0 / (rrf_k + (rank as f64 + 1.0));
-        scores
-            .entry(id.to_string())
-            .and_modify(|e| e.score += rrf)
-            .or_insert(RankedHit {
-                score: rrf,
-                content,
-                idx,
-                document: doc,
-                title,
-                source,
-            });
-    }
+    accumulate(&krows);
 
     let mut sorted: Vec<_> = scores.into_iter().collect();
     sorted.sort_by(|a, b| {

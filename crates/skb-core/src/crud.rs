@@ -95,7 +95,7 @@ const MAX_LIST_LIMIT: usize = 10_000;
 
 /// Upper bound for list offset: a huge offset makes SurrealDB scan that many
 /// records before returning, so cap it to bound per-request CPU/IO.
-const MAX_LIST_OFFSET: usize = 1_000_000;
+pub(crate) const MAX_LIST_OFFSET: usize = 1_000_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
 pub struct ListQuery {
@@ -686,7 +686,7 @@ mod tests {
         );
         assert_eq!(
             value["properties"]["offset"]["minimum"], 0,
-            "schema offset minimum must track MAX_LIST_OFFSET"
+            "schema offset minimum must be 0"
         );
         assert_eq!(
             value["properties"]["offset"]["maximum"], MAX_LIST_OFFSET as u64,
