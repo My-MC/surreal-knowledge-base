@@ -315,6 +315,7 @@ fn rows_to_hits(
         let content = row["content"].as_str().unwrap_or("").to_string();
         // Only terms actually present in this hit's content are highlighted;
         // a keyword row whose content lacks the query terms reports None.
+        let hit_highlights = highlights.and_then(|terms| present_terms(&content, terms));
         hits.push(SearchHit {
             document_id: row["document"].as_str().unwrap_or("").to_string(),
             chunk_idx: row["idx"].as_u64().unwrap_or(0) as usize,
@@ -322,10 +323,7 @@ fn rows_to_hits(
             score: row["score"].as_f64().unwrap_or(0.0),
             title: row["title"].as_str().map(|s| s.to_string()),
             source: row["source"].as_str().map(|s| s.to_string()),
-            highlights: highlights.and_then(|terms| {
-                let content = row["content"].as_str().unwrap_or("");
-                present_terms(content, terms)
-            }),
+            highlights: hit_highlights,
             matched_entities: None,
         });
     }

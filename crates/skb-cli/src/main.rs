@@ -336,13 +336,7 @@ async fn run(cli: &Cli) -> Result<u8> {
             // Exactly one input source may be given (spec §12.3); a conflict
             // between --stdin, --url, and paths is rejected before opening the
             // database or expanding paths.
-            let active_sources = [*stdin, url.is_some(), !paths.is_empty()]
-                .into_iter()
-                .filter(|present| *present)
-                .count();
-            if active_sources > 1 {
-                anyhow::bail!("specify exactly one of --stdin, --url, or paths, not several");
-            }
+            check_single_source(*stdin, url.is_some(), !paths.is_empty())?;
 
             let kb = KnowledgeBase::open(cfg()?).await?;
             let meta: HashMap<String, String> = metadata
@@ -679,6 +673,18 @@ fn cfg() -> Result<Config> {
     Config::load()
 }
 
+/// Exactly one input source may be given for an upload (spec §12.3).
+fn check_single_source(stdin: bool, has_url: bool, has_paths: bool) -> Result<()> {
+    let active = [stdin, has_url, has_paths]
+        .into_iter()
+        .filter(|present| *present)
+        .count();
+    if active > 1 {
+        anyhow::bail!("specify exactly one of --stdin, --url, or paths, not several");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -693,5 +699,18 @@ mod tests {
                 .is_err()
         );
         assert!(Cli::try_parse_from(["skb", "upload", "--base64", "--stdin"]).is_ok());
+    }
+
+    #[test]
+    fn single_input_source_is_enforced() {
+        // Only combinations with more than one source are rejected by the
+        // helper; zero sources is handled by the "no input" error later.
+        assert!(check_single_source(true, true, false).is_err());
+        assert!(check_single_source(true, false, true).is_err());
+        assert!(check_single_source(false, true, true).is_err());
+        assert!(check_single_source(true, false, false).is_ok());
+        assert!(check_single_source(false, true, false).is_ok());
+        assert!(check_single_source(false, false, true).is_ok());
+        assert!(check_single_source(false, false, false).is_ok());
     }
 }

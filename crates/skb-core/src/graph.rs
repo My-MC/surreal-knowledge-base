@@ -15,8 +15,8 @@ static WIKI_RE: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"\[\[([^\]|]+)(?:\|([^\]]+))?\]\]").unwrap());
 static TAG_RE: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"(?:^|\s)#([a-zA-Z][\w-]{1,})").unwrap());
-static HEADING_RE: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"(?m)^#{1,6}\s+(.+)").unwrap());
+// Captures both the level (`#{1,6}`) and the heading name; used by heading
+// extraction and section hierarchy so the heading rule lives in one place.
 static SECTION_RE: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"(?m)^(#{1,6})\s+(.+)").unwrap());
 
@@ -584,6 +584,8 @@ pub async fn expand_search_hits(
 
         // Dedup the frontier by entity name, keeping the best (closest hop =
         // highest decay) score, so the chunk query below runs once per entity.
+        // Sort by name so iteration (and thus matched_entities order) is
+        // deterministic across runs.
         let mut best: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
         for (entity, decay) in frontier {
             best.entry(entity)
@@ -594,7 +596,8 @@ pub async fn expand_search_hits(
                 })
                 .or_insert(decay);
         }
-        let frontier: Vec<(String, f64)> = best.into_iter().collect();
+        let mut frontier: Vec<(String, f64)> = best.into_iter().collect();
+        frontier.sort_by(|a, b| a.0.cmp(&b.0));
 
         // Chunks mentioning any frontier entity; scores are the origin hit's
         // score decayed by hop distance (spec §6 re-rank).
@@ -634,12 +637,8 @@ pub async fn expand_search_hits(
     }
 
     // No count truncation here: `max_expand` is the hop depth and the caller
-    // (KnowledgeBase::search) trims the merged list to top_k (spec §6).
-    expanded.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    // (KnowledgeBase::search) re-sorts the merged list with deterministic
+    // tie-breaks and trims to top_k (spec §6), so no intermediate sort needed.
 
     Ok((expanded, origin_entities))
 }
@@ -731,8 +730,8 @@ pub fn extract_entities(content: &str) -> Vec<EntityInfo> {
         });
     }
 
-    // Inline tags: #tag (preceded by space, start-of-line, or punct)
-    // Uses word boundary: \b#tag matches when # is at word boundary
+    // Inline tags: TAG_RE matches `#tag` after start-of-input or whitespace,
+    // with a leading letter and at least one word-character or hyphen.
     for cap in TAG_RE.captures_iter(content) {
         let tag = cap.get(1).map(|m| m.as_str()).unwrap_or("");
         entities.push(EntityInfo {
@@ -743,8 +742,8 @@ pub fn extract_entities(content: &str) -> Vec<EntityInfo> {
     }
 
     // Headings: ^#{1,6}\s+(.+)
-    for cap in HEADING_RE.captures_iter(content) {
-        let heading = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+    for cap in SECTION_RE.captures_iter(content) {
+        let heading = cap.get(2).map(|m| m.as_str()).unwrap_or("");
         if heading.chars().count() > 2 {
             entities.push(EntityInfo {
                 name: heading.trim().to_string(),

@@ -232,10 +232,8 @@ impl Config {
             })?;
         }
         if let Some(v) = env_opt("SKB_SEARCH_DEFAULT_MODE")? {
-            self.search.default_mode = v.parse::<SearchMode>().map_err(|e| {
-                anyhow::anyhow!(
-                    "SKB_SEARCH_DEFAULT_MODE must be hybrid, vector or keyword, got '{v}': {e}"
-                )
+            self.search.default_mode = v.parse::<SearchMode>().with_context(|| {
+                format!("SKB_SEARCH_DEFAULT_MODE must be hybrid, vector or keyword, got '{v}'")
             })?;
         }
         if let Some(v) = env_opt("SKB_SEARCH_TOP_K")? {
@@ -595,6 +593,8 @@ mod tests {
         std::env::set_current_dir(&home).unwrap();
         let config = Config::load().unwrap();
         assert_eq!(config.embedding.model, "env-only-model");
+        // Restore the original directory before removing the temp dir.
+        drop(_cwd);
         let _ = std::fs::remove_dir_all(&home);
     }
 }

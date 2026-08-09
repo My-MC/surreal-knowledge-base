@@ -230,7 +230,7 @@ Phase 0〜8 で確定した方針（`tokenizers`、SurrealKV 組込み、ORT 静
 
 ### 9-1: 設定・モデル・tokenizer整合性（完了）
 
-- `KnowledgeBase::open` は明示設定か自動検出かを保持したまま、`max_input_tokens = 0` をモデル設定から解決し、dimension/max inputを正規化してから `Config::validate()` の `0 < overlap_tokens < max_tokens <= max_input_tokens` を適用する。明示値とモデル値が不一致の場合は `E_VALIDATION` とする。
+- `KnowledgeBase::open` は明示設定か自動検出かを保持したまま、`max_input_tokens = 0` をモデル設定から解決し、dimension/max inputを正規化してから `Config::validate()` の `0 ≤ overlap_tokens < max_tokens <= max_input_tokens` を適用する。明示値とモデル値が不一致の場合は `E_VALIDATION` とする。
 - CLI引数、`SKB_*`環境変数、`./skb.toml`、ユーザー設定の優先順位を実装する。
 - モデル設定からdimensionと最大入力トークン数を検出し、明示設定との不一致を`E_VALIDATION`にする。
 - `embedding.tokenizer` の明示パスと`"auto"`を同じ解決経路として扱い、取得元、`tokenizers`のアルゴリズム/バージョン、対象構成をcanonical JSON serializationしてSHA-256 fingerprintを作成する。

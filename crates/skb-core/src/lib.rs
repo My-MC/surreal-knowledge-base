@@ -308,7 +308,9 @@ impl KnowledgeBase {
             }
             offset += PAGE;
         }
-        let truncated = docs.len() > max || (hit_offset_cap && docs.len() < max);
+        // Reaching the offset cap means more documents may exist, so report
+        // truncation regardless of whether docs.len() reached max.
+        let truncated = docs.len() > max || hit_offset_cap;
         docs.truncate(max);
         Ok((docs, truncated))
     }
@@ -481,13 +483,15 @@ pub(crate) fn tokenizer_fingerprint(
         .and_then(|v| v.as_str())
         .unwrap_or("unknown")
         .to_string();
-    let canonical = serde_json::to_string(&serde_json::json!({
+    // Sort JSON keys recursively so the fingerprint is independent of
+    // serde_json's preserve_order feature (or any insertion-order difference).
+    let canonical = serde_json::to_string(&sort_json_keys(&serde_json::json!({
         "schema": TOKENIZER_FINGERPRINT_SCHEMA,
         "tokenizers": TOKENIZER_CRATE_VERSION,
         "source": source,
         "algorithm": algorithm,
         "config": config,
-    }))
+    })))
     .map_err(|e| {
         SkbError::new(
             ErrorCode::Tokenize,
@@ -506,6 +510,25 @@ pub(crate) fn tokenizer_fingerprint(
         algorithm,
         tokenizers_version: TOKENIZER_CRATE_VERSION.to_string(),
     })
+}
+
+/// Recursively sort JSON object keys so the fingerprint is independent of
+/// serde_json's `preserve_order` feature (or any insertion-order differences).
+fn sort_json_keys(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut sorted: Vec<(String, serde_json::Value)> = map
+                .iter()
+                .map(|(k, v)| (k.clone(), sort_json_keys(v)))
+                .collect();
+            sorted.sort_by(|a, b| a.0.cmp(&b.0));
+            serde_json::Value::Object(sorted.into_iter().collect())
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(sort_json_keys).collect())
+        }
+        other => other.clone(),
+    }
 }
 
 /// Compare the computed tokenizer fingerprint against `meta` and persist it on

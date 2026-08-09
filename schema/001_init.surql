@@ -21,7 +21,11 @@ DEFINE FIELD IF NOT EXISTS token_count ON chunk TYPE int;
 DEFINE FIELD IF NOT EXISTS heading     ON chunk TYPE option<string>;
 
 -- ── Per-document chunk lookups (graph expansion, deletes) ──────────
-DEFINE INDEX IF NOT EXISTS chunk_document_idx ON chunk FIELDS document, idx;
+-- (document, idx) is logically unique: replacement flows delete the old
+-- chunks and insert the new ones within one transaction, so the intermediate
+-- state never violates the constraint. First creation on an existing large
+-- store runs synchronously during Db::migrate on startup.
+DEFINE INDEX IF NOT EXISTS chunk_document_idx ON chunk FIELDS document, idx UNIQUE;
 
 -- ── Full-text index (keyword / hybrid) ──────────────
 -- 3.x dropped the `SEARCH INDEX` keyword; fulltext uses `FULLTEXT ANALYZER`.

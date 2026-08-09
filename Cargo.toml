@@ -3,6 +3,10 @@ resolver = "2"
 members = ["crates/skb-core", "crates/skb-cli", "crates/skb-mcp"]
 exclude = ["spike"]
 
+[workspace.package]
+# MSRV: uses usize::is_multiple_of (stabilized 1.87); CI pins the stable toolchain.
+rust-version = "1.87"
+
 [workspace.dependencies]
 schemars = { version = "1.2", features = ["derive"] }
 

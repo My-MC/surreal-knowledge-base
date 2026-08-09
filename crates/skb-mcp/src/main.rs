@@ -305,6 +305,7 @@ fn all_tools() -> Result<Vec<ToolDef>, rmcp::ErrorData> {
 
 /// Degenerate request type for tools without parameters (`skb_stats`).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct NoParams {}
 
 impl SkbServer {

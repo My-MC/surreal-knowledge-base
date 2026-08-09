@@ -844,6 +844,7 @@ pub fn is_blocked_ip(ip: IpAddr) -> bool {
                 || v6.is_multicast()
                 || v6.is_unique_local()
                 || v6.is_unicast_link_local()
+                || is_site_local_v6(v6)
                 || is_documentation_v6(v6)
                 || is_nat64_v6(v6)
                 || is_6to4_v6(v6)
@@ -899,7 +900,14 @@ fn is_reserved_v4(v4: std::net::Ipv4Addr) -> bool {
 
 /// 2001:db8::/32 — documentation range.
 fn is_documentation_v6(v6: std::net::Ipv6Addr) -> bool {
-    v6.segments()[0] == 0x2001 && v6.segments()[1] == 0x0db8
+    let s = v6.segments();
+    s[0] == 0x2001 && s[1] == 0x0db8 || s[0] == 0x3fff && s[1] == 0
+}
+
+/// fec0::/10 — deprecated site-local (RFC 3879).
+fn is_site_local_v6(v6: std::net::Ipv6Addr) -> bool {
+    let s = v6.segments();
+    s[0] & 0xffc0 == 0xfec0
 }
 
 /// 64:ff9b::/96 — NAT64 well-known prefix (maps to IPv4 destinations).
@@ -1072,6 +1080,8 @@ mod tests {
             "64:ff9b::7f00:1",
             "2002:7f00:0001::",
             "2001:0000:0:0:0:0:0101:0101",
+            "fec0::1",
+            "3fff::1",
         ];
         for ip in extra_v6 {
             let ip: IpAddr = ip.parse().unwrap();
@@ -1155,6 +1165,11 @@ mod tests {
 
     /// Serve an HTTP response repeatedly on a loopback listener in a background
     /// thread, returning the base URL.
+    /// Serve `response` for exactly `times` connections on a background
+    /// listener. `times` must equal the number of connections each test
+    /// consumes (fetch_url_rejects_too_many_redirects uses MAX_REDIRECTS + 1,
+    /// fetch_url_rejects_body_over_size_limit uses 1); otherwise the listener
+    /// thread blocks in accept until process shutdown.
     fn serve_repeatedly(response: String, times: usize) -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
