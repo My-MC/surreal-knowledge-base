@@ -283,8 +283,10 @@ fn contract_search_response_fields() {
     assert!(hl.iter().any(|v| v == "zzzkw"));
 
     let vec = run_skb(&["search", "zzzkw", "--mode", "vector"], None);
-    assert!(vec["hits"][0]["title"].is_string());
-    assert!(vec["hits"][0]["highlights"].is_null());
+    let hits = vec["hits"].as_array().unwrap();
+    assert!(!hits.is_empty(), "vector search must return hits");
+    assert!(hits[0]["title"].is_string());
+    assert!(hits[0]["highlights"].is_null());
 }
 
 #[test]

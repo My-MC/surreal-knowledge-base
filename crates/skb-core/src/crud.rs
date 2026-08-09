@@ -684,5 +684,13 @@ mod tests {
             value["properties"]["limit"]["maximum"],
             MAX_LIST_LIMIT as u64
         );
+        assert_eq!(
+            value["properties"]["offset"]["minimum"], 0,
+            "schema offset minimum must track MAX_LIST_OFFSET"
+        );
+        assert_eq!(
+            value["properties"]["offset"]["maximum"], MAX_LIST_OFFSET as u64,
+            "schema offset maximum must track MAX_LIST_OFFSET"
+        );
     }
 }

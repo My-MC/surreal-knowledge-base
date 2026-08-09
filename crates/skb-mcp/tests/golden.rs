@@ -205,10 +205,13 @@ fn normalize(value: &mut Value) {
             map.remove("created_at");
             map.remove("updated_at");
             for (k, v) in map.iter_mut() {
-                // `hits` carries ranking order that must survive comparison.
+                // `hits` carries ranking order that must survive comparison;
+                // `highlights` / `matched_entities` inside each hit are also
+                // contractually ordered, so their arrays are normalized
+                // without sorting.
                 if k == "hits" {
                     for hit in v.as_array_mut().into_iter().flatten() {
-                        normalize(hit);
+                        normalize_object_preserving_arrays(hit);
                     }
                 } else {
                     normalize(v);
@@ -222,6 +225,30 @@ fn normalize(value: &mut Value) {
             items.sort_by_key(|item| serde_json::to_string(item).unwrap_or_default());
         }
         _ => {}
+    }
+}
+
+/// Like `normalize`, but preserves the order of array fields inside an object
+/// (used for hits, where highlights/matched_entities ordering is significant).
+fn normalize_object_preserving_arrays(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            map.remove("document_id");
+            map.remove("id");
+            map.remove("elapsed_ms");
+            map.remove("created_at");
+            map.remove("updated_at");
+            for (k, v) in map.iter_mut() {
+                if k == "highlights" || k == "matched_entities" {
+                    for item in v.as_array_mut().into_iter().flatten() {
+                        normalize(item);
+                    }
+                } else {
+                    normalize(v);
+                }
+            }
+        }
+        other => normalize(other),
     }
 }
 

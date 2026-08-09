@@ -173,7 +173,7 @@ fn is_heading_line(line: &str) -> bool {
             break;
         }
     }
-    (1..=6).contains(&hashes) && bytes.get(hashes) == Some(&b' ')
+    (1..=6).contains(&hashes) && matches!(bytes.get(hashes), Some(b' ') | Some(b'\t'))
 }
 
 /// The heading that owns a chunk spanning `[start, end)`: the first heading

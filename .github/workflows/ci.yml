@@ -118,6 +118,8 @@ jobs:
         with:
           node-version: 22
       - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.19
       - uses: actions/download-artifact@v8
         with:
           name: npm-linux-x64
@@ -141,6 +143,10 @@ jobs:
         run: |
           MAX_GLIBC=$(objdump -T npm/packages/linux-x64/bin/skb-mcp \
             | grep -oP 'GLIBC_\K[0-9.]+' | sort -Vu | tail -1)
+          if [ -z "$MAX_GLIBC" ]; then
+            echo "failed to extract a GLIBC version from the binary"
+            exit 1
+          fi
           echo "Max GLIBC version required: $MAX_GLIBC"
           LIMIT=2.38
           HIGHEST=$(printf '%s\n%s\n' "$MAX_GLIBC" "$LIMIT" | sort -V | tail -1)

@@ -852,6 +852,10 @@ fn is_blocked_v4(v4: std::net::Ipv4Addr) -> bool {
         || v4.is_unspecified()
         || v4.is_broadcast()
         || v4.is_documentation()
+        // 0.0.0.0/8 — "this network" (RFC 1122); only 0.0.0.0 itself matches
+        // is_unspecified, so block the whole range (some OSes route it to
+        // loopback; ::0.0.0.x arrives here via to_ipv4()).
+        || v4.octets()[0] == 0
         || is_cgnat(v4)
         || is_benchmarking(v4)
         || is_reserved_v4(v4)
@@ -1016,6 +1020,8 @@ mod tests {
             "240.0.0.1",
             "255.255.255.255",
             "0.0.0.0",
+            "0.0.0.1",
+            "0.1.2.3",
             "192.0.2.1",
             "::1",
             "fe80::1",

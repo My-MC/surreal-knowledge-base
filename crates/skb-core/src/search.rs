@@ -11,6 +11,9 @@ use std::collections::HashMap;
 /// request validation, the JSON Schema and the config validation.
 pub const MAX_TOP_K: usize = 1000;
 
+/// Upper bound for graph expansion depth in one search request.
+pub const MAX_GRAPH_EXPAND: usize = 5;
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SearchRequest {
     pub query: String,
@@ -45,10 +48,10 @@ impl SearchRequest {
             }
         }
         if let Some(depth) = self.graph_expand {
-            if depth > 5 {
+            if depth > MAX_GRAPH_EXPAND {
                 return Err(SkbError::new(
                     ErrorCode::Validation,
-                    "graph_expand must be at most 5",
+                    format!("graph_expand must be at most {MAX_GRAPH_EXPAND}"),
                 ));
             }
         }
@@ -68,7 +71,8 @@ pub struct SearchHit {
     /// Document source (path / url / inline); always present for persisted chunks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
-    /// Query terms found in the chunk (keyword mode).
+    /// Query terms found in the chunk, for both keyword and hybrid modes
+    /// (only terms actually present in the hit's content are kept).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub highlights: Option<Vec<String>>,
     /// Entities that led to this hit via graph expansion.
@@ -283,6 +287,9 @@ async fn hybrid_search(
         b.1.score
             .partial_cmp(&a.1.score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            // Deterministic tie-break on a stable identifier so boundary
+            // results are reproducible across runs and platforms.
+            .then_with(|| a.0.cmp(&b.0))
     });
     sorted.truncate(top_k);
 
@@ -524,6 +531,9 @@ mod tests {
             value["properties"]["top_k"]["maximum"], MAX_TOP_K as u64,
             "schema top_k maximum must track MAX_TOP_K"
         );
-        assert_eq!(value["properties"]["graph_expand"]["maximum"], 5);
+        assert_eq!(
+            value["properties"]["graph_expand"]["maximum"], MAX_GRAPH_EXPAND as u64,
+            "schema graph_expand maximum must track MAX_GRAPH_EXPAND"
+        );
     }
 }

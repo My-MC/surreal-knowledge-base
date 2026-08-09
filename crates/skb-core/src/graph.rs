@@ -759,6 +759,16 @@ fn frontmatter_list(content: &str, key: &str) -> Vec<String> {
         if trimmed.starts_with("---") {
             break;
         }
+        // A bullet inside a list is always a list entry — even when the item
+        // text contains a colon (e.g. "- note: something"), which must not
+        // terminate the list via the key/value branch below.
+        if in_list && trimmed.starts_with('-') {
+            let item = trimmed[1..].trim();
+            if !item.is_empty() {
+                out.push(item.to_string());
+            }
+            continue;
+        }
         if let Some((k, rest)) = trimmed.split_once(':') {
             let is_target = k.trim() == key;
             let rest = rest.trim();
@@ -773,15 +783,8 @@ fn frontmatter_list(content: &str, key: &str) -> Vec<String> {
             // Any other key ends the current list: the following bullets
             // belong to that key's value, not to the one we are collecting.
             in_list = false;
-        } else if in_list {
-            if let Some(item) = trimmed.strip_prefix("-") {
-                let item = item.trim();
-                if !item.is_empty() {
-                    out.push(item.to_string());
-                }
-            } else {
-                in_list = false;
-            }
+        } else {
+            in_list = false;
         }
     }
     out

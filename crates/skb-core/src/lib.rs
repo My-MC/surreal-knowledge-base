@@ -146,11 +146,14 @@ impl KnowledgeBase {
             )
             .await?;
             db.set_meta("schema_version", "1").await?;
-        } else {
+        } else if !allow_mismatch {
             // Backfill metadata for stores created before these keys existed
             // (e.g. migrate succeeded but set_meta was interrupted). Without
             // them the model/dimension comparison in open skips (None), so a
-            // config change would go undetected.
+            // config change would go undetected. In allow_mismatch mode
+            // (open_for_reindex) only a successful reindex may record the new
+            // values, so the backfill is skipped there — matching the
+            // tokenizer fingerprint handling below.
             if db.get_meta("embedding_model").await?.is_none() {
                 db.set_meta("embedding_model", &config.embedding.model)
                     .await?;
@@ -695,6 +698,9 @@ mod tests {
         for _ in 0..ATTEMPTS {
             match KnowledgeBase::open(config.clone()).await {
                 Ok(kb) => return Ok(kb),
+                // Only transient file-lock failures are retried; persistent
+                // errors (e.g. ModelMismatch) return immediately.
+                Err(e) if !matches!(e.code, ErrorCode::Db) => return Err(e),
                 Err(e) => {
                     last = Some(e);
                     tokio::time::sleep(std::time::Duration::from_millis(150)).await;

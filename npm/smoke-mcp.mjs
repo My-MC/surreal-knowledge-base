@@ -23,6 +23,9 @@ child.on("error", (err) => {
   }
 });
 const rl = createInterface({ input: child.stdout });
+// Swallow EPIPE from stdin writes after the child exits; the exit/error
+// handlers reject pending requests with the real failure reason.
+child.stdin.on("error", () => {});
 const pending = new Map();
 let nextId = 1;
 
@@ -131,5 +134,8 @@ assert(
 );
 
 console.log("SMOKE OK");
+// Wait for the child to exit so its SurrealKV file handles are released
+// before the job moves on; fall back to exiting after 5s.
+child.once("exit", () => process.exit(0));
 child.kill();
-process.exit(0);
+setTimeout(() => process.exit(0), 5000).unref();

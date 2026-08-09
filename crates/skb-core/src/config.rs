@@ -571,7 +571,12 @@ mod tests {
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/skb-cfg-test-home");
         std::fs::create_dir_all(&home).unwrap();
         let _home = EnvGuard::set("HOME", home.to_str().unwrap());
+        // Also chdir into the empty dir so a ./skb.toml in the crate cwd
+        // cannot be discovered; restore the original directory afterwards.
+        let original = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&home).unwrap();
         let config = Config::load().unwrap();
+        std::env::set_current_dir(original).unwrap();
         assert_eq!(config.embedding.model, "env-only-model");
         let _ = std::fs::remove_dir_all(&home);
     }

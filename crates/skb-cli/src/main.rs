@@ -391,13 +391,11 @@ async fn run(cli: &Cli) -> Result<u8> {
                     }
                 }
             }
-            // A glob matching only directories (non-recursive) leaves `expanded`
-            // empty even though the user did provide inputs; report that with a
-            // dedicated message instead of the misleading "no input" error.
+            // A glob matching only directories (non-recursive) — or a
+            // --recursive walk that found nothing — leaves `expanded` empty
+            // even though the user did provide inputs; report that clearly.
             if !paths.is_empty() && expanded.is_empty() {
-                anyhow::bail!(
-                    "no files to upload: matched entries are directories; use --recursive"
-                );
+                anyhow::bail!("no files found to upload for the given inputs");
             }
 
             let build = |p: Option<String>,

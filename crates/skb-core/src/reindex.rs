@@ -88,8 +88,9 @@ pub async fn reindex(
                 continue;
             }
             dry_entity_names.extend(
-                crate::graph::extract_entities(content)
-                    .into_iter()
+                chunks
+                    .iter()
+                    .flat_map(|c| crate::graph::extract_entities(&c.content))
                     .map(|e| e.name),
             );
             result.documents_processed += 1;
