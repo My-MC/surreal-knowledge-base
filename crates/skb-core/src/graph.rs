@@ -614,39 +614,52 @@ pub async fn expand_search_hits(
         });
 
         // Chunks mentioning any frontier entity; scores are the origin hit's
-        // score decayed by hop distance (spec §6 re-rank).
-        for (entity, decay) in frontier {
-            let esql = "SELECT content, idx, meta::id(document) AS document, \
-                        document.title AS title, document.source AS source \
-                        FROM chunk WHERE $name IN ->mentions->entity.name \
-                        LIMIT 50";
-            let mut r = db
-                .db
-                .query(esql)
-                .bind(("name", entity.clone()))
-                .await
-                .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand2: {e}")))?;
-            let erows: Vec<serde_json::Value> = r
-                .take(0)
-                .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand2 take: {e}")))?;
+        // score decayed by hop distance (spec §6 re-rank). All frontier
+        // entities are resolved in one batched query to avoid N+1 round trips.
+        let names: Vec<String> = frontier.iter().map(|(e, _)| e.clone()).collect();
+        let decay_map: std::collections::HashMap<String, f64> = frontier.into_iter().collect();
+        let esql = "SELECT content, idx, \
+                    string::concat('document:', meta::id(document)) AS document, \
+                    document.title AS title, document.source AS source, \
+                    ->mentions->entity.name AS e \
+                    FROM chunk WHERE ->mentions->entity.name IN $names \
+                    LIMIT 200";
+        let mut r = db
+            .db
+            .query(esql)
+            .bind(("names", names))
+            .await
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand2: {e}")))?;
+        let erows: Vec<serde_json::Value> = r
+            .take(0)
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand2 take: {e}")))?;
 
-            for erow in erows.iter() {
-                let document_id = erow["document"].as_str().unwrap_or("").to_string();
-                let chunk_idx = erow["idx"].as_u64().unwrap_or(0) as usize;
-                if !seen_chunks.insert((document_id.clone(), chunk_idx)) {
-                    continue;
-                }
-                expanded.push(SearchHit {
-                    document_id,
-                    chunk_idx,
-                    content: erow["content"].as_str().unwrap_or("").to_string(),
-                    score: origin_score * decay,
-                    title: erow["title"].as_str().map(|s| s.to_string()),
-                    source: erow["source"].as_str().map(|s| s.to_string()),
-                    highlights: None,
-                    matched_entities: Some(vec![entity.clone()]),
-                });
+        for erow in erows.iter() {
+            let document_id = erow["document"].as_str().unwrap_or("").to_string();
+            let chunk_idx = erow["idx"].as_u64().unwrap_or(0) as usize;
+            if !seen_chunks.insert((document_id.clone(), chunk_idx)) {
+                continue;
             }
+            let decay = to_string_vec(&erow["e"])
+                .iter()
+                .filter_map(|e| decay_map.get(e))
+                .cloned()
+                .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .unwrap_or(1.0);
+            let entity = to_string_vec(&erow["e"])
+                .into_iter()
+                .next()
+                .unwrap_or_default();
+            expanded.push(SearchHit {
+                document_id,
+                chunk_idx,
+                content: erow["content"].as_str().unwrap_or("").to_string(),
+                score: origin_score * decay,
+                title: erow["title"].as_str().map(|s| s.to_string()),
+                source: erow["source"].as_str().map(|s| s.to_string()),
+                highlights: None,
+                matched_entities: Some(vec![entity]),
+            });
         }
     }
 
@@ -755,9 +768,9 @@ pub fn extract_entities(content: &str) -> Vec<EntityInfo> {
         });
     }
 
-    // Headings: ^#{1,6}\s+(.+)
-    for cap in SECTION_RE.captures_iter(content) {
-        let heading = cap.get(2).map(|m| m.as_str()).unwrap_or("");
+    // Headings: ^#{1,6}\s+(.+), skipping lines inside fenced code blocks so
+    // `# comment` in a fence is never treated as a section entity.
+    for (heading, _) in visible_headings(content) {
         if heading.chars().count() > 2 {
             entities.push(EntityInfo {
                 name: heading.trim().to_string(),
@@ -768,6 +781,30 @@ pub fn extract_entities(content: &str) -> Vec<EntityInfo> {
     }
 
     dedup_entities(entities)
+}
+
+/// Iterate headings (name, level) that are NOT inside fenced code blocks,
+/// shared by entity extraction and section hierarchy so the heading rules
+/// match the chunking logic in tokenize.rs (which also skips fences).
+fn visible_headings(content: &str) -> Vec<(String, u32)> {
+    let mut out = Vec::new();
+    let mut in_fence = false;
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        if let Some(cap) = SECTION_RE.captures(trimmed) {
+            let level = cap.get(1).map(|m| m.as_str().len()).unwrap_or(1) as u32;
+            let name = cap.get(2).map(|m| m.as_str().trim()).unwrap_or("");
+            out.push((name.to_string(), level));
+        }
+    }
+    out
 }
 
 /// Read a list value (`[a, b]` or `- item` lines) for `key` from a YAML
@@ -841,8 +878,18 @@ fn frontmatter_body(content: &str) -> Option<&str> {
     let rest = content
         .strip_prefix("---\n")
         .or_else(|| content.strip_prefix("---\r\n"))?;
-    let end = rest.find("\n---")?;
-    Some(&rest[..end])
+    // The closing delimiter is recognized only when an entire line equals
+    // "---", so `----`, `--- note` and horizontal rules inside the body are
+    // not treated as the end of frontmatter.
+    let mut offset = 0usize;
+    for line in rest.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\r', '\n']).trim_end();
+        if trimmed == "---" {
+            return Some(&rest[..offset]);
+        }
+        offset += line.len();
+    }
+    None
 }
 
 fn dedup_entities(entities: Vec<EntityInfo>) -> Vec<EntityInfo> {
@@ -859,17 +906,13 @@ pub struct Section {
     pub level: u32,
 }
 
-/// Extract heading sections with levels for hierarchy linking.
+/// Extract heading sections with levels for hierarchy linking. Headings inside
+/// fenced code blocks are ignored (shared with entity extraction).
 pub fn extract_sections(content: &str) -> Vec<Section> {
     let mut sections = Vec::new();
-    for cap in SECTION_RE.captures_iter(content) {
-        let level = cap.get(1).map(|m| m.as_str().len()).unwrap_or(1) as u32;
-        let name = cap.get(2).map(|m| m.as_str().trim()).unwrap_or("");
+    for (name, level) in visible_headings(content) {
         if name.chars().count() > 2 {
-            sections.push(Section {
-                name: name.to_string(),
-                level,
-            });
+            sections.push(Section { name, level });
         }
     }
     sections

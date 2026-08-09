@@ -79,8 +79,11 @@ function notify(method, params) {
 function assert(cond, message) {
   if (!cond) {
     console.error("FAIL: " + message);
+    // Terminate the child and wait for its exit (releasing SurrealKV file
+    // locks) before ending the parent, like the normal shutdown path.
+    child.once("exit", () => process.exit(1));
     child.kill();
-    process.exit(1);
+    setTimeout(() => process.exit(1), 5000).unref();
   }
 }
 
@@ -99,10 +102,15 @@ const toolNames = (tools.result?.tools ?? []).map((t) => t.name);
 assert(toolNames.includes("skb_upload"), "tools/list must list skb_upload");
 assert(toolNames.includes("skb_search"), "tools/list must list skb_search");
 
+// Unique content per run so an existing store never dedupes the upload to
+// "skipped" (and the search assertion still finds the document).
+const uniqueContent =
+  "Smoke test document about HNSW vector search and BM25. " + Date.now();
+
 const up = await request("tools/call", {
   name: "skb_upload",
   arguments: {
-    content: "Smoke test document about HNSW vector search and BM25.",
+    content: uniqueContent,
     title: "smoke-doc",
   },
 });

@@ -107,6 +107,11 @@ pub async fn reindex(
             result.tokens_total += chunks.iter().map(|c| c.token_count).sum::<usize>();
         }
         result.entities_extracted = dry_entity_names.len();
+        // Emit the same final notification as the normal path so callbacks
+        // recognize dry-run completion (docs.len(), docs.len()).
+        if let Some(report) = progress {
+            report(docs.len(), docs.len());
+        }
         return Ok(result);
     }
 

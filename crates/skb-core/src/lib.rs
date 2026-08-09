@@ -627,11 +627,19 @@ mod tests {
     #[test]
     fn tokenizer_crate_version_matches_manifest() {
         let manifest = include_str!("../Cargo.toml");
-        assert!(
-            manifest.contains(&format!(
+        let workspace = include_str!("../../../Cargo.toml");
+        let direct = manifest.contains(&format!(
+            "tokenizers = {{ version = \"{TOKENIZER_CRATE_VERSION}\""
+        )) || manifest
+            .contains(&format!("tokenizers = \"{TOKENIZER_CRATE_VERSION}\""));
+        // A workspace-ref declaration resolves from the root manifest instead.
+        let workspace_ref = manifest.contains("tokenizers.workspace = true")
+            && workspace.contains(&format!(
                 "tokenizers = {{ version = \"{TOKENIZER_CRATE_VERSION}\""
-            )) || manifest.contains(&format!("tokenizers = \"{TOKENIZER_CRATE_VERSION}\"")),
-            "TOKENIZER_CRATE_VERSION ({TOKENIZER_CRATE_VERSION}) must match Cargo.toml"
+            ));
+        assert!(
+            direct || workspace_ref,
+            "TOKENIZER_CRATE_VERSION ({TOKENIZER_CRATE_VERSION}) must match the manifest"
         );
     }
 

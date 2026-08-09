@@ -130,18 +130,6 @@ pub async fn upload(
     req.validate()?;
     let force = req.force.unwrap_or(false);
     let doc = extract_document_data(req, config).await?;
-    let existed = doc_exists(db, &doc.sha256).await?;
-    if !force && existed {
-        return Ok(UploadResult {
-            document_id: None,
-            title: doc.title,
-            status: "skipped".into(),
-            chunks: 0,
-            tokens: 0,
-            sha256: doc.sha256,
-            entities: vec![],
-        });
-    }
 
     let chunks = tokenizer.chunk(
         &doc.content,
@@ -171,6 +159,23 @@ pub async fn upload(
         .begin()
         .await
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("upload begin: {e}")))?;
+
+    // The duplicate check runs inside the same transaction as the write so a
+    // concurrent upload of identical content cannot both observe "new" and
+    // create duplicate documents.
+    let existed = tx_doc_exists(&tx, &doc.sha256).await?;
+    if !force && existed {
+        let _ = tx.cancel().await;
+        return Ok(UploadResult {
+            document_id: None,
+            title: doc.title,
+            status: "skipped".into(),
+            chunks: 0,
+            tokens: 0,
+            sha256: doc.sha256,
+            entities: vec![],
+        });
+    }
 
     let stored = store_and_index(&tx, &doc, &chunks, &embeddings, force && existed).await;
     let (doc_id, entities) = match stored {
@@ -930,10 +935,9 @@ fn is_teredo_v6(v6: std::net::Ipv6Addr) -> bool {
 
 fn base64_decode_checked(b64: &str, config: &Config) -> Result<Vec<u8>, SkbError> {
     use base64::Engine;
-    // Reject oversized input before allocating the compact copy: encoded size
-    // is an upper bound on the decoded size (base64 is >= 4/3).
-    check_size(b64.len() as u64, config)?;
     let compact: String = b64.chars().filter(|c| !c.is_whitespace()).collect();
+    // Pre-allocation size check via the decoded-length estimate (a tight
+    // bound); oversized payloads are rejected before allocating the buffer.
     let estimated = base64::decoded_len_estimate(compact.len());
     check_size(estimated as u64, config)?;
     let bytes = base64::engine::general_purpose::STANDARD
@@ -979,10 +983,9 @@ fn embed_batch(
     Ok(all)
 }
 
-async fn doc_exists(db: &Db, sha256: &str) -> Result<bool, SkbError> {
+async fn tx_doc_exists(tx: &LocalTransaction, sha256: &str) -> Result<bool, SkbError> {
     let query = "SELECT count() AS c FROM document WHERE sha256 = $sha256 GROUP ALL";
-    let mut r = db
-        .db
+    let mut r = tx
         .query(query)
         .bind(("sha256", sha256.to_string()))
         .await

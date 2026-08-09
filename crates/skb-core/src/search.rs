@@ -134,7 +134,7 @@ async fn vector_search(
 
     let emb_str = serde_json::to_string(&query_emb).unwrap_or_default();
     let sql = format!(
-        "SELECT content, idx, meta::id(document) AS document, \
+        "SELECT content, idx, string::concat('document:', meta::id(document)) AS document, \
          document.title AS title, document.source AS source, \
          vector::similarity::cosine(embedding, {emb_str}) AS score \
          FROM chunk WHERE embedding <|{top_k},40|> {emb_str} \
@@ -155,7 +155,7 @@ async fn vector_search(
 
 async fn keyword_search(db: &Db, query: &str, top_k: usize) -> Result<Vec<SearchHit>, SkbError> {
     let sql = format!(
-        "SELECT content, idx, meta::id(document) AS document, \
+        "SELECT content, idx, string::concat('document:', meta::id(document)) AS document, \
          document.title AS title, document.source AS source, search::score(0) AS score \
          FROM chunk WHERE content @0@ $q ORDER BY score DESC LIMIT {top_k}"
     );
@@ -195,7 +195,7 @@ async fn hybrid_search(
     // Vector results
     let vsql = format!(
         "SELECT content, idx, meta::id(id) AS chunk_id, \
-         meta::id(document) AS document, \
+         string::concat('document:', meta::id(document)) AS document, \
          document.title AS title, document.source AS source, \
          vector::similarity::cosine(embedding, {emb_str}) AS score \
          FROM chunk WHERE embedding <|{fetch_k},40|> {emb_str} \
@@ -213,7 +213,7 @@ async fn hybrid_search(
     // Keyword results
     let ksql = format!(
         "SELECT content, idx, meta::id(id) AS chunk_id, \
-         meta::id(document) AS document, \
+         string::concat('document:', meta::id(document)) AS document, \
          document.title AS title, document.source AS source, search::score(0) AS score \
          FROM chunk WHERE content @0@ $q ORDER BY score DESC LIMIT {fetch_k}"
     );
@@ -366,6 +366,8 @@ async fn apply_filter(
     let mut ids: Vec<String> = hits.iter().map(|h| h.document_id.clone()).collect();
     ids.sort();
     ids.dedup();
+    // document_id is `document:<key>`; match on the full record id so the
+    // comparison uses the same normalized form as the search results.
     let in_list = ids
         .iter()
         .map(|id| format!("'{id}'"))
@@ -375,8 +377,8 @@ async fn apply_filter(
     let select_fields = fields.join(",");
 
     let sql = format!(
-        "SELECT meta::id(id) AS id, {select_fields} \
-         FROM document WHERE meta::id(id) IN [{ids}]",
+        "SELECT string::concat('document:', meta::id(id)) AS id, {select_fields} \
+         FROM document WHERE string::concat('document:', meta::id(id)) IN [{ids}]",
         select_fields = select_fields,
         ids = in_list,
     );
