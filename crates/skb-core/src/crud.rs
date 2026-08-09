@@ -33,6 +33,7 @@ pub struct ChunkInfo {
     pub idx: usize,
     pub content: String,
     pub token_count: usize,
+    #[serde(default)]
     pub heading: Option<String>,
 }
 
@@ -460,7 +461,12 @@ pub async fn doctor(
     // Connectivity first: the point of doctor is to report problems, so a
     // broken database must never make the report itself fail.
     match db.db.query("RETURN 1").await {
-        Ok(_) => report.db_connected = true,
+        Ok(r) => match r.check() {
+            Ok(_) => report.db_connected = true,
+            Err(e) => report
+                .errors
+                .push(format!("SurrealDB statement check: {e}")),
+        },
         Err(e) => report.errors.push(format!("SurrealDB connection: {e}")),
     }
     // Meta reads can also fail; record instead of propagating.

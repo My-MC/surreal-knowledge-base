@@ -533,10 +533,12 @@ pub async fn expand_search_hits(
         for row in rows.iter() {
             for ename in to_string_vec(&row["e"]) {
                 frontier.push((ename.clone(), 1.0_f64));
-                origin_entities
+                let origin = origin_entities
                     .entry(format!("{}/{}", hit.document_id, hit.chunk_idx))
-                    .or_default()
-                    .push(ename);
+                    .or_default();
+                if !origin.contains(&ename) {
+                    origin.push(ename);
+                }
             }
         }
 

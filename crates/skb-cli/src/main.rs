@@ -298,6 +298,11 @@ async fn run(cli: &Cli) -> Result<u8> {
                 );
                 println!("Embedding dim: {}", report.embedding_dimension);
                 println!("Tokenizer vocab: {}", report.tokenizer_vocab);
+                println!("Tokenizer ver: {}", report.tokenizer_version);
+                println!(
+                    "Tokenizer fp schema: {}",
+                    report.tokenizer_fingerprint_schema
+                );
                 println!("Model: {}", report.model);
                 println!("Schema ver: {}", report.schema_version);
                 for error in &report.errors {

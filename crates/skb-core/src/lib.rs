@@ -571,6 +571,17 @@ mod tests {
 
     static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
+    #[test]
+    fn tokenizer_crate_version_matches_manifest() {
+        let manifest = include_str!("../Cargo.toml");
+        assert!(
+            manifest.contains(&format!(
+                "tokenizers = {{ version = \"{TOKENIZER_CRATE_VERSION}\""
+            )) || manifest.contains(&format!("tokenizers = \"{TOKENIZER_CRATE_VERSION}\"")),
+            "TOKENIZER_CRATE_VERSION ({TOKENIZER_CRATE_VERSION}) must match Cargo.toml"
+        );
+    }
+
     fn is_upload_source(name: &str) -> bool {
         matches!(name, "path" | "url" | "content" | "content_base64")
     }

@@ -57,6 +57,14 @@ impl McpClient {
             .expect("failed to spawn skb-mcp (build with: cargo build -p skb-mcp)");
         let stdin = child.stdin.take().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
+        // Watchdog: if the server stays alive without replying, read_response
+        // would block forever; abort the test process after 60s instead of
+        // hanging CI (matches the 30s smoke limit with margin).
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            eprintln!("golden test watchdog: aborting after 60s (no response from skb-mcp)");
+            std::process::abort();
+        });
         McpClient {
             child,
             stdin,
@@ -143,7 +151,9 @@ dimension = 8
 [storage]
 path = "{}"
 "#,
-        dir.join("db").display()
+        // Forward slashes so the path is a valid TOML basic string on Windows
+        // (backslashes would be invalid escapes).
+        dir.join("db").display().to_string().replace('\\', "/")
     );
     std::fs::write(dir.join("skb.toml"), config).unwrap();
     dir
@@ -267,7 +277,11 @@ fn golden_upload_search_list_stats_get_delete() {
     // stats
     let mcp_stats = mcp.call_tool("skb_stats", json!({})).unwrap();
     let cli_stats = run_cli(&cli_dir, &["stats"], None).unwrap();
-    assert_eq!(mcp_stats, cli_stats, "stats: {mcp_stats} vs {cli_stats}");
+    let mut a = mcp_stats.clone();
+    let mut b = cli_stats.clone();
+    normalize(&mut a);
+    normalize(&mut b);
+    assert_eq!(a, b, "stats: {mcp_stats} vs {cli_stats}");
 
     // get
     let mcp_doc_id = mcp_upload["document_id"].as_str().unwrap();

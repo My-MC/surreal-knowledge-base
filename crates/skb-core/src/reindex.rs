@@ -256,7 +256,8 @@ async fn rebuild_all(
             .begin()
             .await
             .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex begin: {e}")))?;
-        let rebuilt = rebuild_document(&tx, did, &chunks, &embeddings).await;
+        let content = content.to_string();
+        let rebuilt = rebuild_document(&tx, did, &content, &chunks, &embeddings).await;
         let entity_names = match rebuilt {
             Ok(names) => {
                 tx.commit()
@@ -335,6 +336,7 @@ async fn update_metas(
 async fn rebuild_document(
     tx: &LocalTransaction,
     did: &str,
+    content: &str,
     chunks: &[crate::tokenize::Chunk],
     embeddings: &[Vec<f32>],
 ) -> Result<Vec<String>, SkbError> {
@@ -388,6 +390,9 @@ async fn rebuild_document(
             crate::graph::index_chunk_entities_in_transaction(tx, cid, &chunk.content).await?;
         entity_names.extend(names);
     }
+    // Rebuild the heading-section part-of hierarchy for the whole document,
+    // matching the ingest flow (spec §5.1).
+    crate::graph::link_section_hierarchy(tx, content).await?;
     Ok(entity_names.into_iter().collect())
 }
 

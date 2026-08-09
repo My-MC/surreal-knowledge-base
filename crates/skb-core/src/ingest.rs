@@ -507,7 +507,6 @@ async fn extract_pdf_checked(bytes: &[u8]) -> Result<String, SkbError> {
         .acquire_owned()
         .await
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("pdf semaphore: {e}")))?;
-    let start = Instant::now();
     let shared = std::sync::Arc::new(bytes.to_vec());
     let job = tokio::task::spawn_blocking(move || -> Result<String, String> {
         let _permit = permit;
@@ -523,7 +522,6 @@ async fn extract_pdf_checked(bytes: &[u8]) -> Result<String, SkbError> {
         .map_err(|_| SkbError::new(ErrorCode::Validation, "pdf processing exceeded time limit"))?
         .map_err(|e| SkbError::new(ErrorCode::Io, format!("pdf join: {e}")))?
         .map_err(|e| SkbError::new(ErrorCode::Validation, e))?;
-    let _ = start;
     Ok(text)
 }
 

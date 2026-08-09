@@ -75,6 +75,7 @@ function notify(method, params) {
 function assert(cond, message) {
   if (!cond) {
     console.error("FAIL: " + message);
+    child.kill();
     process.exit(1);
   }
 }
