@@ -14,6 +14,9 @@ if (!bin) {
   process.exit(2);
 }
 
+const pending = new Map();
+let nextId = 1;
+
 const child = spawn(bin, [], { stdio: ["pipe", "pipe", "inherit"] });
 child.on("error", (err) => {
   for (const [id, { reject, timer }] of pending) {
@@ -26,8 +29,6 @@ const rl = createInterface({ input: child.stdout });
 // Swallow EPIPE from stdin writes after the child exits; the exit/error
 // handlers reject pending requests with the real failure reason.
 child.stdin.on("error", () => {});
-const pending = new Map();
-let nextId = 1;
 
 // If the child exits before responding (crash, bad config, etc.), fail all
 // in-flight requests immediately with the exit code instead of timing out.

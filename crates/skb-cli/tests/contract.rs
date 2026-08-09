@@ -362,7 +362,9 @@ fn contract_upload_glob_and_multiple_paths() {
     std::fs::write(docs.join("b.md"), "# B\n\ncontent b").unwrap();
     std::fs::write(docs.join("c.txt"), "plain c").unwrap();
 
-    let pattern = format!("{}/*.md", docs.display());
+    // Forward slashes so glob patterns are valid on Windows.
+    let docs = docs.display().to_string().replace('\\', "/");
+    let pattern = format!("{docs}/*.md");
     let val = run_skb(&["upload", &pattern], None);
     assert_eq!(
         val["results"].as_array().unwrap().len(),
@@ -373,12 +375,13 @@ fn contract_upload_glob_and_multiple_paths() {
 
     // A single input keeps the direct UploadResult shape (no results/errors
     // wrapper); multi-input uploads always report {results, errors}.
-    let val = run_skb(&["upload", docs.join("c.txt").to_str().unwrap()], None);
+    let single = format!("{docs}/c.txt");
+    let val = run_skb(&["upload", &single], None);
     assert_eq!(val["status"], "created");
     assert!(val["document_id"].is_string());
 
     // A glob matching exactly one file also keeps the direct shape.
-    let one = format!("{}/*.tx?", docs.display());
+    let one = format!("{docs}/*.tx?");
     let val = run_skb(&["upload", &one, "--force"], None);
     assert!(val["document_id"].is_string());
     assert!(val["status"] == "created" || val["status"] == "updated");

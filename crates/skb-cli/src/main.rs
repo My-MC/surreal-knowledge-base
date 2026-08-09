@@ -441,9 +441,9 @@ async fn run(cli: &Cli) -> Result<u8> {
                         Ok(result) => results.push(serde_json::to_value(result)?),
                         Err(e) => errors.push(serde_json::json!({
                             "input": p,
-                            "error": skb_core::error::ErrorCode::from_std(&e)
-                                .map(|c| c.code_str().to_string())
-                                .unwrap_or_else(|| "E_INTERNAL".to_string()),
+                            // `kb.upload` always returns SkbError, so the code
+                            // string is always present (no E_INTERNAL fallback).
+                            "error": e.code.code_str(),
                             "message": format!("{e:#}"),
                         })),
                     }
@@ -572,15 +572,20 @@ async fn run(cli: &Cli) -> Result<u8> {
                 Err(e) => return Err(e.into()),
             };
             let req = skb_core::reindex::ReindexRequest { dry_run: *dry_run };
-            let progress = |done: usize, total: usize| {
+            let emitted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let progress_emitted = emitted.clone();
+            let progress = move |done: usize, total: usize| {
+                progress_emitted.store(true, std::sync::atomic::Ordering::Relaxed);
                 eprint!("\rreindexed {done}/{total}");
                 let _ = std::io::Write::flush(&mut std::io::stderr());
             };
             let result = kb.reindex(&req, Some(&progress)).await;
             // The progress callback printed a partial line; terminate it so
             // the shell prompt does not appear on the same line, including on
-            // the error path.
-            eprintln!();
+            // the error path — but only when progress was actually shown.
+            if emitted.load(std::sync::atomic::Ordering::Relaxed) {
+                eprintln!();
+            }
             let result = result?;
             output(&result, &fmt)?;
         }

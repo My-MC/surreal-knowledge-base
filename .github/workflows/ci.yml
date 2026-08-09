@@ -13,6 +13,7 @@ jobs:
   test:
     name: Test + release gates
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
@@ -32,8 +33,11 @@ jobs:
         run: cargo test --workspace -- --test-threads=1
       - name: Cargo audit (dependency advisories, incl. pinned ureq)
         run: |
-          cargo install cargo-audit --locked || true
-          cargo audit || echo "cargo audit unavailable; install it locally to run advisory checks"
+          if cargo install cargo-audit --locked; then
+            cargo audit
+          else
+            echo "cargo-audit could not be installed; skipping advisory check"
+          fi
       - name: Check no native-tls / openssl dependency
         run: |
           cargo tree -i openssl-sys 2>&1 | grep -q "did not match"
@@ -44,6 +48,7 @@ jobs:
   build:
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     permissions:
       contents: read
     strategy:
@@ -110,6 +115,7 @@ jobs:
   smoke:
     name: Smoke test (linux-x64)
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     needs: build
     permissions:
       contents: read
@@ -193,17 +199,18 @@ jobs:
           cd "$SMOKE"
           WRAPPER="$(node -p "require.resolve('surreal-knowledge-base/bin/skb-mcp.js')")"
           echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"node-wrapper","version":"1.0"}}}' \
-            | node "$WRAPPER" >node.out 2>node.log || true
+            | timeout 60 node "$WRAPPER" >node.out 2>node.log || true
           grep -q 'protocolVersion' node.out \
             || { echo "node wrapper launch failed; stderr:"; cat node.log; exit 1; }
           echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"bun-wrapper","version":"1.0"}}}' \
-            | bun "$WRAPPER" >bun.out 2>bun.log || true
+            | timeout 60 bun "$WRAPPER" >bun.out 2>bun.log || true
           grep -q 'protocolVersion' bun.out \
             || { echo "bun wrapper launch failed; stderr:"; cat bun.log; exit 1; }
 
   e2e-linux-arm64:
     name: E2E (linux-arm64)
     runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
     needs: build
     permissions:
       contents: read
@@ -245,6 +252,7 @@ jobs:
   e2e-macos:
     name: E2E (darwin-arm64)
     runs-on: macos-latest
+    timeout-minutes: 20
     needs: build
     permissions:
       contents: read
@@ -286,6 +294,7 @@ jobs:
   e2e-windows:
     name: E2E (win32-x64)
     runs-on: windows-2022
+    timeout-minutes: 20
     needs: build
     permissions:
       contents: read

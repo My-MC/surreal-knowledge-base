@@ -711,8 +711,13 @@ fn fetch_url_with_validator(
             .map_err(|e| SkbError::new(ErrorCode::Validation, format!("invalid url: {e}")))?;
         validate(&url)?;
 
+        // Enforce the remaining total budget at request level so the body
+        // read (not just connect) cannot block past the deadline.
         let mut resp = agent
             .get(&current)
+            .config()
+            .timeout_global(Some(remaining))
+            .build()
             .call()
             .map_err(|e| SkbError::new(ErrorCode::Io, format!("fetch url: {e}")))?;
         let status = resp.status().as_u16();

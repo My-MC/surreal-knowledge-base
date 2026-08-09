@@ -351,7 +351,13 @@ pub async fn delete_document(
         let rows: Vec<serde_json::Value> = r
             .take(0)
             .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete lookup take: {e}")))?;
-        if rows.is_empty() {
+        // SurrealDB 3 returns NONE for a missing $id; both an empty list and a
+        // null/NONE row mean the document does not exist.
+        let missing = rows.is_empty()
+            || rows
+                .iter()
+                .all(|v| v.is_null() || v.as_array().is_some_and(Vec::is_empty));
+        if missing {
             return Err(SkbError::new(
                 ErrorCode::DocumentNotFound,
                 format!("not found: {}", req.id),

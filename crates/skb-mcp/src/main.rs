@@ -12,6 +12,7 @@ use rmcp::service::serve_server;
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::transport::io::stdio;
 use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use skb_core::config::Config;
 use skb_core::crud::{DeleteDocumentRequest, GetDocumentRequest, ListQuery};
@@ -303,7 +304,7 @@ fn all_tools() -> Result<Vec<ToolDef>, rmcp::ErrorData> {
 }
 
 /// Degenerate request type for tools without parameters (`skb_stats`).
-#[derive(JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 struct NoParams {}
 
 impl SkbServer {
@@ -356,11 +357,16 @@ impl SkbServer {
                     .map(|r| serde_json::to_value(r).unwrap_or_default())
                     .map_err(|e| format!("{e}"))
             }
-            "skb_stats" => kb
-                .stats()
-                .await
-                .map(|r| serde_json::to_value(r).unwrap_or_default())
-                .map_err(|e| format!("{e}")),
+            "skb_stats" => {
+                // Reject unexpected parameters via the DTO validation path,
+                // matching the other tools.
+                let _params: NoParams = serde_json::from_value(Value::Object(args))
+                    .map_err(|e| valid_err(&format!("invalid stats parameters: {e}")))?;
+                kb.stats()
+                    .await
+                    .map(|r| serde_json::to_value(r).unwrap_or_default())
+                    .map_err(|e| format!("{e}"))
+            }
             "skb_graph_query" => {
                 let params: GraphQueryRequest = serde_json::from_value(Value::Object(args))
                     .map_err(|e| valid_err(&format!("invalid graph query parameters: {e}")))?;

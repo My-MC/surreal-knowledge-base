@@ -149,16 +149,30 @@ impl Tokenize for TokenizersImpl {
 fn heading_starts(text: &str) -> Vec<usize> {
     let mut out = Vec::new();
     let mut line_start = 0usize;
+    let mut in_fence = false;
     for (i, b) in text.bytes().enumerate() {
         if b == b'\n' {
-            if is_heading_line(&text[line_start..i]) {
+            let line = &text[line_start..i];
+            let trimmed = line.trim();
+            // Toggle fenced code blocks (``` or ~~~); headings inside fences
+            // (e.g. shell/python `# comment`) must not be recorded.
+            if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+                in_fence = !in_fence;
+            } else if !in_fence && is_heading_line(line) {
                 out.push(line_start);
             }
             line_start = i + 1;
         }
     }
-    if line_start < text.len() && is_heading_line(&text[line_start..]) {
-        out.push(line_start);
+    if line_start < text.len() {
+        let line = &text[line_start..];
+        let trimmed = line.trim();
+        if !(trimmed.starts_with("```") || trimmed.starts_with("~~~"))
+            && !in_fence
+            && is_heading_line(line)
+        {
+            out.push(line_start);
+        }
     }
     out
 }

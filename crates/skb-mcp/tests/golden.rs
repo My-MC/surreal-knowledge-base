@@ -12,22 +12,29 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 
+/// target/debug for normal tests, target/release for `cargo test --release`.
+const PROFILE_DIR: &str = if cfg!(debug_assertions) {
+    "debug"
+} else {
+    "release"
+};
+
 fn mcp_binary() -> PathBuf {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.push("../../target/debug/skb-mcp");
+    path.push(format!("../../target/{PROFILE_DIR}/skb-mcp"));
     assert!(
         path.exists(),
-        "missing target/debug/skb-mcp; run: cargo test --workspace -- --test-threads=1"
+        "missing target/{PROFILE_DIR}/skb-mcp; run: cargo test --workspace -- --test-threads=1"
     );
     path
 }
 
 fn cli_binary() -> PathBuf {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.push("../../target/debug/skb");
+    path.push(format!("../../target/{PROFILE_DIR}/skb"));
     assert!(
         path.exists(),
-        "missing target/debug/skb; run: cargo test --workspace -- --test-threads=1"
+        "missing target/{PROFILE_DIR}/skb; run: cargo test --workspace -- --test-threads=1"
     );
     path
 }
@@ -213,13 +220,13 @@ fn normalize(value: &mut Value) {
             map.remove("created_at");
             map.remove("updated_at");
             for (k, v) in map.iter_mut() {
-                // `hits` carries ranking order that must survive comparison;
-                // `highlights` / `matched_entities` inside each hit are also
-                // contractually ordered, so their arrays are normalized
-                // without sorting.
-                if k == "hits" {
-                    for hit in v.as_array_mut().into_iter().flatten() {
-                        normalize_object_preserving_arrays(hit);
+                // `hits` carries ranking order and `chunks` are ordered by
+                // idx — both must survive comparison; `highlights` /
+                // `matched_entities` inside each hit are also contractually
+                // ordered, so their arrays are normalized without sorting.
+                if k == "hits" || k == "chunks" {
+                    for item in v.as_array_mut().into_iter().flatten() {
+                        normalize_object_preserving_arrays(item);
                     }
                 } else {
                     normalize(v);
@@ -230,7 +237,7 @@ fn normalize(value: &mut Value) {
             for item in items.iter_mut() {
                 normalize(item);
             }
-            items.sort_by_key(|item| serde_json::to_string(item).unwrap_or_default());
+            items.sort_by_cached_key(|item| serde_json::to_string(item).unwrap_or_default());
         }
         _ => {}
     }

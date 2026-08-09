@@ -744,6 +744,9 @@ mod tests {
         for _ in 0..ATTEMPTS {
             match KnowledgeBase::open_for_reindex(config.clone()).await {
                 Ok(kb) => return Ok(kb),
+                // Only transient file-lock failures are retried; persistent
+                // errors return immediately (same as open_retrying).
+                Err(e) if !matches!(e.code, ErrorCode::Db) => return Err(e),
                 Err(e) => {
                     last = Some(e);
                     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
