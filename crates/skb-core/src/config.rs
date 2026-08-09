@@ -222,7 +222,7 @@ impl Config {
             self.chunking.overlap_tokens = v;
         }
         if let Some(v) = env_opt("SKB_SEARCH_DEFAULT_MODE")? {
-            self.search.default_mode = v.parse().map_err(|e: SkbError| e)?;
+            self.search.default_mode = v.parse::<SearchMode>()?;
         }
         if let Some(v) = env_parse("SKB_SEARCH_TOP_K")? {
             self.search.top_k = v;
@@ -293,6 +293,16 @@ impl Config {
             return Err(SkbError::new(
                 ErrorCode::Validation,
                 "search.top_k must be at least 1",
+            ));
+        }
+        if self.search.top_k > crate::search::MAX_TOP_K {
+            return Err(SkbError::new(
+                ErrorCode::Validation,
+                format!(
+                    "search.top_k ({}) must be at most {}",
+                    self.search.top_k,
+                    crate::search::MAX_TOP_K
+                ),
             ));
         }
         if self.search.rrf_k == 0 {
@@ -407,7 +417,10 @@ mod tests {
 
     fn resolved_default() -> Config {
         Config::default()
-            .resolve_embedding_settings(8, 8192)
+            .resolve_embedding_settings(
+                crate::embed::MOCK_EMBEDDER_DIMENSION,
+                crate::embed::MOCK_EMBEDDER_MAX_INPUT_TOKENS,
+            )
             .unwrap()
     }
 
@@ -455,7 +468,10 @@ mod tests {
         let mut c = Config::default();
         c.embedding.dimension = 16; // explicit value disagrees with detected 8
         assert!(matches!(
-            c.resolve_embedding_settings(8, 8192),
+            c.resolve_embedding_settings(
+                crate::embed::MOCK_EMBEDDER_DIMENSION,
+                crate::embed::MOCK_EMBEDDER_MAX_INPUT_TOKENS
+            ),
             Err(SkbError {
                 code: ErrorCode::Validation,
                 ..
@@ -468,7 +484,10 @@ mod tests {
         let mut c = Config::default();
         c.embedding.max_input_tokens = 4096;
         assert!(matches!(
-            c.resolve_embedding_settings(8, 8192),
+            c.resolve_embedding_settings(
+                crate::embed::MOCK_EMBEDDER_DIMENSION,
+                crate::embed::MOCK_EMBEDDER_MAX_INPUT_TOKENS
+            ),
             Err(SkbError {
                 code: ErrorCode::Validation,
                 ..
@@ -479,18 +498,29 @@ mod tests {
     #[test]
     fn resolve_fills_detected_values() {
         let c = Config::default()
-            .resolve_embedding_settings(8, 8192)
+            .resolve_embedding_settings(
+                crate::embed::MOCK_EMBEDDER_DIMENSION,
+                crate::embed::MOCK_EMBEDDER_MAX_INPUT_TOKENS,
+            )
             .unwrap();
         assert_eq!(c.embedding.dimension, 8);
-        assert_eq!(c.embedding.max_input_tokens, 8192);
+        assert_eq!(
+            c.embedding.max_input_tokens,
+            crate::embed::MOCK_EMBEDDER_MAX_INPUT_TOKENS
+        );
     }
 
     #[test]
     fn resolve_accepts_matching_explicit_values() {
         let mut c = Config::default();
         c.embedding.dimension = 8;
-        c.embedding.max_input_tokens = 8192;
-        let resolved = c.resolve_embedding_settings(8, 8192).unwrap();
+        c.embedding.max_input_tokens = crate::embed::MOCK_EMBEDDER_MAX_INPUT_TOKENS;
+        let resolved = c
+            .resolve_embedding_settings(
+                crate::embed::MOCK_EMBEDDER_DIMENSION,
+                crate::embed::MOCK_EMBEDDER_MAX_INPUT_TOKENS,
+            )
+            .unwrap();
         assert_eq!(resolved.embedding.dimension, 8);
         assert_eq!(resolved.embedding.max_input_tokens, 8192);
     }

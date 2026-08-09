@@ -10,6 +10,10 @@ pub trait Embed: Send + Sync {
 /// so that explicit `embedding.dimension` values are validated against it.
 pub const MOCK_EMBEDDER_DIMENSION: usize = 8;
 
+/// Max input tokens of the mock embedder; shares the same fixed contract as
+/// the dimension so tests never hardcode a divergent value.
+pub const MOCK_EMBEDDER_MAX_INPUT_TOKENS: usize = 8192;
+
 pub struct MockEmbedder;
 
 impl Embed for MockEmbedder {
@@ -17,7 +21,7 @@ impl Embed for MockEmbedder {
         MOCK_EMBEDDER_DIMENSION
     }
     fn max_input_tokens(&self) -> usize {
-        8192
+        MOCK_EMBEDDER_MAX_INPUT_TOKENS
     }
 
     fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, SkbError> {

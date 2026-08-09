@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, GetPromptRequestParams,
@@ -386,7 +386,7 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let config = Config::load().unwrap_or_default();
+    let config = Config::load().context("failed to load config")?;
     let kb = KnowledgeBase::open(config).await?;
     let server = SkbServer::new(kb);
 

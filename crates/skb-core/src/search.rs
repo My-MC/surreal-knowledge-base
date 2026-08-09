@@ -6,11 +6,15 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Practical upper bound for `top_k` (and the list limit); also keeps
+/// `fetch_k = top_k * 3` small. Shared by request/schema/config validation.
+pub const MAX_TOP_K: usize = 1000;
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SearchRequest {
     pub query: String,
     pub mode: Option<SearchMode>,
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1, max = 1000))]
     pub top_k: Option<usize>,
     #[schemars(range(min = 0, max = 5))]
     pub graph_expand: Option<usize>,
@@ -32,10 +36,10 @@ impl SearchRequest {
                     "top_k must be at least 1",
                 ));
             }
-            if top_k > usize::MAX / 3 {
+            if top_k > MAX_TOP_K {
                 return Err(SkbError::new(
                     ErrorCode::Validation,
-                    "top_k too large: fetch_k = top_k * 3 must not overflow",
+                    format!("top_k must be at most {MAX_TOP_K}"),
                 ));
             }
         }

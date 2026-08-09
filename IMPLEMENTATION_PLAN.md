@@ -228,7 +228,7 @@ Phase 3 (CLI) ──► Phase 4 (MCP) ──► Phase 5 (契約テスト+npm) �
 
 Phase 0〜8 で確定した方針（`tokenizers`、SurrealKV 組込み、ORT 静的リンク）を前提に、仕様書の未実装項目を依存順に実装する。各変更は専用ブランチで行い、対応する回帰テストと仕様更新を同じPRに含める。各項目には基本実装が存在する場合もあるが、ここに記載する完了条件を満たすまで **未完了** とする。
 
-### 9-1: 設定・モデル・tokenizer整合性（完了）
+### 9-1: 設定・モデル・tokenizer整合性（部分完了 — CLI引数優先・config.json自動検出は未実装）
 
 - `KnowledgeBase::open` は明示設定か自動検出かを保持したまま、`max_input_tokens = 0` をモデル設定から解決し、dimension/max inputを正規化してから `Config::validate()` の `0 < overlap_tokens < max_tokens <= max_input_tokens` を適用する。明示値とモデル値が不一致の場合は `E_VALIDATION` とする。
 - CLI引数、`SKB_*`環境変数、`./skb.toml`、ユーザー設定の優先順位を実装する。

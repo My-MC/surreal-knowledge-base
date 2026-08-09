@@ -88,7 +88,7 @@ impl OrderBy {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
 pub struct ListQuery {
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1, max = 1000))]
     pub limit: Option<usize>,
     pub offset: Option<usize>,
     pub order: Option<OrderBy>,
@@ -101,6 +101,12 @@ impl ListQuery {
                 return Err(SkbError::new(
                     ErrorCode::Validation,
                     "limit must be at least 1",
+                ));
+            }
+            if limit > crate::search::MAX_TOP_K {
+                return Err(SkbError::new(
+                    ErrorCode::Validation,
+                    format!("limit must be at most {}", crate::search::MAX_TOP_K),
                 ));
             }
         }
@@ -367,9 +373,12 @@ fn val_u64(row: &serde_json::Value, key: &str) -> u64 {
 /// Convert a validated document id string into a typed `RecordId` for query
 /// parameter binding (never interpolated into SurrealQL).
 fn document_record_id(id: &str) -> Result<surrealdb::types::RecordId, SkbError> {
-    let (table, key) = id
-        .split_once(':')
-        .expect("validated document id must contain ':'");
+    let (table, key) = id.split_once(':').ok_or_else(|| {
+        SkbError::new(
+            ErrorCode::Validation,
+            format!("id must be a document record id (document:<key>), got '{id}'"),
+        )
+    })?;
     Ok(surrealdb::types::RecordId::new(table, key))
 }
 
