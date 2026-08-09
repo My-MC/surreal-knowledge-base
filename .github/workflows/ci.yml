@@ -34,7 +34,11 @@ jobs:
       - name: Cargo audit (dependency advisories, incl. pinned ureq)
         run: |
           if cargo install cargo-audit --locked; then
-            cargo audit
+            # rkyv (RUSTSEC-2026-0235) and rsa (RUSTSEC-2023-0071) come from
+            # surrealdb-core (via its rkyv / jsonwebtoken deps). No fixed
+            # 0.7.x / 0.9.x release exists, and the 0.8 / 0.10 majors are
+            # breaking — cannot be upgraded from this crate. Tracked upstream.
+            cargo audit --ignore RUSTSEC-2026-0235 --ignore RUSTSEC-2023-0071
           else
             echo "cargo-audit could not be installed; skipping advisory check"
           fi
