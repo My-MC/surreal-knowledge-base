@@ -290,8 +290,7 @@ async fn rebuild_all(
             .begin()
             .await
             .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex begin: {e}")))?;
-        let content = content.to_string();
-        let rebuilt = rebuild_document(&tx, did, &content, &chunks, &embeddings).await;
+        let rebuilt = rebuild_document(&tx, did, content, &chunks, &embeddings).await;
         let entity_names = match rebuilt {
             Ok(names) => {
                 tx.commit()

@@ -1318,6 +1318,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_document_missing_id_is_not_found() {
+        let kb = setup().await;
+        let err = kb
+            .get_document(&GetDocumentRequest {
+                id: "document:missing".into(),
+                include_chunks: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err.code, ErrorCode::DocumentNotFound));
+        cleanup(&kb);
+    }
+
+    #[tokio::test]
     async fn test_upload_rejects_oversized_base64() {
         let n = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
         let mut config = small_limit_config(1);

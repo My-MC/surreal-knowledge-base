@@ -344,7 +344,7 @@ impl KnowledgeBase {
 ```
 
 - すべての Request/Response 型は `Serialize`/`Deserialize`/`JsonSchema` を derive し、**CLI の JSON 入出力と MCP ツールスキーマの双方をこの型から生成**する。
-- 非同期（`tokio`）。長時間処理（upload）は内部で進捗コールバックを受け取れる設計とし、MCP では progress notification、CLI ではプログレスバーへ写像する。
+- 非同期（`tokio`）。長時間処理（reindex）は進捗コールバック（`ProgressFn`）を受け取り、MCP では progress notification、CLI ではプログレス出力へ写像する。
 
 上記は v1 の目標API契約である。実装進捗は IMPLEMENTATION_PLAN.md を参照すること。
 

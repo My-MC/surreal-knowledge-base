@@ -21,7 +21,7 @@ fn setup_config() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 
-    let db_path = dir.join("db");
+    let db_path = dir.join("db").display().to_string().replace('\\', "/");
     let config = format!(
         r#"search = {{ rrf_k = 10 }}
 
@@ -30,10 +30,9 @@ onnx_path = "mock"
 dimension = {}
 
 [storage]
-path = "{}"
+path = "{db_path}"
 "#,
         skb_core::embed::MOCK_EMBEDDER_DIMENSION,
-        db_path.display()
     );
     std::fs::write(dir.join("skb.toml"), config).unwrap();
 }

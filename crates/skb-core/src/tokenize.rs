@@ -208,6 +208,7 @@ mod tests {
     #[test]
     fn detects_heading_lines() {
         assert!(is_heading_line("# Title"));
+        assert!(is_heading_line("#\tTitle"));
         assert!(is_heading_line("## Sub"));
         assert!(is_heading_line("###### Deep"));
         assert!(!is_heading_line("####### Too deep"));

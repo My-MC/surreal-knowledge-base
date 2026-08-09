@@ -275,7 +275,13 @@ pub async fn get_document(db: &Db, req: &GetDocumentRequest) -> Result<DocumentD
         .take(0)
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("get take: {e}")))?;
 
-    if rows.is_empty() {
+    // SurrealDB 3 returns NONE for a missing $id; both an empty list and a
+    // None payload mean the document does not exist.
+    let missing = rows.is_empty()
+        || rows
+            .iter()
+            .all(|v| v.is_null() || v.as_array().is_some_and(Vec::is_empty));
+    if missing {
         return Err(SkbError::new(
             ErrorCode::DocumentNotFound,
             format!("not found: {}", req.id),
@@ -599,6 +605,27 @@ mod tests {
 
         let ok = ListQuery {
             limit: Some(MAX_LIST_LIMIT),
+            ..Default::default()
+        };
+        assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn list_query_rejects_offset_above_max() {
+        let q = ListQuery {
+            offset: Some(MAX_LIST_OFFSET + 1),
+            ..Default::default()
+        };
+        assert!(matches!(
+            q.validate(),
+            Err(SkbError {
+                code: ErrorCode::Validation,
+                ..
+            })
+        ));
+
+        let ok = ListQuery {
+            offset: Some(MAX_LIST_OFFSET),
             ..Default::default()
         };
         assert!(ok.validate().is_ok());

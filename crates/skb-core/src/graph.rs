@@ -788,6 +788,12 @@ fn frontmatter_list(content: &str, key: &str) -> Vec<String> {
                 if let Some(items) = parse_inline_list(rest) {
                     out.extend(items);
                     in_list = false;
+                } else if !rest.is_empty() {
+                    // A scalar value (e.g. `tags: rust`) is a single item;
+                    // strip surrounding quotes and close the list so later
+                    // unrelated bullets are not attached to this key.
+                    out.push(rest.trim_matches('"').trim_matches('\'').to_string());
+                    in_list = false;
                 }
                 continue;
             }
