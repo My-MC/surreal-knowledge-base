@@ -1,12 +1,14 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use skb_core::config::Config;
+use skb_core::crud::{DeleteDocumentRequest, GetDocumentRequest, ListQuery, OrderBy};
 use skb_core::graph::{EntityInfo, GraphQueryRequest, LinkInfo};
 use skb_core::ingest::UploadRequest;
 use skb_core::search::SearchRequest;
 use skb_core::KnowledgeBase;
 use std::collections::HashMap;
 use std::io::Read;
+use std::str::FromStr;
 
 #[derive(Parser)]
 #[command(name = "skb", version, about = "Surreal Knowledge Base CLI")]
@@ -234,12 +236,24 @@ async fn run(cli: &Cli) -> Result<()> {
             order,
         } => {
             let kb = KnowledgeBase::open(cfg()?).await?;
-            let docs = kb.list_documents(*limit, *offset, order.clone()).await?;
+            let order = order.as_deref().map(OrderBy::from_str).transpose()?;
+            let docs = kb
+                .list_documents(&ListQuery {
+                    limit: Some(*limit),
+                    offset: Some(*offset),
+                    order,
+                })
+                .await?;
             output(&docs, &fmt)?;
         }
         Commands::Get { id, chunks } => {
             let kb = KnowledgeBase::open(cfg()?).await?;
-            let doc = kb.get_document(id, *chunks).await?;
+            let doc = kb
+                .get_document(&GetDocumentRequest {
+                    id: id.clone(),
+                    include_chunks: Some(*chunks),
+                })
+                .await?;
             output(&doc, &fmt)?;
         }
         Commands::Delete { id, yes } => {
@@ -247,7 +261,9 @@ async fn run(cli: &Cli) -> Result<()> {
                 anyhow::bail!("use --yes to confirm deletion of {id}");
             }
             let kb = KnowledgeBase::open(cfg()?).await?;
-            let result = kb.delete_document(id).await?;
+            let result = kb
+                .delete_document(&DeleteDocumentRequest { id: id.clone() })
+                .await?;
             output(&result, &fmt)?;
         }
         Commands::Stats => {
@@ -356,7 +372,7 @@ async fn run(cli: &Cli) -> Result<()> {
                 .collect::<Result<_, _>>()?;
             let req = SearchRequest {
                 query: query.clone(),
-                mode: Some(mode.clone()),
+                mode: Some(mode.parse()?),
                 top_k: Some(*top_k),
                 graph_expand: *graph_expand,
                 filter: if filter.is_empty() {

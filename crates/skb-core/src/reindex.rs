@@ -4,9 +4,10 @@ use crate::embed::Embed;
 use crate::error::{ErrorCode, SkbError};
 use crate::tokenize::Tokenize;
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ReindexResult {
     pub documents_processed: usize,
     pub chunks_created: usize,
@@ -14,7 +15,7 @@ pub struct ReindexResult {
     pub entities_extracted: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
 pub struct ReindexRequest {
     /// Only report what a reindex would do, without mutating the database.
     #[serde(default)]
