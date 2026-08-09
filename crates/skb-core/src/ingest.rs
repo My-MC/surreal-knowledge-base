@@ -156,8 +156,11 @@ pub async fn upload(
 fn extract_document_data(req: UploadRequest, config: &Config) -> Result<DocumentData, SkbError> {
     let (content, source, source_type, file_title) = if let Some(path) = &req.path {
         let path = std::path::Path::new(path);
-        validate_path(path, config)?;
-        let text = read_file(path)?;
+        // Resolve and validate in one step: the canonicalized path returned
+        // here is used for all subsequent operations so a symlink swapped
+        // between validation and read cannot escape `allowed_dirs` (TOCTOU).
+        let path = validate_path(path, config)?;
+        let text = read_file(&path)?;
         let ft = path
             .file_name()
             .and_then(|n| n.to_str())
@@ -329,20 +332,22 @@ fn base64_decode(b64: &str) -> Result<Vec<u8>, SkbError> {
         .map_err(|e| SkbError::new(ErrorCode::Validation, format!("base64: {e}")))
 }
 
-fn validate_path(path: &std::path::Path, config: &Config) -> Result<(), SkbError> {
-    let allowed = &config.upload.allowed_dirs;
-    if allowed.is_empty() {
-        return Ok(());
-    }
+fn validate_path(path: &std::path::Path, config: &Config) -> Result<std::path::PathBuf, SkbError> {
+    // Always canonicalize so callers use the same resolved path for every
+    // subsequent operation (no re-resolution TOCTOU window).
     let canonical = path
         .canonicalize()
         .map_err(|e| SkbError::new(ErrorCode::Io, format!("resolve path: {e}")))?;
+    let allowed = &config.upload.allowed_dirs;
+    if allowed.is_empty() {
+        return Ok(canonical);
+    }
     for dir in allowed {
         let can_dir = dir
             .canonicalize()
             .map_err(|e| SkbError::new(ErrorCode::Io, format!("resolve allowed dir: {e}")))?;
         if canonical.starts_with(&can_dir) {
-            return Ok(());
+            return Ok(canonical);
         }
     }
     Err(SkbError::new(
