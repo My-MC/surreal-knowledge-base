@@ -123,7 +123,8 @@ pub struct GetDocumentRequest {
 
 impl GetDocumentRequest {
     pub fn validate(&self) -> Result<(), SkbError> {
-        validate_document_id(&self.id)
+        validate_document_id(&self.id)?;
+        Ok(())
     }
 }
 
@@ -150,10 +151,10 @@ impl DeleteDocumentRequest {
     }
 }
 
-/// Validate that `id` is a `document:<key>` record id and reject inputs that
-/// could alter the query when interpolated (the query itself is parameterized
-/// as a second layer of defense).
-fn validate_document_id(id: &str) -> Result<(), SkbError> {
+/// Validate that `id` is a `document:<key>` record id, reject inputs that
+/// could alter the query, and build the typed `RecordId` for parameter
+/// binding (never interpolated into SurrealQL).
+fn validate_document_id(id: &str) -> Result<surrealdb::types::RecordId, SkbError> {
     if id.trim().is_empty() {
         return Err(SkbError::new(ErrorCode::Validation, "id must not be empty"));
     }
@@ -184,14 +185,19 @@ fn validate_document_id(id: &str) -> Result<(), SkbError> {
             format!("invalid document id: '{id}'"),
         ));
     }
-    Ok(())
+    Ok(surrealdb::types::RecordId::new(table, key))
 }
 
 pub async fn list_documents(db: &Db, q: &ListQuery) -> Result<Vec<DocumentSummary>, SkbError> {
     q.validate()?;
     let limit = q.limit.unwrap_or(50);
     let offset = q.offset.unwrap_or(0);
-    let order_by = q.order.map_or("created_at DESC", OrderBy::to_surql);
+    // A deterministic tie-breaker (the record id) keeps offset pagination
+    // stable so pages cannot duplicate or skip records when created_at ties.
+    let order_by = q
+        .order
+        .map(|o| format!("{}, id", OrderBy::to_surql(o)))
+        .unwrap_or_else(|| "created_at DESC, id".to_string());
     let query = format!(
         "SELECT string::concat('document:', meta::id(id)) AS id, \
          title, source, sha256, created_at \
@@ -221,7 +227,7 @@ pub async fn list_documents(db: &Db, q: &ListQuery) -> Result<Vec<DocumentSummar
 
 pub async fn get_document(db: &Db, req: &GetDocumentRequest) -> Result<DocumentDetail, SkbError> {
     req.validate()?;
-    let record_id = document_record_id(&req.id)?;
+    let record_id = validate_document_id(&req.id)?;
     let query = "SELECT title, source, source_type, sha256, content, created_at FROM $id";
     let mut r = db
         .db
@@ -283,7 +289,7 @@ pub async fn delete_document(
     req: &DeleteDocumentRequest,
 ) -> Result<DeleteResult, SkbError> {
     req.validate()?;
-    let record_id = document_record_id(&req.id)?;
+    let record_id = validate_document_id(&req.id)?;
     let query = "DELETE FROM chunk WHERE document = $id RETURN BEFORE; DELETE $id;";
     let r = db
         .db
@@ -373,18 +379,6 @@ fn val_str(row: &serde_json::Value, key: &str) -> String {
 
 fn val_u64(row: &serde_json::Value, key: &str) -> u64 {
     row[key].as_u64().unwrap_or(0)
-}
-
-/// Convert a validated document id string into a typed `RecordId` for query
-/// parameter binding (never interpolated into SurrealQL).
-fn document_record_id(id: &str) -> Result<surrealdb::types::RecordId, SkbError> {
-    let (table, key) = id.split_once(':').ok_or_else(|| {
-        SkbError::new(
-            ErrorCode::Validation,
-            format!("id must be a document record id (document:<key>), got '{id}'"),
-        )
-    })?;
-    Ok(surrealdb::types::RecordId::new(table, key))
 }
 
 #[cfg(test)]

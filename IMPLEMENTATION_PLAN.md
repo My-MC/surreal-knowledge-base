@@ -56,7 +56,7 @@
 
 | 領域 | 現在確認できる実装 | 不足する検証/実装 | 次のPhase |
 |---|---|---|---|
-| 設定・モデル | `./skb.toml`/ユーザー設定探索、`SKB_*`環境変数オーバーライド、model名のmeta照合、dimension/max_inputのモデル解決と`E_VALIDATION`、tokenizer fingerprintの生成・meta保存・`E_MODEL_MISMATCH`、再起動検証（9-1完了） | CLI引数による設定オーバーライド（CLI > SKB_* > file）は引数が存在しないため未実装（envが最上位）。bge-m3 の config.json からの dimension / max_input_tokens 自動検出も未実装 | — |
+| 設定・モデル | `./skb.toml`/ユーザー設定探索、`SKB_*`環境変数オーバーライド、model名のmeta照合、dimension/max_inputのモデル解決と`E_VALIDATION`、tokenizer fingerprintの生成・meta保存・`E_MODEL_MISMATCH`、再起動検証（9-1の実装済み範囲） | CLI引数による設定オーバーライド（CLI > SKB_* > file）は引数が存在しないため未実装（envが最上位）。bge-m3 の config.json からの dimension / max_input_tokens 自動検出も未実装 | — |
 | Upload | path/url/content/base64の基本処理、PDF抽出、allowed_dirs | 全経路の上限、SSRF、任意バイナリ、原子性、部分失敗 | 9-3 |
 | Chunk/Graph/Search | token分割、基本抽出、vector/keyword/hybrid、単純graph expansion | heading、frontmatter/WikiLink、N-hop/re-rank、検索応答拡張 | 9-4 |
 | Reindex | ドキュメント単位のchunk置換transaction | mismatch時の起動、dimension/HNSW/meta、全体rollback、progress | 9-5 |
