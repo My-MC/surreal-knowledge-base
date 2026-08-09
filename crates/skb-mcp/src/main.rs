@@ -422,10 +422,7 @@ impl SkbServer {
                                 send_progress(peer.clone(), worker_token.clone(), done, total)
                                     .await;
                             }
-                            let last = {
-                                let mut guard = worker_final.lock().unwrap();
-                                guard.take()
-                            };
+                            let last = worker_final.lock().ok().and_then(|mut g| g.take());
                             if let Some((done, total)) = last {
                                 send_progress(peer.clone(), worker_token.clone(), done, total)
                                     .await;
@@ -437,7 +434,9 @@ impl SkbServer {
                                     return;
                                 }
                                 if tx.try_send((done, total)).is_err() && done == total {
-                                    *pending_final.lock().unwrap() = Some((done, total));
+                                    if let Ok(mut slot) = pending_final.lock() {
+                                        *slot = Some((done, total));
+                                    }
                                 }
                             });
                         (Some(callback), Some(handle))

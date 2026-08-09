@@ -575,6 +575,11 @@ pub async fn expand_search_hits(
                     .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand hop take: {e}")))?;
                 for erow in erows.iter() {
                     for nname in to_string_vec(&erow["n"]) {
+                        // Enforce the cap per name so extend(next) cannot
+                        // exceed MAX_FRONTIER.
+                        if frontier.len() + next.len() >= MAX_FRONTIER {
+                            break;
+                        }
                         next.push((nname, decay));
                     }
                 }
@@ -597,7 +602,14 @@ pub async fn expand_search_hits(
                 .or_insert(decay);
         }
         let mut frontier: Vec<(String, f64)> = best.into_iter().collect();
-        frontier.sort_by(|a, b| a.0.cmp(&b.0));
+        // Decay descending (closer hops first, so they win seen_chunks and
+        // matched_entities), entity name ascending as the deterministic
+        // tie-break.
+        frontier.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
 
         // Chunks mentioning any frontier entity; scores are the origin hit's
         // score decayed by hop distance (spec §6 re-rank).

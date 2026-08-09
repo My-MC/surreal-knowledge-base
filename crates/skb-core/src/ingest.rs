@@ -898,10 +898,11 @@ fn is_reserved_v4(v4: std::net::Ipv4Addr) -> bool {
     v4.octets()[0] >= 240
 }
 
-/// 2001:db8::/32 — documentation range.
+/// 2001:db8::/32 — documentation range; 3fff::/20 (RFC 9637) — additional
+/// documentation range.
 fn is_documentation_v6(v6: std::net::Ipv6Addr) -> bool {
     let s = v6.segments();
-    s[0] == 0x2001 && s[1] == 0x0db8 || s[0] == 0x3fff && s[1] == 0
+    s[0] == 0x2001 && s[1] == 0x0db8 || s[0] & 0xfff0 == 0x3ff0
 }
 
 /// fec0::/10 — deprecated site-local (RFC 3879).
@@ -1082,6 +1083,7 @@ mod tests {
             "2001:0000:0:0:0:0:0101:0101",
             "fec0::1",
             "3fff::1",
+            "3ff0::1",
         ];
         for ip in extra_v6 {
             let ip: IpAddr = ip.parse().unwrap();

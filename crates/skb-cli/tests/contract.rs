@@ -276,7 +276,9 @@ fn contract_search_response_fields() {
     );
 
     let search = run_skb(&["search", "zzzkw", "--mode", "keyword"], None);
-    let hit = &search["hits"][0];
+    let hits = search["hits"].as_array().unwrap();
+    assert!(!hits.is_empty(), "keyword search must return hits");
+    let hit = &hits[0];
     assert_eq!(hit["title"], "fields-test");
     assert!(hit["source"].is_string());
     let hl = hit["highlights"].as_array().unwrap();

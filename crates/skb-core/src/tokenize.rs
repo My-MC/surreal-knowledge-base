@@ -153,12 +153,13 @@ fn heading_starts(text: &str) -> Vec<usize> {
     for (i, b) in text.bytes().enumerate() {
         if b == b'\n' {
             let line = &text[line_start..i];
-            let trimmed = line.trim();
-            // Toggle fenced code blocks (``` or ~~~); headings inside fences
-            // (e.g. shell/python `# comment`) must not be recorded.
-            if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            // Fence detection tolerates leading whitespace; heading detection
+            // is aligned via trim_start (CommonMark allows up to 3 spaces
+            // before ATX headings).
+            let trimmed_start = line.trim_start();
+            if trimmed_start.starts_with("```") || trimmed_start.starts_with("~~~") {
                 in_fence = !in_fence;
-            } else if !in_fence && is_heading_line(line) {
+            } else if !in_fence && is_heading_line(trimmed_start) {
                 out.push(line_start);
             }
             line_start = i + 1;
@@ -166,10 +167,10 @@ fn heading_starts(text: &str) -> Vec<usize> {
     }
     if line_start < text.len() {
         let line = &text[line_start..];
-        let trimmed = line.trim();
-        if !(trimmed.starts_with("```") || trimmed.starts_with("~~~"))
+        let trimmed_start = line.trim_start();
+        if !(trimmed_start.starts_with("```") || trimmed_start.starts_with("~~~"))
             && !in_fence
-            && is_heading_line(line)
+            && is_heading_line(trimmed_start)
         {
             out.push(line_start);
         }

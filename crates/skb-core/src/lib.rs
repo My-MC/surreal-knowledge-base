@@ -600,7 +600,7 @@ pub(crate) mod testutil {
         use tokenizers::pre_tokenizers::whitespace::WhitespaceSplit;
         use tokenizers::Tokenizer;
 
-        let mut vocab = ahash::AHashMap::default();
+        let mut vocab: tokenizers::models::bpe::Vocab = Default::default();
         vocab.insert("<unk>".to_string(), 0);
         vocab.insert(word.to_string(), 1);
         let bpe = BPE::builder()

@@ -310,11 +310,18 @@ async fn run(cli: &Cli) -> Result<u8> {
                 }
                 if report.is_healthy() {
                     println!("Status: healthy");
+                    return Ok(0);
                 } else {
                     println!("Status: {} problem(s) found", report.errors.len());
+                    // Unhealthy diagnostics exit non-zero (E_VALIDATION=8
+                    // convention; the report itself explains the problems).
+                    return Ok(8);
                 }
             } else {
                 output(&report, &fmt)?;
+                if !report.is_healthy() {
+                    return Ok(8);
+                }
             }
         }
         Commands::Query { surql } => {
@@ -360,14 +367,13 @@ async fn run(cli: &Cli) -> Result<u8> {
                             for file in collect_files(&path)? {
                                 expanded.push(file.display().to_string());
                             }
-                        } else if path.is_dir() {
-                            anyhow::bail!(
-                                "no files to upload: matched directory '{}'; use --recursive",
-                                path.display()
-                            );
                         } else if path.is_file() {
                             expanded.push(path.display().to_string());
                         }
+                        // A glob-matched directory without --recursive is
+                        // silently skipped (glob convention); if only
+                        // directories matched, `expanded` stays empty and the
+                        // "no files found to upload" check below reports it.
                     }
                     if !matched {
                         anyhow::bail!("no files match '{pattern}'");
