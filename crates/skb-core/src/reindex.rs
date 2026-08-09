@@ -157,14 +157,15 @@ pub async fn reindex(
             }
         }
         update_metas(db, embedder, tokenizer, config).await?;
-        db.set_meta("reindex_in_progress", "0").await?;
     } else {
         result = rebuild_all(db, embedder, tokenizer, config, &docs, progress).await?;
         // Always refresh metadata after a successful rebuild: even a
         // tokenizer-only change must record the new fingerprint (§5.4).
         update_metas(db, embedder, tokenizer, config).await?;
-        db.set_meta("reindex_in_progress", "0").await?;
     }
+    // The rebuild completed successfully: clear the in-progress marker so the
+    // store opens normally with the new config.
+    db.set_meta("reindex_in_progress", "0").await?;
 
     // Guarantee the final progress notification reaches 100% even when the
     // loop skipped documents (e.g. empty content), so clients see completion.

@@ -857,20 +857,23 @@ pub(crate) async fn link_section_hierarchy(
             let sql = "INSERT INTO entity (id, name, kind, description) \
                        VALUES ($id, $name, $kind, $description) \
                        ON DUPLICATE KEY UPDATE description = $description";
-            // The child endpoint of the part-of edge must exist as an entity;
-            // it may have been missed by chunk processing (e.g. a tab-headed
-            // section whose boundary was not recognized as a heading), so
-            // upsert it here before creating the edge. The parent is a prior
-            // stack entry already upserted by ingest.
-            tx.query(sql)
-                .bind(("id", entity_record_id(&section.name)?))
-                .bind(("name", section.name.clone()))
-                .bind(("kind", "section"))
-                .bind(("description", ""))
-                .await
-                .map_err(|e| SkbError::new(ErrorCode::Db, format!("section upsert: {e}")))?
-                .check()
-                .map_err(|e| SkbError::new(ErrorCode::Db, format!("section upsert check: {e}")))?;
+            // Both endpoints of the part-of edge must exist as entities. Chunk
+            // processing may have missed either one (a heading split across a
+            // chunk boundary is not re-extracted at document scope), so upsert
+            // both the child and its parent before creating the edge.
+            for name in [section.name.as_str(), parent.as_str()] {
+                tx.query(sql)
+                    .bind(("id", entity_record_id(name)?))
+                    .bind(("name", name.to_string()))
+                    .bind(("kind", "section"))
+                    .bind(("description", ""))
+                    .await
+                    .map_err(|e| SkbError::new(ErrorCode::Db, format!("section upsert: {e}")))?
+                    .check()
+                    .map_err(|e| {
+                        SkbError::new(ErrorCode::Db, format!("section upsert check: {e}"))
+                    })?;
+            }
             tx.query(
                 "DELETE FROM related_to WHERE relation = 'part-of' \
                  AND in = $child AND out = $parent; \

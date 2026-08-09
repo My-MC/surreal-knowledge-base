@@ -43,6 +43,7 @@ struct McpClient {
     stdin: ChildStdin,
     stdout: BufReader<std::process::ChildStdout>,
     next_id: u64,
+    alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl McpClient {
@@ -59,17 +60,24 @@ impl McpClient {
         let stdout = BufReader::new(child.stdout.take().unwrap());
         // Watchdog: if the server stays alive without replying, read_response
         // would block forever; abort the test process after 60s instead of
-        // hanging CI (matches the 30s smoke limit with margin).
-        std::thread::spawn(|| {
+        // hanging CI (matches the 30s smoke limit with margin). It is
+        // cancelled when the client is dropped so multiple sequential clients
+        // cannot trip the first watchdog.
+        let alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let watch = alive.clone();
+        std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_secs(60));
-            eprintln!("golden test watchdog: aborting after 60s (no response from skb-mcp)");
-            std::process::abort();
+            if watch.load(std::sync::atomic::Ordering::SeqCst) {
+                eprintln!("golden test watchdog: aborting after 60s (no response from skb-mcp)");
+                std::process::abort();
+            }
         });
         McpClient {
             child,
             stdin,
             stdout,
             next_id: 1,
+            alive,
         }
     }
 
@@ -131,6 +139,7 @@ impl McpClient {
 
 impl Drop for McpClient {
     fn drop(&mut self) {
+        self.alive.store(false, std::sync::atomic::Ordering::SeqCst);
         let _ = self.stdin.flush();
         let _ = self.child.kill();
         let _ = self.child.wait();
