@@ -533,5 +533,10 @@ mod tests {
             "no field may be required in ListQuery"
         );
         assert_eq!(value["properties"]["limit"]["minimum"], 1);
+        assert_eq!(
+            value["properties"]["limit"]["maximum"],
+            crate::search::MAX_TOP_K as u64,
+            "schema limit maximum must track MAX_TOP_K"
+        );
     }
 }

@@ -8,6 +8,60 @@ pub struct Db {
     pub db: Surreal<surrealdb::engine::local::Db>,
 }
 
+/// SQL for upserting a `meta` key/value; shared by the connection handle and
+/// the transaction implementation so the behavior cannot diverge.
+const SET_META_SQL: &str = "INSERT INTO meta (key, meta_value) VALUES ($key, $val) \
+                            ON DUPLICATE KEY UPDATE meta_value = $val";
+
+/// Something that can persist a `meta` table key/value. Implemented for both
+/// the connection handle and an in-progress transaction so metadata writes can
+/// be grouped atomically (e.g. reindex §5.4).
+pub(crate) trait MetaStore {
+    fn set_meta(
+        &self,
+        key: &str,
+        val: &str,
+    ) -> impl std::future::Future<Output = Result<(), SkbError>> + Send;
+}
+
+impl MetaStore for Db {
+    async fn set_meta(&self, key: &str, val: &str) -> Result<(), SkbError> {
+        set_meta_impl(&self.db, key, val).await
+    }
+}
+
+impl MetaStore for surrealdb::method::Transaction<surrealdb::engine::local::Db> {
+    async fn set_meta(&self, key: &str, val: &str) -> Result<(), SkbError> {
+        self.query(SET_META_SQL)
+            .bind(("key", key))
+            .bind(("val", val))
+            .await
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("set_meta: {e}")))?
+            .check()
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("set_meta check: {e}")))?;
+        Ok(())
+    }
+}
+
+/// Shared upsert implementation for the connection handle; both the inherent
+/// `Db::set_meta` and the `MetaStore` trait impl delegate here so removing or
+/// renaming the inherent method cannot turn the trait call into infinite
+/// recursion.
+async fn set_meta_impl(
+    db: &Surreal<surrealdb::engine::local::Db>,
+    key: &str,
+    val: &str,
+) -> Result<(), SkbError> {
+    db.query(SET_META_SQL)
+        .bind(("key", key))
+        .bind(("val", val))
+        .await
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("set_meta: {e}")))?
+        .check()
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("set_meta check: {e}")))?;
+    Ok(())
+}
+
 impl Db {
     pub async fn open(config: &Config) -> Result<Self, SkbError> {
         let path = shellexpand_path(&config.storage.path);
@@ -84,17 +138,7 @@ impl Db {
     }
 
     pub async fn set_meta(&self, key: &str, val: &str) -> Result<(), SkbError> {
-        let query = "INSERT INTO meta (key, meta_value) VALUES ($key, $val) \
-                     ON DUPLICATE KEY UPDATE meta_value = $val";
-        self.db
-            .query(query)
-            .bind(("key", key.to_string()))
-            .bind(("val", val.to_string()))
-            .await
-            .map_err(|e| SkbError::new(ErrorCode::Db, format!("set_meta: {e}")))?
-            .check()
-            .map_err(|e| SkbError::new(ErrorCode::Db, format!("set_meta check: {e}")))?;
-        Ok(())
+        set_meta_impl(&self.db, key, val).await
     }
 }
 

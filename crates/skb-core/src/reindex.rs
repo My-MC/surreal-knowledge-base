@@ -107,22 +107,46 @@ pub async fn reindex(
     }
 
     if !dry_run {
-        // Record the resolved model/tokenizer metadata (spec §5.4). The
-        // fingerprint comparison already happened in `KnowledgeBase::open`;
-        // after a successful rebuild the stored values are refreshed.
-        db.set_meta("embedding_model", &config.embedding.model)
+        // Record the resolved model/tokenizer metadata (spec §5.4) in one
+        // transaction so a partial failure leaves the previous metadata
+        // intact. The fingerprint comparison already happened in
+        // `KnowledgeBase::open`; after a successful rebuild the stored values
+        // are refreshed.
+        let tx = db
+            .db
+            .clone()
+            .begin()
+            .await
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex meta begin: {e}")))?;
+        let result = async {
+            use crate::db::MetaStore;
+            tx.set_meta("embedding_model", &config.embedding.model)
+                .await?;
+            tx.set_meta("embedding_dimension", &embedder.dimension().to_string())
+                .await?;
+            tx.set_meta(
+                "embedding_max_input_tokens",
+                &embedder.max_input_tokens().to_string(),
+            )
             .await?;
-        db.set_meta("embedding_dimension", &embedder.dimension().to_string())
-            .await?;
-        db.set_meta(
-            "embedding_max_input_tokens",
-            &config.embedding.max_input_tokens.to_string(),
-        )
-        .await?;
-        db.set_meta("schema_version", crate::SCHEMA_VERSION).await?;
-        let source = crate::tokenizer_source_for(config);
-        let meta = crate::tokenizer_fingerprint(&source, &tokenizer.config_json()?)?;
-        crate::save_tokenizer_meta(db, config, &source, &meta).await?;
+            tx.set_meta("schema_version", crate::SCHEMA_VERSION).await?;
+            let source = crate::tokenizer_source_for(config);
+            let meta = crate::tokenizer_fingerprint(&source, &tokenizer.config_json()?)?;
+            crate::save_tokenizer_meta(&tx, config, &source, &meta).await?;
+            Ok::<(), SkbError>(())
+        }
+        .await;
+        match result {
+            Ok(()) => {
+                tx.commit().await.map_err(|e| {
+                    SkbError::new(ErrorCode::Db, format!("reindex meta commit: {e}"))
+                })?;
+            }
+            Err(e) => {
+                let _ = tx.cancel().await;
+                return Err(e);
+            }
+        }
     }
 
     Ok(result)

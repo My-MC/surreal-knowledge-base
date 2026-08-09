@@ -39,7 +39,22 @@ pub struct KnowledgeBase {
 }
 
 impl KnowledgeBase {
+    /// Open the knowledge base, refusing to operate when the stored
+    /// model/dimension/tokenizer no longer match the configuration
+    /// (`E_MODEL_MISMATCH`, spec §5.4). Use [`KnowledgeBase::open_for_reindex`]
+    /// to rebuild after such a change.
     pub async fn open(config: Config) -> Result<Self, SkbError> {
+        Self::open_inner(config, false).await
+    }
+
+    /// Open the knowledge base even when the stored model/dimension/tokenizer
+    /// mismatch the configuration, so that `reindex` can rebuild it
+    /// (spec §5.4: management path from the mismatch state).
+    pub async fn open_for_reindex(config: Config) -> Result<Self, SkbError> {
+        Self::open_inner(config, true).await
+    }
+
+    async fn open_inner(config: Config, allow_mismatch: bool) -> Result<Self, SkbError> {
         let db = Db::open(&config).await?;
 
         let tokenizer_path = resolve_tokenizer_path(&config)?;
@@ -90,7 +105,7 @@ impl KnowledgeBase {
             )
             .await?;
             db.set_meta("schema_version", crate::SCHEMA_VERSION).await?;
-        } else {
+        } else if !allow_mismatch {
             let stored_model = db.get_meta("embedding_model").await?;
             if let Some(ref stored) = stored_model {
                 if stored != &config.embedding.model {
@@ -152,7 +167,9 @@ impl KnowledgeBase {
         // fingerprint (spec §5.4 rule 3). A mismatch requires a reindex.
         let tokenizer_source = tokenizer_source_for(&config);
         let tokenizer_meta = tokenizer_fingerprint(&tokenizer_source, &tokenizer.config_json()?)?;
-        sync_tokenizer_meta(&db, &config, &tokenizer_source, &tokenizer_meta).await?;
+        if !allow_mismatch {
+            sync_tokenizer_meta(&db, &config, &tokenizer_source, &tokenizer_meta).await?;
+        }
 
         tracing::info!(model=%config.embedding.model, dim=dimension, "KnowledgeBase opened");
 
@@ -205,6 +222,36 @@ impl KnowledgeBase {
     // ── CRUD ──
     pub async fn list_documents(&self, q: &ListQuery) -> Result<Vec<DocumentSummary>, SkbError> {
         crud::list_documents(&self.db, q).await
+    }
+
+    /// Return at most `max` documents plus whether more remain. Paging is
+    /// performed here with a stable order so callers do not hold a lock across
+    /// repeated async fetches (the MCP `skb://documents` resource, §8.3).
+    pub async fn document_snapshot(
+        &self,
+        max: usize,
+    ) -> Result<(Vec<DocumentSummary>, bool), SkbError> {
+        const PAGE: usize = 100;
+        let mut docs = Vec::new();
+        let mut offset = 0;
+        loop {
+            let page = self
+                .list_documents(&ListQuery {
+                    limit: Some(PAGE),
+                    offset: Some(offset),
+                    order: None,
+                })
+                .await?;
+            let page_len = page.len();
+            docs.extend(page);
+            if page_len < PAGE || docs.len() > max {
+                break;
+            }
+            offset += PAGE;
+        }
+        let truncated = docs.len() > max;
+        docs.truncate(max);
+        Ok((docs, truncated))
     }
 
     pub async fn get_document(&self, req: &GetDocumentRequest) -> Result<DocumentDetail, SkbError> {
@@ -382,19 +429,24 @@ pub(crate) async fn sync_tokenizer_meta(
 
 /// Persist the tokenizer metadata unconditionally (used after a successful
 /// reindex, spec §5.4 rule 3).
-pub(crate) async fn save_tokenizer_meta(
-    db: &Db,
+pub(crate) async fn save_tokenizer_meta<S: crate::db::MetaStore>(
+    store: &S,
     config: &Config,
     source: &str,
     meta: &TokenizerMeta,
 ) -> Result<(), SkbError> {
-    db.set_meta("tokenizer", &config.embedding.tokenizer)
+    store
+        .set_meta("tokenizer", &config.embedding.tokenizer)
         .await?;
-    db.set_meta("tokenizer_source", source).await?;
-    db.set_meta("tokenizer_algorithm", &meta.algorithm).await?;
-    db.set_meta("tokenizer_fingerprint_schema", TOKENIZER_FINGERPRINT_SCHEMA)
+    store.set_meta("tokenizer_source", source).await?;
+    store
+        .set_meta("tokenizer_algorithm", &meta.algorithm)
         .await?;
-    db.set_meta("tokenizer_fingerprint", &meta.fingerprint)
+    store
+        .set_meta("tokenizer_fingerprint_schema", TOKENIZER_FINGERPRINT_SCHEMA)
+        .await?;
+    store
+        .set_meta("tokenizer_fingerprint", &meta.fingerprint)
         .await?;
     Ok(())
 }
@@ -437,6 +489,8 @@ mod tests {
         use tokenizers::models::bpe::BPE;
         use tokenizers::Tokenizer;
 
+        // BPE::builder().vocab_and_merges expects tokenizers' Vocab type
+        // (an ahash map); ahash stays a dev-dependency for this construction.
         let mut vocab = ahash::AHashMap::default();
         vocab.insert("<unk>".to_string(), 0);
         vocab.insert(word.to_string(), 1);

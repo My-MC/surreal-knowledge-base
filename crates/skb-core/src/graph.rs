@@ -672,6 +672,32 @@ mod tests {
     }
 
     #[test]
+    fn rejects_limit_above_max_top_k() {
+        let mut req = graph_request("A");
+        req.limit = Some(crate::search::MAX_TOP_K + 1);
+        assert!(matches!(
+            req.validate(),
+            Err(SkbError {
+                code: ErrorCode::Validation,
+                ..
+            })
+        ));
+        req.limit = Some(crate::search::MAX_TOP_K);
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn graph_query_schema_marks_limit_max() {
+        let schema = schemars::schema_for!(GraphQueryRequest);
+        let value = serde_json::to_value(&schema).unwrap();
+        assert_eq!(
+            value["properties"]["limit"]["maximum"],
+            crate::search::MAX_TOP_K as u64,
+            "schema limit maximum must track MAX_TOP_K"
+        );
+    }
+
+    #[test]
     fn rejects_empty_entity_name_and_kind() {
         for (name, kind) in [("", "k"), ("n", "")] {
             assert!(matches!(

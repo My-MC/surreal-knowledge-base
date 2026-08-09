@@ -234,11 +234,6 @@ impl Config {
             self.upload.max_file_mb = v;
         }
         if let Some(v) = env_opt("SKB_UPLOAD_ALLOWED_DIRS")? {
-            if v.trim().is_empty() {
-                return Err(anyhow::anyhow!(
-                    "SKB_UPLOAD_ALLOWED_DIRS must not be empty (got '{v}')"
-                ));
-            }
             let dirs: Vec<PathBuf> = v
                 .split(',')
                 .map(|part| PathBuf::from(part.trim()))
@@ -591,11 +586,11 @@ mod tests {
     fn load_works_without_config_file_when_env_set() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _model = EnvGuard::set("SKB_EMBEDDING_MODEL", "env-only-model");
-        // Config::load() must not require a config file: defaults + env apply.
-        // The env override wins over any file the cwd happens to contain, so
-        // the assertion below holds regardless of a local skb.toml — unless
-        // that file is malformed TOML, which legitimately surfaces as an error.
-        let config = Config::load().unwrap();
+        // Exercise the env-override path directly instead of Config::load(),
+        // so a developer's ~/.config/skb/config.toml (even malformed) cannot
+        // affect this test. Defaults + env override must yield the env model.
+        let mut config = Config::default();
+        config.apply_env_overrides().unwrap();
         assert_eq!(config.embedding.model, "env-only-model");
     }
 }
