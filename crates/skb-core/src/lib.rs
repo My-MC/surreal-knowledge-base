@@ -713,8 +713,13 @@ mod tests {
         base64::engine::general_purpose::STANDARD.encode(bytes)
     }
 
-    fn cleanup(kb: &KnowledgeBase) {
-        let _ = std::fs::remove_dir_all(&kb.config().storage.path);
+    fn cleanup(kb: KnowledgeBase) {
+        let path = kb.config().storage.path.clone();
+        // Drop the KnowledgeBase first so the embedded SurrealKv file lock is
+        // released before the directory is removed (Windows cannot delete
+        // open files).
+        drop(kb);
+        let _ = std::fs::remove_dir_all(&path);
     }
 
     /// In-process reopening of the same SurrealKv path needs the previous
@@ -1340,7 +1345,7 @@ mod tests {
     async fn test_open() {
         let kb = setup().await;
         assert_eq!(kb.embedder().dimension(), 8);
-        cleanup(&kb);
+        cleanup(kb);
     }
 
     #[tokio::test]
@@ -1354,7 +1359,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err.code, ErrorCode::DocumentNotFound));
-        cleanup(&kb);
+        cleanup(kb);
     }
 
     #[tokio::test]
@@ -1751,7 +1756,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err.code, ErrorCode::Validation));
 
-        cleanup(&kb);
+        cleanup(kb);
     }
 
     #[test]

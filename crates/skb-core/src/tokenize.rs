@@ -9,8 +9,15 @@ pub trait Tokenize: Send + Sync {
     /// Canonical JSON serialization of the tokenizer configuration: model
     /// (vocabulary), normalizer, pre-tokenizer, post-processor, decoder and
     /// other fields as loaded from `tokenizer.json`. Deterministic for a given
-    /// file; used for fingerprinting (§5.4).
-    fn config_json(&self) -> Result<serde_json::Value, SkbError>;
+    /// file; used for fingerprinting (§5.4). The default fails so external
+    /// `Tokenize` implementations remain compilable without it; the built-in
+    /// `TokenizersImpl` always provides a real value.
+    fn config_json(&self) -> Result<serde_json::Value, SkbError> {
+        Err(SkbError::new(
+            ErrorCode::Tokenize,
+            "config_json is not supported by this tokenizer implementation",
+        ))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -111,7 +118,13 @@ impl Tokenize for TokenizersImpl {
                 if let Some(i) = (start + 1..window_end)
                     .find(|&i| offsets.get(i).map(|o| o.1).unwrap_or(0) > heading_off)
                 {
-                    end = i;
+                    // A split immediately after the first token would produce a
+                    // one-token chunk (e.g. an overlap rewind landing right
+                    // before a heading); in that case keep the whole window so
+                    // tiny, low-quality chunks are not emitted.
+                    if i > start + 1 {
+                        end = i;
+                    }
                 }
             }
 
@@ -212,7 +225,9 @@ fn heading_text(text: &str, start: usize) -> Option<String> {
         .map(|e| start + e)
         .unwrap_or(text.len());
     let line = &text[start..end];
-    let trimmed = line.trim_start_matches('#').trim();
+    // Trim leading whitespace first so indented headings ("  ## Title") yield
+    // the plain heading text, matching the heading-line detection.
+    let trimmed = line.trim_start().trim_start_matches('#').trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
@@ -236,6 +251,12 @@ mod tests {
     fn collects_heading_offsets() {
         let text = "# A\nbody\n## B\nmore\n";
         assert_eq!(heading_starts(text), vec![0, 9]);
+    }
+
+    #[test]
+    fn ignores_headings_inside_code_fences() {
+        let text = "# A\n```\n# not a heading\n```\n## B\n";
+        assert_eq!(heading_starts(text), vec![0, 28]);
     }
 
     #[test]

@@ -555,11 +555,13 @@ pub async fn expand_search_hits(
             }
             let mut next: Vec<(String, f64)> = Vec::new();
             for (entity, _) in frontier.iter() {
-                if !visited.insert(entity.clone()) {
-                    continue;
-                }
+                // Capacity check first: an entity is marked visited only when
+                // it will actually be queried.
                 if frontier.len() + next.len() >= MAX_FRONTIER {
                     break;
+                }
+                if !visited.insert(entity.clone()) {
+                    continue;
                 }
                 let decay = 1.0 / hop as f64;
                 let esql =
@@ -909,9 +911,13 @@ pub(crate) async fn link_section_hierarchy(
                         SkbError::new(ErrorCode::Db, format!("section upsert check: {e}"))
                     })?;
             }
+            // Remove every part-of edge originating from the child (a section
+            // may have moved under a different parent since a previous upload)
+            // before creating the current parent edge. Section entities are
+            // global (name-keyed), so this cleans up stale edges from any
+            // document without touching unrelated relations.
             tx.query(
-                "DELETE FROM related_to WHERE relation = 'part-of' \
-                 AND in = $child AND out = $parent; \
+                "DELETE FROM related_to WHERE relation = 'part-of' AND in = $child; \
                  RELATE $child->related_to->$parent SET relation = 'part-of', weight = 1.0",
             )
             .bind(("child", entity_record_id(&section.name)?))

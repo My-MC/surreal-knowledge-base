@@ -930,6 +930,9 @@ fn is_teredo_v6(v6: std::net::Ipv6Addr) -> bool {
 
 fn base64_decode_checked(b64: &str, config: &Config) -> Result<Vec<u8>, SkbError> {
     use base64::Engine;
+    // Reject oversized input before allocating the compact copy: encoded size
+    // is an upper bound on the decoded size (base64 is >= 4/3).
+    check_size(b64.len() as u64, config)?;
     let compact: String = b64.chars().filter(|c| !c.is_whitespace()).collect();
     let estimated = base64::decoded_len_estimate(compact.len());
     check_size(estimated as u64, config)?;

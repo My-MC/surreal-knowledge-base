@@ -257,7 +257,7 @@ Phase 0〜8 で確定した方針（`tokenizers`、SurrealKV 組込み、ORT 静
 - document、chunk、entity、mentions、force更新時の旧データ削除を一つのトランザクションで処理する。
 - 複数入力時は成功結果と`errors[]`を集約し、一件の失敗で全体を中断しない。
 - **完了条件**: サイズ超過base64、PDF爆弾（ページ数）、decode/extractの時間上限、DNS rebinding、redirect再検証、未対応形式、部分失敗、rollbackのテストが緑。
-- **残余（未実装・記録のみ）**: 圧縮爆弾・ネスト深度・メモリ上限、検証済みIPへの接続固定（ureq 3.3 は resolver/connector 差し替え非公開、§15）。
+- **残余（未実装・記録のみ）**: 圧縮爆弾・ネスト深度・メモリ上限（PDFはページ数・時間上限のみ）。検証済みIPへの接続固定は SafeResolver（ureq Resolver 実装）で実装済み。
 
 ✅ 実装済み: 全入力経路（file/stdin/base64/inline/URL）に `upload.max_file_mb` を decode/extract 前後で適用（stdin は `Read::take`、URL は `limit()` ストリーミング読み、base64 は `decoded_len_estimate` 事前検査 + 実長検査）。base64 を任意バイナリとして保持し、PDF マジック/MIME で分類、未対応バイナリは `E_UNSUPPORTED_FORMAT`。URL は http/https のみ、手動リダイレクトループ（上限5）で各 hop に scheme + DNS 事前解決・IP 検証（private/loopback/link-local/multicast/unspecified/broadcast/documentation/CGNAT/benchmarking/reserved/metadata 169.254.169.254）、connect/global タイムアウト。PDF はページ数上限200・処理時間上限30秒。document+chunk+mentions+force 時の旧データ削除を単一トランザクション化（失敗時 rollback）。CLI 複数入力（--recursive 等）は `{results, errors[]}` 集約で部分失敗を許容。
 

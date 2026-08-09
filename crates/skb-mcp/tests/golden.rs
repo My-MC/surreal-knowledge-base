@@ -21,7 +21,10 @@ const PROFILE_DIR: &str = if cfg!(debug_assertions) {
 
 fn mcp_binary() -> PathBuf {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.push(format!("../../target/{PROFILE_DIR}/skb-mcp"));
+    path.push(format!(
+        "../../target/{PROFILE_DIR}/skb-mcp{}",
+        std::env::consts::EXE_SUFFIX
+    ));
     assert!(
         path.exists(),
         "missing target/{PROFILE_DIR}/skb-mcp; run: cargo test --workspace -- --test-threads=1"
@@ -31,7 +34,10 @@ fn mcp_binary() -> PathBuf {
 
 fn cli_binary() -> PathBuf {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.push(format!("../../target/{PROFILE_DIR}/skb"));
+    path.push(format!(
+        "../../target/{PROFILE_DIR}/skb{}",
+        std::env::consts::EXE_SUFFIX
+    ));
     assert!(
         path.exists(),
         "missing target/{PROFILE_DIR}/skb; run: cargo test --workspace -- --test-threads=1"
