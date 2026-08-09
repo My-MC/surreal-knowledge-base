@@ -532,6 +532,7 @@ fn parse_scalar_item(raw: &str) -> toml_edit::Item {
 
 fn cfg() -> Result<Config> {
     // Errors (invalid SKB_* env values, unreadable/ malformed config files)
-    // must surface instead of silently falling back to defaults.
-    Config::load().map_err(|e| anyhow::anyhow!("{e:#}"))
+    // must surface instead of silently falling back to defaults. Return the
+    // original error so ErrorCode::from_std can detect SkbError codes.
+    Config::load()
 }

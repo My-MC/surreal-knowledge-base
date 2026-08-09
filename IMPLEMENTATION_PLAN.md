@@ -50,7 +50,7 @@
 | 6 | Skill | 部分完了 | 実装済みレスポンスとSkillの引用・エラー説明の同期が必要 |
 | 7 | 仕上げ | 進行中 | ベンチ結果の判定、日本語FTS評価、公開手順の整理が必要 |
 | 8 | ort有効バイナリ + 依存最小化 | 部分完了 | CI証跡と生成artifactの扱い、Windows runtime案内のE2Eが必要 |
-| 9 | 仕様適合化と未実施機能 | 部分完了 | 9-1/9-2は完了。9-3〜9-7を順に実装する。既存の部分実装は完了条件を満たすまで未完了とする |
+| 9 | 仕様適合化と未実施機能 | 部分完了 | 9-1は部分完了（CLI引数優先・config.json自動検出は未実装）、9-2は完了。9-3〜9-7を順に実装する。既存の部分実装は完了条件を満たすまで未完了とする |
 
 ### 現状検証マトリクス
 
@@ -237,7 +237,7 @@ Phase 0〜8 で確定した方針（`tokenizers`、SurrealKV 組込み、ORT 静
 - fingerprint schema version、canonicalization規則、取得元、アルゴリズム/バージョン、fingerprintを`meta`に保存し、`KnowledgeBase::open`と`reindex`で比較する。
 - **完了条件**: 不正設定、環境変数上書き、model/dimension/max input mismatch、tokenizer fingerprint不一致、保存後の再起動検証が緑。
 
-✅ 実装済み: `Config::validate()`（`0 < overlap < max <= max_input`ほか）と `Config::resolve_embedding_settings()`（dimension/max_input のモデル値解決・不一致は `E_VALIDATION`）、`SKB_*` 環境変数オーバーライド（`Config::load()` がファイルなし時も default+env を返す）、tokenizer fingerprint（canonical JSON + SHA-256、schema v1、meta 保存・`open`/`reindex` で比較、不一致は `E_MODEL_MISMATCH`）、reindex 成功時に model/tokenizer meta を更新、`search` のデフォルト mode/top_k を `config.search` から適用。MockEmbedder は固定 8 次元として検出値とみなす。CLI 引数レイヤは該当する設定キーの引数が存在しないため env が最上位。bge-m3 の自動検出値は 1024/8192（OrtEmbedder 固定、config.json からの検出は将来課題）。
+✅ 実装済み: `Config::validate()`（`0 <= overlap < max <= max_input`ほか）と `Config::resolve_embedding_settings()`（dimension/max_input のモデル値解決・不一致は `E_VALIDATION`）、`SKB_*` 環境変数オーバーライド（`Config::load()` がファイルなし時も default+env を返す）、tokenizer fingerprint（canonical JSON + SHA-256、schema v1、meta 保存・`open`/`reindex` で比較、不一致は `E_MODEL_MISMATCH`）、reindex 成功時に model/tokenizer meta を更新、`search` のデフォルト mode/top_k を `config.search` から適用。MockEmbedder は固定 8 次元として検出値とみなす。CLI 引数レイヤは該当する設定キーの引数が存在しないため env が最上位。bge-m3 の自動検出値は 1024/8192（OrtEmbedder 固定、config.json からの検出は将来課題）。
 
 ### 9-2: 共通DTO・JSON Schema基盤（完了）
 

@@ -28,6 +28,9 @@ use std::sync::Arc;
 /// the canonicalization rules or the covered fields change.
 pub const TOKENIZER_FINGERPRINT_SCHEMA: &str = "1";
 
+/// Database schema version written to the `schema_version` metadata key.
+pub const SCHEMA_VERSION: &str = "1";
+
 pub struct KnowledgeBase {
     db: Db,
     embedder: Arc<dyn Embed>,
@@ -86,7 +89,7 @@ impl KnowledgeBase {
                 &config.embedding.max_input_tokens.to_string(),
             )
             .await?;
-            db.set_meta("schema_version", "1").await?;
+            db.set_meta("schema_version", crate::SCHEMA_VERSION).await?;
         } else {
             let stored_model = db.get_meta("embedding_model").await?;
             if let Some(ref stored) = stored_model {

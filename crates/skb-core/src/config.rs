@@ -234,11 +234,22 @@ impl Config {
             self.upload.max_file_mb = v;
         }
         if let Some(v) = env_opt("SKB_UPLOAD_ALLOWED_DIRS")? {
-            self.upload.allowed_dirs = v
+            if v.trim().is_empty() {
+                return Err(anyhow::anyhow!(
+                    "SKB_UPLOAD_ALLOWED_DIRS must not be empty (got '{v}')"
+                ));
+            }
+            let dirs: Vec<PathBuf> = v
                 .split(',')
                 .map(|part| PathBuf::from(part.trim()))
                 .filter(|p| !p.as_os_str().is_empty())
                 .collect();
+            if dirs.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "SKB_UPLOAD_ALLOWED_DIRS must contain at least one directory (got '{v}')"
+                ));
+            }
+            self.upload.allowed_dirs = dirs;
         }
         Ok(())
     }

@@ -119,7 +119,7 @@ pub async fn reindex(
             &config.embedding.max_input_tokens.to_string(),
         )
         .await?;
-        db.set_meta("schema_version", "1").await?;
+        db.set_meta("schema_version", crate::SCHEMA_VERSION).await?;
         let source = crate::tokenizer_source_for(config);
         let meta = crate::tokenizer_fingerprint(&source, &tokenizer.config_json()?)?;
         crate::save_tokenizer_meta(db, config, &source, &meta).await?;

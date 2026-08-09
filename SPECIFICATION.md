@@ -312,9 +312,9 @@ impl KnowledgeBase {
 
     // 資料管理
     pub async fn upload(&self, req: UploadRequest) -> Result<UploadResult>;
-    pub async fn list_documents(&self, q: ListQuery) -> Result<Page<DocumentSummary>>;
-    pub async fn get_document(&self, id: &str, opts: GetOptions) -> Result<DocumentDetail>;
-    pub async fn delete_document(&self, id: &str) -> Result<DeleteResult>;
+    pub async fn list_documents(&self, q: &ListQuery) -> Result<Vec<DocumentSummary>>;
+    pub async fn get_document(&self, req: &GetDocumentRequest) -> Result<DocumentDetail>;
+    pub async fn delete_document(&self, req: &DeleteDocumentRequest) -> Result<DeleteResult>;
 
     // 検索
     pub async fn search(&self, req: SearchRequest) -> Result<SearchResponse>;

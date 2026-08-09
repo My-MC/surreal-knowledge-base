@@ -284,18 +284,22 @@ pub async fn delete_document(
 ) -> Result<DeleteResult, SkbError> {
     req.validate()?;
     let record_id = document_record_id(&req.id)?;
-    let query = "DELETE FROM chunk WHERE document = $id; DELETE $id;";
-    db.db
+    let query = "DELETE FROM chunk WHERE document = $id RETURN BEFORE; DELETE $id;";
+    let r = db
+        .db
         .query(query)
         .bind(("id", record_id))
         .await
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete: {e}")))?
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete: {e}")))?;
+    let deleted: Vec<serde_json::Value> = r
         .check()
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete check: {e}")))?;
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete check: {e}")))?
+        .take(0)
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete take: {e}")))?;
 
     Ok(DeleteResult {
         document_id: req.id.clone(),
-        chunks_deleted: 0,
+        chunks_deleted: deleted.len(),
     })
 }
 
