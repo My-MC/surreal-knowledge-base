@@ -580,17 +580,38 @@ mod tests {
         let _model = EnvGuard::set("SKB_EMBEDDING_MODEL", "env-only-model");
         // Run from an isolated directory under ./target (never /tmp) so an
         // existing ./skb.toml in the caller's cwd cannot be loaded; load()
-        // must fall back to defaults + env instead of failing. cwd is
-        // preserved/restored even on panic.
+        // must fall back to defaults + env instead of failing. CwdGuard
+        // restores the original cwd on drop, including on panic.
         let original = std::env::current_dir().unwrap();
         let isolated =
             std::path::PathBuf::from(format!("./target/skb-config-test-{}", std::process::id()));
         std::fs::create_dir_all(&isolated).unwrap();
         std::env::set_current_dir(&isolated).unwrap();
+        let _cwd_guard = CwdGuard::new(original);
         let result = Config::load();
+        // Remove the relative isolated path before cwd restoration (the guard
+        // is still alive, so the cwd is still the isolated dir).
         let _ = std::fs::remove_dir_all(&isolated);
-        std::env::set_current_dir(&original).unwrap();
         let config = result.unwrap();
         assert_eq!(config.embedding.model, "env-only-model");
+    }
+
+    /// Restores the original current directory on drop, including on panic
+    /// (panics unwind, so Drop runs; the guard must be kept alive for the
+    /// whole test body).
+    struct CwdGuard {
+        original: std::path::PathBuf,
+    }
+
+    impl CwdGuard {
+        fn new(original: std::path::PathBuf) -> Self {
+            Self { original }
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.original);
+        }
     }
 }

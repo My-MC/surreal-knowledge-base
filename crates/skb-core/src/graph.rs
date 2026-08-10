@@ -89,7 +89,7 @@ pub struct GraphQueryRequest {
     pub relation: Option<String>,
     #[schemars(range(min = 1, max = 5))]
     pub depth: Option<usize>,
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1, max = crate::crud::MAX_LIST_LIMIT))]
     pub limit: Option<usize>,
 }
 
@@ -582,7 +582,12 @@ pub async fn expand_search_hits(
                     }
                 }
             }
+            // Cap the frontier at the end of each hop so a dense graph
+            // cannot grow it unboundedly across hops (request-level bound).
             frontier.extend(next);
+            if frontier.len() > frontier_max {
+                frontier.truncate(frontier_max);
+            }
         }
 
         // Dedup the frontier by entity name, keeping the best (closest hop =
@@ -752,7 +757,7 @@ pub fn extract_entities(content: &str) -> Vec<EntityInfo> {
     let heading_re = &HEADING_RE;
     for cap in heading_re.captures_iter(content) {
         let heading = cap.get(1).map(|m| m.as_str()).unwrap_or("");
-        if heading.len() > 2 {
+        if heading.chars().count() > 2 {
             entities.push(EntityInfo {
                 name: heading.trim().to_string(),
                 kind: "section".into(),

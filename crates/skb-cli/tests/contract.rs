@@ -1,3 +1,5 @@
+use serial_test::serial;
+
 // Contract tests: verify CLI and core API produce compatible JSON output
 
 use serde_json::Value;
@@ -134,6 +136,7 @@ fn core_stats() -> Value {
 
 const TEST_DATA: &str = "SurrealDB supports vector search with HNSW and full-text with BM25.";
 
+#[serial(contract)]
 #[test]
 fn contract_upload() {
     setup_config();
@@ -146,6 +149,7 @@ fn contract_upload() {
     assert!(cli_val["chunks"].as_u64().unwrap() > 0);
 }
 
+#[serial(contract)]
 #[test]
 fn contract_search() {
     setup_config();
@@ -162,6 +166,7 @@ fn contract_search() {
     assert_eq!(cli_val["mode"], core_val["mode"]);
 }
 
+#[serial(contract)]
 #[test]
 fn contract_list() {
     setup_config();
@@ -177,6 +182,7 @@ fn contract_list() {
     assert!(!core_val.as_array().unwrap().is_empty());
 }
 
+#[serial(contract)]
 #[test]
 fn contract_stats() {
     setup_config();
@@ -197,6 +203,7 @@ fn contract_stats() {
     );
 }
 
+#[serial(contract)]
 #[test]
 fn contract_config_set_updates_existing_config() {
     setup_config();
@@ -213,6 +220,7 @@ fn contract_config_set_updates_existing_config() {
     assert_eq!(shown["search"]["rrf_k"], 42);
 }
 
+#[serial(contract)]
 #[test]
 fn contract_config_env_override() {
     setup_config();
@@ -227,6 +235,7 @@ fn contract_config_env_override() {
     assert_eq!(val["search"]["top_k"], 42);
 }
 
+#[serial(contract)]
 #[test]
 fn contract_upload_partial_failure() {
     setup_config();
@@ -272,6 +281,7 @@ fn contract_upload_partial_failure() {
     );
 }
 
+#[serial(contract)]
 #[test]
 fn contract_search_response_fields() {
     setup_config();
@@ -292,6 +302,7 @@ fn contract_search_response_fields() {
     assert!(vec["hits"][0]["highlights"].is_null());
 }
 
+#[serial(contract)]
 #[test]
 fn contract_pipeline() {
     setup_config();

@@ -13,7 +13,7 @@ pub const MAX_TOP_K: usize = 1000;
 pub struct SearchRequest {
     pub query: String,
     pub mode: Option<SearchMode>,
-    #[schemars(range(min = 1, max = 1000))]
+    #[schemars(range(min = 1, max = MAX_TOP_K))]
     pub top_k: Option<usize>,
     #[schemars(range(min = 0, max = 5))]
     pub graph_expand: Option<usize>,
@@ -145,7 +145,7 @@ async fn vector_search(
 }
 
 async fn keyword_search(db: &Db, query: &str, top_k: usize) -> Result<Vec<SearchHit>, SkbError> {
-    let escaped = query.replace('\'', "''");
+    let escaped = surql_escape(query);
     let sql = format!(
         "SELECT content, idx, meta::id(document) AS document, \
          document.title AS title, document.source AS source, search::score(0) AS score \
@@ -201,7 +201,7 @@ async fn hybrid_search(
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("hybrid vec take: {e}")))?;
 
     // Keyword results
-    let escaped = query.replace('\'', "''");
+    let escaped = surql_escape(query);
     let ksql = format!(
         "SELECT content, idx, meta::id(id) AS chunk_id, \
          meta::id(document) AS document, \
@@ -261,15 +261,30 @@ async fn hybrid_search(
 
     Ok(sorted
         .into_iter()
-        .map(|(_, (score, content, idx, doc, title, source))| SearchHit {
-            document_id: doc,
-            chunk_idx: idx,
-            content,
-            score,
-            title,
-            source,
-            highlights: Some(highlights.clone()),
-            matched_entities: None,
+        .map(|(_, (score, content, idx, doc, title, source))| {
+            // Highlight only terms actually present in this chunk's content
+            // (the shared global highlights were computed from the query, not
+            // per hit).
+            let hit_highlights: Vec<String> = highlights
+                .iter()
+                .filter(|t| content.to_lowercase().contains(&t.to_lowercase()))
+                .cloned()
+                .collect();
+            let hit_highlights = if hit_highlights.is_empty() {
+                None
+            } else {
+                Some(hit_highlights)
+            };
+            SearchHit {
+                document_id: doc,
+                chunk_idx: idx,
+                content,
+                score,
+                title,
+                source,
+                highlights: hit_highlights,
+                matched_entities: None,
+            }
         })
         .collect())
 }
@@ -292,6 +307,14 @@ fn rows_to_hits(
         });
     }
     Ok(hits)
+}
+
+/// Escape a string literal for embedding in SurrealQL: backslashes first (so
+/// the quote doubling cannot be undone by a preceding backslash), then single
+/// quotes doubled (SurrealQL's string-literal escaping). Used by the keyword
+/// query construction until the SurrealDB `@@ $query` binding defect is fixed.
+pub(crate) fn surql_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('\'', "''")
 }
 
 /// The query terms that a keyword search can highlight: whitespace/punctuation
@@ -398,6 +421,21 @@ mod tests {
             graph_expand: None,
             filter: None,
         }
+    }
+
+    #[test]
+    fn surql_escape_doubles_quotes_and_backslashes() {
+        // A quote must be doubled and a backslash must be doubled BEFORE the
+        // quote so the escaping cannot be undone (backslash then quote).
+        assert_eq!(surql_escape("it's"), "it''s");
+        assert_eq!(surql_escape(r"a\b"), r"a\\b");
+        assert_eq!(surql_escape(r"a\'b"), r"a\\''b");
+        assert_eq!(
+            surql_escape("'; DELETE FROM document; --"),
+            "''; DELETE FROM document; --"
+        );
+        // ASCII-only input is unchanged.
+        assert_eq!(surql_escape("plain query"), "plain query");
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, GetPromptRequestParams,
@@ -100,23 +100,27 @@ impl ServerHandler for SkbServer {
             // whether truncation actually occurred; `truncated` is reported
             // inside a valid JSON payload so clients can parse the resource.
             const MAX_DOCUMENTS_RESOURCE: usize = 10_000;
+            const PAGE_SIZE: usize = 100;
             let mut docs: Vec<skb_core::crud::DocumentSummary> = Vec::new();
             let mut offset = 0;
             loop {
                 let page = kb
                     .list_documents(&ListQuery {
-                        limit: Some(100),
+                        limit: Some(PAGE_SIZE),
                         offset: Some(offset),
-                        order: None,
+                        // Stable pagination order (created_at ascending) so
+                        // pages cannot duplicate/skip rows while the store
+                        // changes between requests.
+                        order: Some(skb_core::crud::OrderBy::CreatedAsc),
                     })
                     .await
                     .map_err(err_data)?;
                 let page_len = page.len();
                 docs.extend(page);
-                if page_len < 100 || docs.len() > MAX_DOCUMENTS_RESOURCE {
+                if page_len < PAGE_SIZE || docs.len() > MAX_DOCUMENTS_RESOURCE {
                     break;
                 }
-                offset += 100;
+                offset += PAGE_SIZE;
             }
             let truncated = docs.len() > MAX_DOCUMENTS_RESOURCE;
             docs.truncate(MAX_DOCUMENTS_RESOURCE);
@@ -397,13 +401,10 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let config = Config::load().map_err(|e| {
-        let err = skb_core::error::SkbError::new(
-            skb_core::error::ErrorCode::Config,
-            format!("failed to load config: {e}"),
-        );
-        rmcp::ErrorData::invalid_params(err.to_string(), None)
-    })?;
+    // Match the CLI: Config::load() returning a default for a missing config
+    // file is fine, but parse errors and invalid SKB_* environment values must
+    // stop startup. Propagate the anyhow error with its file-path context.
+    let config = Config::load().context("failed to load config")?;
     let kb = KnowledgeBase::open(config).await?;
     let server = SkbServer::new(kb);
 

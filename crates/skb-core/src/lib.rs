@@ -148,8 +148,11 @@ impl KnowledgeBase {
         if req.mode.is_none() {
             req.mode = Some(self.config.search.default_mode);
         }
-        // validate() guarantees top_k >= 1, so a None here only occurs when
-        // the caller omitted it; use the config default directly.
+        if req.top_k.is_none() {
+            req.top_k = Some(self.config.search.top_k);
+        }
+        // req.top_k is guaranteed Some by the block above; write the resolved
+        // value back so search::search sees the same top_k used for truncation.
         let top_k = req.top_k.unwrap_or(self.config.search.top_k);
         let mut resp = search::search(
             &self.db,
