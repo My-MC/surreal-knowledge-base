@@ -123,12 +123,10 @@ async fn update_metas(
     tokenizer: &dyn Tokenize,
     config: &Config,
 ) -> Result<(), SkbError> {
-    let tx = db
-        .db
-        .clone()
-        .begin()
-        .await
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex begin: {e}")))?;
+    let tx =
+        db.db.clone().begin().await.map_err(|e| {
+            SkbError::new(ErrorCode::Db, format!("reindex update_metas begin: {e}"))
+        })?;
     let result = async {
         tx.set_meta("embedding_model", &config.embedding.model)
             .await?;
@@ -211,13 +209,18 @@ async fn rebuild_document(
         chunk_ids.push(cid.to_string());
     }
 
-    let mut entities = 0usize;
+    let mut all_entities: Vec<String> = Vec::new();
     for (cid, chunk) in chunk_ids.iter().zip(chunks.iter()) {
-        entities += crate::graph::index_chunk_entities_in_transaction(tx, cid, &chunk.content)
-            .await?
-            .len();
+        all_entities.extend(
+            crate::graph::index_chunk_entities_in_transaction(tx, cid, &chunk.content).await?,
+        );
     }
-    Ok(entities)
+    // Match dry-run semantics: unique entity names across all chunks (the
+    // per-chunk indexing itself stays inside the transaction, but the count
+    // must not double-count an entity appearing in several chunks).
+    all_entities.sort();
+    all_entities.dedup();
+    Ok(all_entities.len())
 }
 
 fn embed_in_batches(

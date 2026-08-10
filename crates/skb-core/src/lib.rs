@@ -78,6 +78,43 @@ impl KnowledgeBase {
             config.resolve_embedding_settings(embedder.dimension(), embedder.max_input_tokens())?;
 
         let dimension = embedder.dimension();
+
+        // Before touching the schema: a pre-existing store must agree on the
+        // embedding dimension, otherwise db.migrate would redefine the
+        // embedding field / HNSW index on top of mismatched data. A mismatch
+        // returns E_MODEL_MISMATCH without modifying schema, fields, indexes,
+        // or metadata (spec §5.4 rule 2).
+        let info: Vec<serde_json::Value> = db
+            .db
+            .query("INFO FOR DB")
+            .await
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("open info: {e}")))?
+            .take(0)
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("open info take: {e}")))?;
+        let has_meta = info
+            .first()
+            .and_then(|v| v["tables"].as_object())
+            .map(|t| t.contains_key("meta"))
+            .unwrap_or(false);
+        if has_meta {
+            if let Some(stored_dim) = db.get_meta("embedding_dimension").await? {
+                let stored_dim: usize = stored_dim.parse().map_err(|_| {
+                    SkbError::new(
+                        ErrorCode::Db,
+                        "stored embedding_dimension meta is not a number",
+                    )
+                })?;
+                if stored_dim != dimension {
+                    return Err(SkbError::new(
+                        ErrorCode::ModelMismatch,
+                        format!(
+                            "config dimension: '{dimension}', stored: '{stored_dim}'. Run reindex to switch models.",
+                        ),
+                    ));
+                }
+            }
+        }
+
         db.migrate(dimension).await?;
 
         let stored_model = db.get_meta("embedding_model").await?;

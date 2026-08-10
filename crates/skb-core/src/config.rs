@@ -423,7 +423,7 @@ mod tests {
 
     fn resolved_default() -> Config {
         Config::default()
-            .resolve_embedding_settings(8, 8192)
+            .resolve_embedding_settings(crate::embed::MOCK_EMBEDDER_DIMENSION, 8192)
             .unwrap()
     }
 

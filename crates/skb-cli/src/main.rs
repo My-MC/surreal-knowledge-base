@@ -382,9 +382,14 @@ async fn run(cli: &Cli) -> Result<u8> {
                     let _ = std::io::stdout().flush();
                     return Ok(1);
                 }
-            } else {
-                let result = kb.upload(build(path.clone(), None, None)).await?;
+            } else if let Some(p) = paths.first() {
+                // Single collected input: use the discovered file (--recursive
+                // directories with exactly one file, or the plain positional
+                // path), never the original directory path.
+                let result = kb.upload(build(Some(p.clone()), None, None)).await?;
                 output(&result, &fmt)?;
+            } else {
+                anyhow::bail!("no files to upload");
             }
         }
         Commands::Search {
@@ -576,14 +581,28 @@ mod tests {
     fn upload_base64_requires_stdin() {
         assert!(Cli::try_parse_from(["skb", "upload", "--base64"]).is_err());
         assert!(Cli::try_parse_from(["skb", "upload", "--base64", "--path", "a.md"]).is_err());
-        assert!(Cli::try_parse_from(["skb", "upload", "--base64", "--url", "https://x.example/a"]).is_err());
+        assert!(
+            Cli::try_parse_from(["skb", "upload", "--base64", "--url", "https://x.example/a"])
+                .is_err()
+        );
         assert!(Cli::try_parse_from(["skb", "upload", "--base64", "--stdin"]).is_ok());
     }
 
     #[test]
     fn upload_rejects_multiple_input_sources() {
         assert!(Cli::try_parse_from(["skb", "upload", "--path", "a.md", "--stdin"]).is_err());
-        assert!(Cli::try_parse_from(["skb", "upload", "--path", "a.md", "--url", "https://x.example/a"]).is_err());
-        assert!(Cli::try_parse_from(["skb", "upload", "--url", "https://x.example/a", "--stdin"]).is_err());
+        assert!(Cli::try_parse_from([
+            "skb",
+            "upload",
+            "--path",
+            "a.md",
+            "--url",
+            "https://x.example/a"
+        ])
+        .is_err());
+        assert!(
+            Cli::try_parse_from(["skb", "upload", "--url", "https://x.example/a", "--stdin"])
+                .is_err()
+        );
     }
 }

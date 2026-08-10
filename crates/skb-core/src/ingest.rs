@@ -677,12 +677,11 @@ fn fetch_url_with_validator(
             .with_config()
             .limit(max_bytes + 1)
             .read_to_vec()
-            .map_err(|e| {
-                if e.to_string().contains("larger than request limit") {
+            .map_err(|e| match e {
+                ureq::Error::BodyExceedsLimit(_) => {
                     SkbError::new(ErrorCode::Validation, "response exceeds max file size")
-                } else {
-                    SkbError::new(ErrorCode::Io, format!("read url: {e}"))
                 }
+                other => SkbError::new(ErrorCode::Io, format!("read url: {other}")),
             })?;
         if body.len() as u64 > max_bytes {
             return Err(SkbError::new(

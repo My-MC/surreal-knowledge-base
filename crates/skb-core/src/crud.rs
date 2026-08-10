@@ -275,7 +275,10 @@ pub async fn delete_document(
 ) -> Result<DeleteResult, SkbError> {
     req.validate()?;
     let record_id = document_record_id(&req.id)?;
-    let query = "DELETE FROM chunk WHERE document = $id; DELETE $id;";
+    // RETURN BEFORE makes the deleted chunk records available as the query
+    // result so chunks_deleted reflects the actual deletion count (SurrealDB
+    // DELETE without RETURN returns an empty array).
+    let query = "DELETE FROM chunk WHERE document = $id RETURN BEFORE; DELETE $id;";
     let r = db
         .db
         .query(query)
