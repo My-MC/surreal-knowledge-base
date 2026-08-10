@@ -287,12 +287,8 @@ impl Config {
                 "chunking.max_tokens must be at least 1",
             ));
         }
-        if self.chunking.overlap_tokens == 0 {
-            return Err(SkbError::new(
-                ErrorCode::Validation,
-                "chunking.overlap_tokens must be at least 1",
-            ));
-        }
+        // overlap_tokens == 0 (no overlap) is a valid configuration; only
+        // overlap >= max_tokens is rejected below.
         if self.chunking.overlap_tokens >= self.chunking.max_tokens {
             return Err(SkbError::new(
                 ErrorCode::Validation,
@@ -433,16 +429,11 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_zero_overlap() {
+    fn validate_accepts_zero_overlap() {
         let mut c = resolved_default();
         c.chunking.overlap_tokens = 0;
-        assert!(matches!(
-            c.validate(),
-            Err(SkbError {
-                code: ErrorCode::Validation,
-                ..
-            })
-        ));
+        // No-overlap chunking is valid (spec allows 0 <= overlap < max).
+        c.validate().unwrap();
     }
 
     #[test]

@@ -282,8 +282,7 @@ Phase 0〜8 で確定した方針（`tokenizers`、SurrealKV 組込み、ORT 静
 - MCP progress notificationとCLI progress barを実装する。
 - **完了条件**: dimension変更、HNSW再構築、metadata更新、途中失敗rollback、再起動復旧、progressのテストが緑。
 
-✅ 実装済み: `open` を `migrate` 前にモデル/次元比較（新規DBは `INFO FOR DB` で判定し初期化パス）、`open_for_reindex`（mismatch 状態から開く管理経路、CLI/MCP の reindex は `E_MODEL_MISMATCH` 時に自動フォールバック）。dimension 変更は (1) 単一トランザクションで旧chunk/mentions削除 + embeddingフィールド再定義 → (2) ドキュメント単位再構築 → (3) HNSWインデックス再定義 → (4) meta更新 の順で実行し、遷移直後に次元metaを更新して中断状態を常に検出可能に（再実行で完了）。`reindex` は進捗コールバック `(done, total)` を受け、MCP は progress notification（`notifications/progress`）、CLI は stderr に `
-reindexed n/total` を出力。
+✅ 実装済み: `open` を `migrate` 前にモデル/次元比較（新規DBは `INFO FOR DB` で判定し初期化パス）、`open_for_reindex`（mismatch 状態から開く管理経路、CLI/MCP の reindex は `E_MODEL_MISMATCH` 時に自動フォールバック）。dimension 変更は (1) 単一トランザクションで旧chunk/mentions削除 + embeddingフィールド再定義 → (2) ドキュメント単位再構築 → (3) HNSWインデックス再定義 → (4) meta更新 の順で実行し、遷移直後に次元metaを更新して中断状態を常に検出可能に（再実行で完了）。加えて `reindex_in_progress` マーカーを遷移前に set し `update_metas` 完了後に解除するため、遷移と次元meta更新の間に中断された場合も通常の `open` は `E_MODEL_MISMATCH` を返す（§9-5）。`reindex` は進捗コールバック `(done, total)` を受け、MCP は progress notification（`notifications/progress`）、CLI は stderr に `reindexed n/total`（キャリッジリターンで同一行更新、完了時は改行）を出力。
 
 ※ SurrealDB 3.2.3 の制約: `DEFINE INDEX` の再構築は同一トランザクション内の未コミット DELETE を参照できないため、wipe+再定義と HNSW 再構築を分割した。中断・失敗時は必ず `E_MODEL_MISMATCH` で検出され、`reindex` 再実行で復旧する（完全 rollback は遷移トランザクション内のみ）。
 

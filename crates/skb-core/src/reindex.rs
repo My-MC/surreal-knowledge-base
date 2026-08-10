@@ -53,6 +53,13 @@ pub async fn reindex(
         .and_then(|v| v.parse::<usize>().ok());
     let dimension_changed = stored_dim.is_some_and(|d| d != dimension);
 
+    // Reindex-in-progress marker: set before the transition begins so an
+    // interrupted reindex (crash, kill) is detected on the next normal open
+    // even if the stored dimension still matches the schema; removed only
+    // after update_metas completes. `open_inner` inspects this marker when
+    // allow_mismatch is false and returns E_MODEL_MISMATCH.
+    db.set_meta("reindex_in_progress", "1").await?;
+
     // Get all documents
     let find =
         "SELECT meta::id(id) AS did, title, source, source_type, content, sha256 FROM document";
@@ -158,6 +165,9 @@ pub async fn reindex(
         update_metas(db, embedder, tokenizer, config).await?;
     }
 
+    // Reindex completed: clear the in-progress marker (set at entry).
+    db.set_meta("reindex_in_progress", "").await?;
+
     Ok(result)
 }
 
@@ -242,7 +252,7 @@ async fn rebuild_all(
             .begin()
             .await
             .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex begin: {e}")))?;
-        let rebuilt = rebuild_document(&tx, did, &chunks, &embeddings).await;
+        let rebuilt = rebuild_document(&tx, did, content, &chunks, &embeddings).await;
         let entity_names = match rebuilt {
             Ok(names) => {
                 tx.commit()
@@ -321,6 +331,7 @@ async fn update_metas(
 async fn rebuild_document(
     tx: &LocalTransaction,
     did: &str,
+    content: &str,
     chunks: &[crate::tokenize::Chunk],
     embeddings: &[Vec<f32>],
 ) -> Result<Vec<String>, SkbError> {
@@ -374,6 +385,9 @@ async fn rebuild_document(
             crate::graph::index_chunk_entities_in_transaction(tx, cid, &chunk.content).await?;
         entity_names.extend(names);
     }
+    // Rebuild the heading part-of hierarchy too, matching ingest::store_and_index
+    // so section links are reconstructed when extraction rules change.
+    crate::graph::link_section_hierarchy(tx, content).await?;
     Ok(entity_names.into_iter().collect())
 }
 

@@ -15,7 +15,7 @@ pub const MAX_TOP_K: usize = 1000;
 pub struct SearchRequest {
     pub query: String,
     pub mode: Option<SearchMode>,
-    #[schemars(range(min = 1, max = 1000))]
+    #[schemars(range(min = 1, max = MAX_TOP_K))]
     pub top_k: Option<usize>,
     #[schemars(range(min = 0, max = 5))]
     pub graph_expand: Option<usize>,
@@ -147,16 +147,15 @@ async fn vector_search(
 }
 
 async fn keyword_search(db: &Db, query: &str, top_k: usize) -> Result<Vec<SearchHit>, SkbError> {
-    let escaped = query.replace('\'', "''");
-    let sql = format!(
-        "SELECT content, idx, meta::id(document) AS document, \
+    let sql = "SELECT content, idx, meta::id(document) AS document, \
          document.title AS title, document.source AS source, search::score(0) AS score \
-         FROM chunk WHERE content @@ '{escaped}' ORDER BY score DESC LIMIT {top_k}"
-    );
+         FROM chunk WHERE content @@ $q ORDER BY score DESC LIMIT $top";
 
     let mut r = db
         .db
-        .query(&sql)
+        .query(sql)
+        .bind(("q", query.to_string()))
+        .bind(("top", top_k as i64))
         .await
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("keyword: {e}")))?;
     let rows: Vec<serde_json::Value> = r
@@ -203,16 +202,15 @@ async fn hybrid_search(
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("hybrid vec take: {e}")))?;
 
     // Keyword results
-    let escaped = query.replace('\'', "''");
-    let ksql = format!(
-        "SELECT content, idx, meta::id(id) AS chunk_id, \
+    let ksql = "SELECT content, idx, meta::id(id) AS chunk_id, \
          meta::id(document) AS document, \
          document.title AS title, document.source AS source, search::score(0) AS score \
-         FROM chunk WHERE content @@ '{escaped}' ORDER BY score DESC LIMIT {fetch_k}"
-    );
+         FROM chunk WHERE content @@ $q ORDER BY score DESC LIMIT $fetch";
     let mut r = db
         .db
-        .query(&ksql)
+        .query(ksql)
+        .bind(("q", query.to_string()))
+        .bind(("fetch", fetch_k as i64))
         .await
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("hybrid kw: {e}")))?;
     let krows: Vec<serde_json::Value> = r

@@ -277,22 +277,35 @@ pub async fn delete_document(
 ) -> Result<DeleteResult, SkbError> {
     req.validate()?;
     let record_id = document_record_id(&req.id)?;
-    let query = "DELETE FROM chunk WHERE document = $id RETURN BEFORE; DELETE $id;";
-    let r = db
+    // Count the matching chunks before deletion (a single number, not full
+    // records), then delete without RETURN BEFORE.
+    let count_sql = "SELECT count() AS c FROM chunk WHERE document = $id";
+    let mut c = db
         .db
+        .query(count_sql)
+        .bind(("id", record_id.clone()))
+        .await
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete count: {e}")))?;
+    let count_rows: Vec<serde_json::Value> = c
+        .take(0)
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete count take: {e}")))?;
+    let chunks_deleted = count_rows
+        .first()
+        .and_then(|r| r["c"].as_u64())
+        .unwrap_or(0) as usize;
+
+    let query = "DELETE FROM chunk WHERE document = $id; DELETE $id;";
+    db.db
         .query(query)
         .bind(("id", record_id))
         .await
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete: {e}")))?;
-    let deleted: Vec<serde_json::Value> = r
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete: {e}")))?
         .check()
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete check: {e}")))?
-        .take(0)
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete take: {e}")))?;
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete check: {e}")))?;
 
     Ok(DeleteResult {
         document_id: req.id.clone(),
-        chunks_deleted: deleted.len(),
+        chunks_deleted,
     })
 }
 

@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, GetPromptRequestParams,
@@ -422,13 +422,10 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let config = Config::load().map_err(|e| {
-        let err = skb_core::error::SkbError::new(
-            skb_core::error::ErrorCode::Config,
-            format!("failed to load config: {e}"),
-        );
-        rmcp::ErrorData::invalid_params(err.to_string(), None)
-    })?;
+    // Match the CLI: Config::load() returning a default for a missing config
+    // file is fine, but parse errors and invalid SKB_* environment values must
+    // stop startup. Propagate the anyhow error with its file-path context.
+    let config = Config::load().context("failed to load config")?;
     // In a model/tokenizer mismatch state, start anyway so `skb_reindex`
     // can rebuild the database (spec §9-5).
     let kb = match KnowledgeBase::open(config.clone()).await {

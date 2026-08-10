@@ -338,13 +338,14 @@ async fn run(cli: &Cli) -> Result<u8> {
                     let result = kb.upload(build(None, None, Some(content))).await?;
                     output(&result, &fmt)?;
                 } else {
-                    let mut content = String::new();
-                    std::io::stdin()
-                        .take(read_cap)
-                        .read_to_string(&mut content)?;
-                    if content.len() as u64 > max {
+                    // Read stdin as bytes, size-check the byte length, then
+                    // decode UTF-8 — same order as the base64 path.
+                    let mut raw = Vec::new();
+                    std::io::stdin().take(read_cap).read_to_end(&mut raw)?;
+                    if raw.len() as u64 > max {
                         anyhow::bail!("stdin exceeds upload.max_file_mb");
                     }
+                    let content = String::from_utf8(raw)?;
                     let result = kb.upload(build(None, Some(content), None)).await?;
                     output(&result, &fmt)?;
                 }

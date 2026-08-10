@@ -500,16 +500,15 @@ pub async fn expand_search_hits(
     for hit in hits.iter().take(3) {
         let origin_score = hit.score.max(0.0);
 
-        // Hop 1: entities mentioned by this chunk.
-        let sql = format!(
-            "SELECT ->mentions->entity.name AS e \
-             FROM chunk WHERE idx = {} AND meta::id(document) = '{}'",
-            hit.chunk_idx,
-            hit.document_id.replace('\'', "\\'")
-        );
+        // Hop 1: entities mentioned by this chunk (bound parameters; no
+        // manual string escaping).
+        let sql = "SELECT ->mentions->entity.name AS e \
+                   FROM chunk WHERE idx = $idx AND meta::id(document) = $document";
         let mut r = db
             .db
-            .query(&sql)
+            .query(sql)
+            .bind(("idx", hit.chunk_idx as i64))
+            .bind(("document", hit.document_id.clone()))
             .await
             .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand: {e}")))?;
         let rows: Vec<serde_json::Value> = r
@@ -571,39 +570,47 @@ pub async fn expand_search_hits(
         let frontier: Vec<(String, f64)> = best.into_iter().collect();
 
         // Chunks mentioning any frontier entity; scores are the origin hit's
-        // score decayed by hop distance (spec §6 re-rank).
-        for (entity, decay) in frontier {
-            let esql = "SELECT content, idx, meta::id(document) AS document, \
-                        document.title AS title, document.source AS source \
-                        FROM chunk WHERE $name IN ->mentions->entity.name \
-                        LIMIT 50";
-            let mut r = db
-                .db
-                .query(esql)
-                .bind(("name", entity.clone()))
-                .await
-                .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand2: {e}")))?;
-            let erows: Vec<serde_json::Value> = r
-                .take(0)
-                .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand2 take: {e}")))?;
+        // score decayed by hop distance (spec §6 re-rank). All frontier
+        // entities are resolved in one batched query to avoid N+1 round trips.
+        let names: Vec<String> = frontier.iter().map(|(e, _)| e.clone()).collect();
+        let decay_map: std::collections::HashMap<String, f64> = frontier.into_iter().collect();
+        let esql = "SELECT content, idx, meta::id(document) AS document, \
+                    document.title AS title, document.source AS source, \
+                    ->mentions->entity.name AS e \
+                    FROM chunk WHERE ->mentions->entity.name IN $names \
+                    LIMIT 200";
+        let mut r = db
+            .db
+            .query(esql)
+            .bind(("names", names))
+            .await
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand2: {e}")))?;
+        let erows: Vec<serde_json::Value> = r
+            .take(0)
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand2 take: {e}")))?;
 
-            for erow in erows.iter() {
-                let document_id = erow["document"].as_str().unwrap_or("").to_string();
-                let chunk_idx = erow["idx"].as_u64().unwrap_or(0) as usize;
-                if !seen_chunks.insert((document_id.clone(), chunk_idx)) {
-                    continue;
-                }
-                expanded.push(SearchHit {
-                    document_id,
-                    chunk_idx,
-                    content: erow["content"].as_str().unwrap_or("").to_string(),
-                    score: origin_score * decay,
-                    title: erow["title"].as_str().map(|s| s.to_string()),
-                    source: erow["source"].as_str().map(|s| s.to_string()),
-                    highlights: None,
-                    matched_entities: Some(vec![entity.clone()]),
-                });
+        for erow in erows.iter() {
+            let document_id = erow["document"].as_str().unwrap_or("").to_string();
+            let chunk_idx = erow["idx"].as_u64().unwrap_or(0) as usize;
+            if !seen_chunks.insert((document_id.clone(), chunk_idx)) {
+                continue;
             }
+            let matched = to_string_vec(&erow["e"]);
+            let (decay, entity) = matched
+                .iter()
+                .filter_map(|e| decay_map.get(e).map(|d| (d, e.clone())))
+                .max_by(|a, b| a.0.partial_cmp(b.0).unwrap_or(std::cmp::Ordering::Equal))
+                .unwrap_or((&1.0, matched.into_iter().next().unwrap_or_default()));
+            expanded.push(SearchHit {
+                document_id,
+                chunk_idx,
+                content: erow["content"].as_str().unwrap_or("").to_string(),
+                score: origin_score * *decay,
+                title: erow["title"].as_str().map(|s| s.to_string()),
+                source: erow["source"].as_str().map(|s| s.to_string()),
+                highlights: None,
+                matched_entities: Some(vec![entity]),
+            });
         }
     }
 
@@ -815,7 +822,7 @@ pub fn extract_sections(content: &str) -> Vec<Section> {
     for cap in heading_re.captures_iter(content) {
         let level = cap.get(1).map(|m| m.as_str().len()).unwrap_or(1) as u32;
         let name = cap.get(2).map(|m| m.as_str().trim()).unwrap_or("");
-        if name.len() > 2 {
+        if name.chars().count() > 2 {
             sections.push(Section {
                 name: name.to_string(),
                 level,
@@ -841,18 +848,28 @@ pub(crate) async fn link_section_hierarchy(
             stack.pop();
         }
         if let Some((parent, _)) = stack.last() {
-            let sql = "INSERT INTO entity (id, name, kind, description) \
-                       VALUES ($id, $name, $kind, $description) \
-                       ON DUPLICATE KEY UPDATE description = $description";
-            tx.query(sql)
-                .bind(("id", entity_record_id(parent)?))
-                .bind(("name", parent.clone()))
-                .bind(("kind", "section"))
-                .bind(("description", ""))
-                .await
-                .map_err(|e| SkbError::new(ErrorCode::Db, format!("section upsert: {e}")))?
-                .check()
-                .map_err(|e| SkbError::new(ErrorCode::Db, format!("section upsert check: {e}")))?;
+            let upsert_sql = "INSERT INTO entity (id, name, kind, description) \
+                              VALUES ($id, $name, $kind, $description) \
+                              ON DUPLICATE KEY UPDATE description = $description";
+            // Both endpoints of the part-of edge are sections; upsert the
+            // parent (ancestor) and the child (current section) so the child
+            // exists as an entity even when it is a leaf with no descendants.
+            for (name, id) in [
+                (parent.clone(), entity_record_id(parent)?),
+                (section.name.clone(), entity_record_id(&section.name)?),
+            ] {
+                tx.query(upsert_sql)
+                    .bind(("id", id))
+                    .bind(("name", name))
+                    .bind(("kind", "section"))
+                    .bind(("description", ""))
+                    .await
+                    .map_err(|e| SkbError::new(ErrorCode::Db, format!("section upsert: {e}")))?
+                    .check()
+                    .map_err(|e| {
+                        SkbError::new(ErrorCode::Db, format!("section upsert check: {e}"))
+                    })?;
+            }
             // Idempotent edge: `RELATE` always creates a new edge, so remove
             // an existing part-of edge between the same pair first. Section
             // entities are global (shared across documents), so the dedup is

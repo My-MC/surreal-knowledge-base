@@ -99,6 +99,16 @@ impl KnowledgeBase {
         // database has no meta table yet and takes the initialization path.
         let is_new = db.is_new_database().await?;
         if !is_new && !allow_mismatch {
+            // A reindex interrupted between the transition and update_metas
+            // leaves the in-progress marker; refuse normal opens so the store
+            // is never used half-rebuilt (spec §9-5).
+            let in_progress = db.get_meta("reindex_in_progress").await?;
+            if in_progress.as_deref().is_some_and(|v| !v.is_empty()) {
+                return Err(SkbError::new(
+                    ErrorCode::ModelMismatch,
+                    "a reindex is in progress or was interrupted; run `skb reindex` to complete it",
+                ));
+            }
             if let Some(ref stored) = db.get_meta("embedding_model").await? {
                 if stored != &config.embedding.model {
                     return Err(SkbError::new(
@@ -1076,6 +1086,21 @@ mod tests {
         assert!(matches!(err.code, ErrorCode::Validation));
 
         let _ = std::fs::remove_dir_all(&config.storage.path);
+    }
+
+    #[test]
+    fn tokenizer_crate_version_matches_manifest() {
+        // Build-time guard: TOKENIZER_CRATE_VERSION must stay in sync with the
+        // Cargo.toml dependency so a tokenizers bump (any version update can
+        // change the fingerprint and trigger E_MODEL_MISMATCH) is noticed
+        // here, not as a mysterious fingerprint mismatch later.
+        let manifest = include_str!("../Cargo.toml");
+        let expected = format!("tokenizers = {{ version = \"{TOKENIZER_CRATE_VERSION}\"");
+        assert!(
+            manifest.contains(&expected)
+                || manifest.contains(&format!("tokenizers = \"{TOKENIZER_CRATE_VERSION}\"")),
+            "TOKENIZER_CRATE_VERSION ({TOKENIZER_CRATE_VERSION}) must match Cargo.toml"
+        );
     }
 
     #[test]
