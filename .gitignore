@@ -11,5 +11,7 @@ target/skb-test-*
 skb.toml
 # Experiments (6GB of build artifacts, excluded from workspace)
 spike/
+# npm deps (js-yaml for smoke-mcp; never committed)
+**/node_modules/
 # npm platform binaries (injected by CI, never committed)
 npm/packages/*/bin/

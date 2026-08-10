@@ -640,21 +640,19 @@ pub async fn expand_search_hits(
             if !seen_chunks.insert((document_id.clone(), chunk_idx)) {
                 continue;
             }
-            let decay = to_string_vec(&erow["e"])
+            // The entity used for decay must be one present in decay_map, so
+            // matched_entities stays consistent with the score applied.
+            let matched = to_string_vec(&erow["e"]);
+            let (decay, entity) = matched
                 .iter()
-                .filter_map(|e| decay_map.get(e))
-                .cloned()
-                .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                .unwrap_or(1.0);
-            let entity = to_string_vec(&erow["e"])
-                .into_iter()
-                .next()
-                .unwrap_or_default();
+                .filter_map(|e| decay_map.get(e).map(|d| (d, e.clone())))
+                .max_by(|a, b| a.0.partial_cmp(b.0).unwrap_or(std::cmp::Ordering::Equal))
+                .unwrap_or((&1.0, matched.into_iter().next().unwrap_or_default()));
             expanded.push(SearchHit {
                 document_id,
                 chunk_idx,
                 content: erow["content"].as_str().unwrap_or("").to_string(),
-                score: origin_score * decay,
+                score: origin_score * *decay,
                 title: erow["title"].as_str().map(|s| s.to_string()),
                 source: erow["source"].as_str().map(|s| s.to_string()),
                 highlights: None,

@@ -162,7 +162,11 @@ impl Tokenize for TokenizersImpl {
 fn heading_starts(text: &str) -> Vec<usize> {
     let mut out = Vec::new();
     let mut line_start = 0usize;
-    let mut in_fence = false;
+    // Fence marker (` ``` ` or `~~~`) that opened the current fenced block;
+    // None outside a fence. CommonMark closes a fence only with the same
+    // marker, so tracking the opener prevents a `~~~` line inside a ```
+    // block (or vice versa) from flipping fence state.
+    let mut fence_marker: Option<&str> = None;
     for (i, b) in text.bytes().enumerate() {
         if b == b'\n' {
             let line = &text[line_start..i];
@@ -170,9 +174,15 @@ fn heading_starts(text: &str) -> Vec<usize> {
             // is aligned via trim_start (CommonMark allows up to 3 spaces
             // before ATX headings).
             let trimmed_start = line.trim_start();
-            if trimmed_start.starts_with("```") || trimmed_start.starts_with("~~~") {
-                in_fence = !in_fence;
-            } else if !in_fence && is_heading_line(trimmed_start) {
+            if let Some(open) = fence_marker {
+                if trimmed_start.starts_with(open) {
+                    fence_marker = None;
+                }
+            } else if trimmed_start.starts_with("```") {
+                fence_marker = Some("```");
+            } else if trimmed_start.starts_with("~~~") {
+                fence_marker = Some("~~~");
+            } else if is_heading_line(trimmed_start) {
                 out.push(line_start);
             }
             line_start = i + 1;
@@ -182,7 +192,7 @@ fn heading_starts(text: &str) -> Vec<usize> {
         let line = &text[line_start..];
         let trimmed_start = line.trim_start();
         if !(trimmed_start.starts_with("```") || trimmed_start.starts_with("~~~"))
-            && !in_fence
+            && fence_marker.is_none()
             && is_heading_line(trimmed_start)
         {
             out.push(line_start);

@@ -17,6 +17,14 @@ if (!bin) {
 const pending = new Map();
 let nextId = 1;
 
+// Registered before any await so an assertion failure anywhere in the flow
+// reaches the top-level failure path (terminate child, wait for exit,
+// exit non-zero) instead of dying with an unhandled rejection.
+process.on("uncaughtException", (err) => {
+  console.error("FAIL: " + (err?.message ?? err));
+  shutdown(1);
+});
+
 const child = spawn(bin, [], { stdio: ["pipe", "pipe", "inherit"] });
 child.on("error", (err) => {
   for (const [id, { reject, timer }] of pending) {
@@ -76,15 +84,22 @@ function notify(method, params) {
   child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method, params }) + "\n");
 }
 
+// assert reports the failure and hands control to the top-level failure path,
+// which terminates the child and waits for its exit (releasing SurrealKV file
+// locks) before ending the parent with status 1. Throwing immediately keeps
+// failed checks from continuing to schedule child shutdown.
 function assert(cond, message) {
   if (!cond) {
-    console.error("FAIL: " + message);
-    // Terminate the child and wait for its exit (releasing SurrealKV file
-    // locks) before ending the parent, like the normal shutdown path.
-    child.once("exit", () => process.exit(1));
-    child.kill();
-    setTimeout(() => process.exit(1), 5000).unref();
+    throw new Error(message);
   }
+}
+
+function shutdown(code) {
+  // Wait for the child to exit so its SurrealKV file handles are released
+  // before the job moves on; fall back to exiting after 5s.
+  child.once("exit", () => process.exit(code));
+  child.kill();
+  setTimeout(() => process.exit(code), 5000).unref();
 }
 
 const INIT = {
@@ -143,8 +158,4 @@ assert(
 );
 
 console.log("SMOKE OK");
-// Wait for the child to exit so its SurrealKV file handles are released
-// before the job moves on; fall back to exiting after 5s.
-child.once("exit", () => process.exit(0));
-child.kill();
-setTimeout(() => process.exit(0), 5000).unref();
+shutdown(0);

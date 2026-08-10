@@ -33,15 +33,14 @@ jobs:
         run: cargo test --workspace -- --test-threads=1
       - name: Cargo audit (dependency advisories, incl. pinned ureq)
         run: |
-          if cargo install cargo-audit --locked; then
-            # rkyv (RUSTSEC-2026-0235) and rsa (RUSTSEC-2023-0071) come from
-            # surrealdb-core (via its rkyv / jsonwebtoken deps). No fixed
-            # 0.7.x / 0.9.x release exists, and the 0.8 / 0.10 majors are
-            # breaking — cannot be upgraded from this crate. Tracked upstream.
-            cargo audit --ignore RUSTSEC-2026-0235 --ignore RUSTSEC-2023-0071
-          else
-            echo "cargo-audit could not be installed; skipping advisory check"
-          fi
+          # Failing to install cargo-audit fails the step (hence the job):
+          # a green gate must never skip the advisory check silently.
+          cargo install cargo-audit --locked
+          # rkyv (RUSTSEC-2026-0235) and rsa (RUSTSEC-2023-0071) come from
+          # surrealdb-core (via its rkyv / jsonwebtoken deps). No fixed
+          # 0.7.x / 0.9.x release exists, and the 0.8 / 0.10 majors are
+          # breaking — cannot be upgraded from this crate. Tracked upstream.
+          cargo audit --ignore RUSTSEC-2026-0235 --ignore RUSTSEC-2023-0071
       - name: Check no native-tls / openssl dependency
         run: |
           cargo tree -i openssl-sys 2>&1 | grep -q "did not match"
@@ -324,8 +323,13 @@ jobs:
           $deps = & $dumpbin.FullName /dependents npm-out\packages\win32-x64\bin\skb-mcp.exe
           $deps | Select-String '\.dll'
           if ($deps | Select-String 'onnxruntime') { Write-Error "onnxruntime.dll must not be imported"; exit 1 }
-          if ($deps | Select-String 'libssl-3-x64.dll') { Write-Error "libssl-3-x64.dll must not be imported"; exit 1 }
-          if ($deps | Select-String 'libcrypto-3-x64.dll') { Write-Error "libcrypto-3-x64.dll must not be imported"; exit 1 }
+          # Reject any OpenSSL-related DLL: versioned libssl/libcrypto names
+          # (libssl-3-x64.dll, libssl-1_1-x64.dll, ...) and the legacy
+          # ssleay32/libeay32 names, prefix-matched so new versions are caught.
+          if ($deps | Select-String 'libssl[-\d]') { Write-Error "OpenSSL DLL must not be imported"; exit 1 }
+          if ($deps | Select-String 'libcrypto[-\d]') { Write-Error "OpenSSL DLL must not be imported"; exit 1 }
+          if ($deps | Select-String 'ssleay32') { Write-Error "OpenSSL DLL must not be imported"; exit 1 }
+          if ($deps | Select-String 'libeay32') { Write-Error "OpenSSL DLL must not be imported"; exit 1 }
           if (-not ($deps | Select-String 'MSVCP140.dll')) { Write-Error "MSVCP140.dll (VC++ runtime) must be imported"; exit 1 }
           if (-not ($deps | Select-String 'VCRUNTIME140.dll')) { Write-Error "VCRUNTIME140.dll (VC++ runtime) must be imported"; exit 1 }
           Write-Output "VC++ runtime present on runner: $(Test-Path "$env:WINDIR\System32\vcruntime140.dll")"

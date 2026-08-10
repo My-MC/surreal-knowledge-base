@@ -91,10 +91,19 @@ impl OrderBy {
 
 /// Upper bound for list_documents / list_chunks limits: results are materialized
 /// in memory, so unbounded limits would let a single request exhaust memory.
+///
+/// Keep in sync with the `schemars(range(..., max = ...))` literal on
+/// `ListQuery::limit` below — schemars only accepts literals, so the two values
+/// are duplicated by necessity; `list_query_schema_marks_no_required_and_limit_min`
+/// fails if they diverge.
 const MAX_LIST_LIMIT: usize = 10_000;
 
 /// Upper bound for list offset: a huge offset makes SurrealDB scan that many
 /// records before returning, so cap it to bound per-request CPU/IO.
+///
+/// Keep in sync with the `schemars(range(..., max = ...))` literal on
+/// `ListQuery::offset` below (same literal-only constraint as MAX_LIST_LIMIT;
+/// `list_query_schema_marks_no_required_and_limit_min` enforces the pairing).
 pub(crate) const MAX_LIST_OFFSET: usize = 1_000_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
