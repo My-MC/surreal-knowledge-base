@@ -497,19 +497,25 @@ pub async fn expand_search_hits(
         .map(|h| (h.document_id.clone(), h.chunk_idx))
         .collect();
 
-    for hit in hits.iter().take(3) {
-        let origin_score = hit.score.max(0.0);
+    // Direct-hit entity metadata is recorded for EVERY hit, while graph
+    // expansion is bounded to the top EXPAND_ORIGIN_LIMIT hits so dense
+    // result sets stay cheap.
+    const EXPAND_ORIGIN_LIMIT: usize = 3;
+    const FRONTIER_MAX: usize = 100;
 
-        // Hop 1: entities mentioned by this chunk.
-        let sql = format!(
-            "SELECT ->mentions->entity.name AS e \
-             FROM chunk WHERE idx = {} AND meta::id(document) = '{}'",
-            hit.chunk_idx,
-            hit.document_id.replace('\'', "\\'")
-        );
+    for (hit_idx, hit) in hits.iter().enumerate() {
+        let origin_score = hit.score.max(0.0);
+        let do_expand = hit_idx < EXPAND_ORIGIN_LIMIT && max_expand > 0;
+
+        // Hop 1: entities mentioned by this chunk (bound parameters; no
+        // manual string escaping).
+        let sql = "SELECT ->mentions->entity.name AS e \
+                   FROM chunk WHERE idx = $idx AND meta::id(document) = $document";
         let mut r = db
             .db
-            .query(&sql)
+            .query(sql)
+            .bind(("idx", hit.chunk_idx as i64))
+            .bind(("document", hit.document_id.clone()))
             .await
             .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand: {e}")))?;
         let rows: Vec<serde_json::Value> = r
@@ -519,7 +525,9 @@ pub async fn expand_search_hits(
         let mut frontier: Vec<(String, f64)> = Vec::new(); // (entity, decay)
         for row in rows.iter() {
             for ename in to_string_vec(&row["e"]) {
-                frontier.push((ename.clone(), 1.0_f64));
+                // Decay below 1.0 so expanded results can never tie direct
+                // hits in the re-rank (spec §6).
+                frontier.push((ename.clone(), 0.95_f64));
                 origin_entities
                     .entry(format!("{}/{}", hit.document_id, hit.chunk_idx))
                     .or_default()
@@ -527,33 +535,52 @@ pub async fn expand_search_hits(
             }
         }
 
-        // Hops 2..: follow related_to edges with distance decay.
+        if !do_expand {
+            continue;
+        }
+
+        // Cap each hop's frontier so a dense graph cannot issue unbounded
+        // related_to queries (request-level bound on query fan-out).
+        if frontier.len() > FRONTIER_MAX {
+            frontier.truncate(FRONTIER_MAX);
+        }
+
+        // Hops 2..: follow related_to edges with distance decay. Each hop is
+        // one batched query (IN $names) instead of one query per entity.
         let mut visited: HashSet<String> = HashSet::new();
         for hop in 2..=max_expand {
             let mut next: Vec<(String, f64)> = Vec::new();
-            for (entity, _) in frontier.iter() {
-                if !visited.insert(entity.clone()) {
-                    continue;
-                }
-                let decay = 1.0 / hop as f64;
-                let esql =
-                    "SELECT ->related_to->entity.name AS n FROM entity WHERE name = $name LIMIT 1";
-                let mut r = db
-                    .db
-                    .query(esql)
-                    .bind(("name", entity.clone()))
-                    .await
-                    .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand hop: {e}")))?;
-                let erows: Vec<serde_json::Value> = r
-                    .take(0)
-                    .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand hop take: {e}")))?;
-                for erow in erows.iter() {
-                    for nname in to_string_vec(&erow["n"]) {
-                        next.push((nname, decay));
-                    }
+            let hop_names: Vec<String> = frontier
+                .iter()
+                .filter(|(e, _)| visited.insert(e.clone()))
+                .map(|(e, _)| e.clone())
+                .collect();
+            if hop_names.is_empty() {
+                continue;
+            }
+            let decay = 1.0 / hop as f64;
+            let esql = "SELECT name, ->related_to->entity.name AS n \
+                        FROM entity WHERE name IN $names";
+            let mut r = db
+                .db
+                .query(esql)
+                .bind(("names", hop_names))
+                .await
+                .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand hop: {e}")))?;
+            let erows: Vec<serde_json::Value> = r
+                .take(0)
+                .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand hop take: {e}")))?;
+            for erow in erows.iter() {
+                for nname in to_string_vec(&erow["n"]) {
+                    next.push((nname, decay));
                 }
             }
+            // Cap the frontier at the end of each hop so a dense graph
+            // cannot grow it unboundedly across hops (request-level bound).
             frontier.extend(next);
+            if frontier.len() > FRONTIER_MAX {
+                frontier.truncate(FRONTIER_MAX);
+            }
         }
 
         // Dedup the frontier by entity name, keeping the best (closest hop =
@@ -569,41 +596,52 @@ pub async fn expand_search_hits(
                 .or_insert(decay);
         }
         let frontier: Vec<(String, f64)> = best.into_iter().collect();
+        // Same request-level fan-out bound: the chunk-query loop below must
+        // not exceed the cap either.
+        let frontier: Vec<(String, f64)> = frontier.into_iter().take(FRONTIER_MAX).collect();
 
         // Chunks mentioning any frontier entity; scores are the origin hit's
-        // score decayed by hop distance (spec §6 re-rank).
-        for (entity, decay) in frontier {
-            let esql = "SELECT content, idx, meta::id(document) AS document, \
-                        document.title AS title, document.source AS source \
-                        FROM chunk WHERE $name IN ->mentions->entity.name \
-                        LIMIT 50";
-            let mut r = db
-                .db
-                .query(esql)
-                .bind(("name", entity.clone()))
-                .await
-                .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand2: {e}")))?;
-            let erows: Vec<serde_json::Value> = r
-                .take(0)
-                .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand2 take: {e}")))?;
+        // score decayed by hop distance (spec §6 re-rank). All frontier
+        // entities are resolved in one batched query to avoid N+1 round trips.
+        let names: Vec<String> = frontier.iter().map(|(e, _)| e.clone()).collect();
+        let decay_map: std::collections::HashMap<String, f64> = frontier.into_iter().collect();
+        let esql = "SELECT content, idx, meta::id(document) AS document, \
+                    document.title AS title, document.source AS source, \
+                    ->mentions->entity.name AS e \
+                    FROM chunk WHERE $names CONTAINSANY ->mentions->entity.name \
+                    LIMIT 200";
+        let mut r = db
+            .db
+            .query(esql)
+            .bind(("names", names))
+            .await
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand2: {e}")))?;
+        let erows: Vec<serde_json::Value> = r
+            .take(0)
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand2 take: {e}")))?;
 
-            for erow in erows.iter() {
-                let document_id = erow["document"].as_str().unwrap_or("").to_string();
-                let chunk_idx = erow["idx"].as_u64().unwrap_or(0) as usize;
-                if !seen_chunks.insert((document_id.clone(), chunk_idx)) {
-                    continue;
-                }
-                expanded.push(SearchHit {
-                    document_id,
-                    chunk_idx,
-                    content: erow["content"].as_str().unwrap_or("").to_string(),
-                    score: origin_score * decay,
-                    title: erow["title"].as_str().map(|s| s.to_string()),
-                    source: erow["source"].as_str().map(|s| s.to_string()),
-                    highlights: None,
-                    matched_entities: Some(vec![entity.clone()]),
-                });
+        for erow in erows.iter() {
+            let document_id = erow["document"].as_str().unwrap_or("").to_string();
+            let chunk_idx = erow["idx"].as_u64().unwrap_or(0) as usize;
+            if !seen_chunks.insert((document_id.clone(), chunk_idx)) {
+                continue;
             }
+            let matched = to_string_vec(&erow["e"]);
+            let (decay, entity) = matched
+                .iter()
+                .filter_map(|e| decay_map.get(e).map(|d| (d, e.clone())))
+                .max_by(|a, b| a.0.partial_cmp(b.0).unwrap_or(std::cmp::Ordering::Equal))
+                .unwrap_or((&1.0, matched.into_iter().next().unwrap_or_default()));
+            expanded.push(SearchHit {
+                document_id,
+                chunk_idx,
+                content: erow["content"].as_str().unwrap_or("").to_string(),
+                score: origin_score * *decay,
+                title: erow["title"].as_str().map(|s| s.to_string()),
+                source: erow["source"].as_str().map(|s| s.to_string()),
+                highlights: None,
+                matched_entities: Some(vec![entity]),
+            });
         }
     }
 

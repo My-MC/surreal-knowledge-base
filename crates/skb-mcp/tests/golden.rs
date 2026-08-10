@@ -67,14 +67,38 @@ impl McpClient {
     }
 
     fn read_response(&mut self, id: u64) -> Value {
+        // Bounded wait: the child may hang (or die) without responding;
+        // kill it and fail the test instead of blocking indefinitely.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         loop {
             let mut line = String::new();
-            self.stdout.read_line(&mut line).unwrap();
+            match self.stdout.read_line(&mut line) {
+                Ok(0) | Err(_) => {
+                    let _ = self.child.kill();
+                    panic!("MCP child stopped responding while waiting for id {id}");
+                }
+                Ok(_) => {}
+            }
             let msg: Value = serde_json::from_str(&line).unwrap();
             if msg["id"] == json!(id) {
                 return msg;
             }
+            if std::time::Instant::now() > deadline {
+                let _ = self.child.kill();
+                panic!("timed out waiting for id {id}");
+            }
         }
+    }
+
+    fn notify(&mut self, method: &str, params: Value) {
+        // A notification omits the id and never waits for a response.
+        let msg = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        });
+        writeln!(self.stdin, "{msg}").unwrap();
+        self.stdin.flush().unwrap();
     }
 
     fn initialize(&mut self) {
@@ -87,7 +111,7 @@ impl McpClient {
             }),
         );
         assert!(resp["result"].is_object(), "initialize failed: {resp}");
-        let _ = self.send("notifications/initialized", json!({}));
+        self.notify("notifications/initialized", json!({}));
     }
 
     /// Call a tool and return the parsed JSON payload of its text content.

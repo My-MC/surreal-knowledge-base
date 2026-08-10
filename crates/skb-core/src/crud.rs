@@ -199,13 +199,21 @@ pub async fn list_documents(db: &Db, q: &ListQuery) -> Result<Vec<DocumentSummar
         .take(0)
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("list take: {e}")))?;
 
-    // Per-document chunk counts in one grouped query (spec §9-6).
+    // Per-document chunk counts restricted to the documents on this page
+    // (the count query reuses the fetched ids instead of grouping every chunk
+    // row in the table).
+    let page_ids: Vec<String> = rows
+        .iter()
+        .filter_map(|row| row["id"].as_str().map(|s| s.to_string()))
+        .collect();
     let mut r = db
         .db
         .query(
             "SELECT string::concat('document:', meta::id(document)) AS document, \
-             count() AS c FROM chunk GROUP BY document",
+             count() AS c FROM chunk WHERE string::concat('document:', meta::id(document)) \
+             IN $ids GROUP BY document",
         )
+        .bind(("ids", page_ids))
         .await
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("list chunks: {e}")))?;
     let count_rows: Vec<serde_json::Value> = r
@@ -337,8 +345,8 @@ pub async fn delete_document(
         .query(query)
         .bind(("id", record_id))
         .await
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete: {e}")))?;
-    r.check()
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete: {e}")))?
+        .check()
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete check: {e}")))?;
 
     Ok(DeleteResult {

@@ -219,8 +219,18 @@ async fn hybrid_search(
         .take(0)
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("hybrid kw take: {e}")))?;
 
-    // RRF merge
-    type RankedHit = (f64, String, usize, String, Option<String>, Option<String>);
+    // RRF merge. The last tuple element marks keyword-matched hits so only
+    // chunks actually matched by the keyword leg receive highlights; pure
+    // vector hits stay None.
+    type RankedHit = (
+        f64,
+        String,
+        usize,
+        String,
+        Option<String>,
+        Option<String>,
+        bool,
+    );
     let rrf_k = rrf_k.max(1) as f64;
     let mut scores: HashMap<String, RankedHit> = HashMap::new();
 
@@ -235,7 +245,7 @@ async fn hybrid_search(
         scores
             .entry(id)
             .and_modify(|e| e.0 += rrf)
-            .or_insert((rrf, content, idx, doc, title, source));
+            .or_insert((rrf, content, idx, doc, title, source, false));
     }
 
     let highlights = match_terms(query);
@@ -249,8 +259,11 @@ async fn hybrid_search(
         let rrf = 1.0 / (rrf_k + (rank as f64 + 1.0));
         scores
             .entry(id)
-            .and_modify(|e| e.0 += rrf)
-            .or_insert((rrf, content, idx, doc, title, source));
+            .and_modify(|e| {
+                e.0 += rrf;
+                e.6 = true;
+            })
+            .or_insert((rrf, content, idx, doc, title, source, true));
     }
 
     let mut sorted: Vec<_> = scores.into_iter().collect();
@@ -263,16 +276,24 @@ async fn hybrid_search(
 
     Ok(sorted
         .into_iter()
-        .map(|(_, (score, content, idx, doc, title, source))| SearchHit {
-            document_id: doc,
-            chunk_idx: idx,
-            content,
-            score,
-            title,
-            source,
-            highlights: Some(highlights.clone()),
-            matched_entities: None,
-        })
+        .map(
+            |(_, (score, content, idx, doc, title, source, keyword_matched))| SearchHit {
+                document_id: doc,
+                chunk_idx: idx,
+                content,
+                score,
+                title,
+                source,
+                // Only keyword-matched chunks get highlights; vector-only hits
+                // keep None (spec §6).
+                highlights: if keyword_matched {
+                    Some(highlights.clone())
+                } else {
+                    None
+                },
+                matched_entities: None,
+            },
+        )
         .collect())
 }
 

@@ -1625,8 +1625,9 @@ mod tests {
         assert!(one_of
             .iter()
             .any(|e| e["required"] == serde_json::json!(["content_base64"])));
-        // Each oneOf branch must null out the alternative input sources so the
-        // branches are mutually exclusive (spec §12.3, one source only).
+        // Each oneOf branch must null out ALL the alternative input sources so
+        // the branches are mutually exclusive across path/url/content/
+        // content_base64 (spec §12.3, one source only).
         for e in one_of.iter() {
             let required = e["required"].as_array().unwrap();
             let required_name = required[0].as_str().unwrap();
@@ -1640,19 +1641,10 @@ mod tests {
                         && schema["type"] == serde_json::json!("null")
                 })
                 .collect::<Vec<_>>();
-            // content_base64 branch keeps `content` as string (it stays a
-            // valid field per the UploadRequest contract; runtime validation
-            // still enforces single-source), so it nulls 2 sources; all other
-            // branches null all 3 alternatives.
-            let expected = if required_name == "content_base64" {
-                2
-            } else {
-                3
-            };
             assert_eq!(
                 nulled.len(),
-                expected,
-                "branch {required_name} must null {expected} sources"
+                3,
+                "branch {required_name} must null 3 sources"
             );
             for (name, schema) in nulled {
                 assert_eq!(
