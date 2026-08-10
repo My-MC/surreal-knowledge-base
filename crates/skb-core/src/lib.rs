@@ -1634,17 +1634,32 @@ mod tests {
                 .as_object()
                 .unwrap()
                 .iter()
-                .filter(|(name, _)| {
-                    name.as_str() != required_name && is_upload_source(name.as_str())
+                .filter(|(name, schema)| {
+                    name.as_str() != required_name
+                        && is_upload_source(name.as_str())
+                        && schema["type"] == serde_json::json!("null")
                 })
                 .collect::<Vec<_>>();
+            // content_base64 branch keeps `content` as string (it stays a
+            // valid field per the UploadRequest contract; runtime validation
+            // still enforces single-source), so it nulls 2 sources; all other
+            // branches null all 3 alternatives.
+            let expected = if required_name == "content_base64" {
+                2
+            } else {
+                3
+            };
             assert_eq!(
                 nulled.len(),
-                3,
-                "branch {required_name} must null 3 sources"
+                expected,
+                "branch {required_name} must null {expected} sources"
             );
-            for (_, schema) in nulled {
-                assert_eq!(schema["type"], serde_json::json!("null"));
+            for (name, schema) in nulled {
+                assert_eq!(
+                    schema["type"],
+                    serde_json::json!("null"),
+                    "branch {required_name}: {name}"
+                );
             }
         }
     }

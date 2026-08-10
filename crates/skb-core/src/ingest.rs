@@ -52,7 +52,7 @@ pub const MAX_PROCESS_SECONDS: u64 = 30;
         "properties": {
             "path": {"type": "null"},
             "url": {"type": "null"},
-            "content": {"type": "null"},
+            "content": {"type": "string"},
             "content_base64": {"type": "string"}
         }
     },
