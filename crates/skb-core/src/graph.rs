@@ -175,7 +175,9 @@ pub async fn upsert_entity(db: &Db, entity: &EntityInfo) -> Result<(), SkbError>
             entity.description.clone().unwrap_or_default(),
         ))
         .await
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("upsert entity: {e}")))?;
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("upsert entity: {e}")))?
+        .check()
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("upsert entity check: {e}")))?;
     Ok(())
 }
 
@@ -191,7 +193,9 @@ pub async fn link(db: &Db, link: &LinkInfo) -> Result<(), SkbError> {
         .bind(("relation", link.relation.clone()))
         .bind(("weight", weight))
         .await
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("link: {e}")))?;
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("link: {e}")))?
+        .check()
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("link check: {e}")))?;
     Ok(())
 }
 
