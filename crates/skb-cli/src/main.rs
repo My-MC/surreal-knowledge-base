@@ -160,11 +160,14 @@ fn collect_files(dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>> {
     while let Some(cur) = stack.pop() {
         for entry in std::fs::read_dir(&cur)? {
             let entry = entry?;
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.is_file() {
-                out.push(path);
+            // Check the entry's own type (not path.is_dir(), which follows
+            // symlinks): directory symlinks are not descended into, so a
+            // cyclic link cannot make the walk unbounded.
+            let ft = entry.file_type()?;
+            if ft.is_dir() {
+                stack.push(entry.path());
+            } else if ft.is_file() {
+                out.push(entry.path());
             }
         }
     }

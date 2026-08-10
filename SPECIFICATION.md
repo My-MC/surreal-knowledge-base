@@ -407,7 +407,7 @@ v1 では stdio トランスポートのみを提供する。HTTP トランス�
 | # | ツール名 | 概要 | 主要パラメータ |
 |---|---|---|---|
 | 1 | `skb_upload` | 資料をアップロード | `path?`, `url?`, `content?`, `content_base64?`, `title?`, `tags?`, `metadata?`, `force?` |
-| 2 | `skb_search` | 検索 | `query`, `mode?`（既定は `config.search.default_mode`、省略時 hybrid）, `top_k?`（既定は `config.search.top_k`、範囲1〜1000、超過は `E_VALIDATION`）, `filter?`, `graph_expand?=0`（0〜5、超過は `E_VALIDATION`） |
+| 2 | `skb_search` | 検索 | `query`, `mode?`（既定は `config.search.default_mode`。出荷時設定値は hybrid であり、設定変更時は hybrid へのフォールバックではない）, `top_k?`（既定は `config.search.top_k`、範囲1〜1000、超過は `E_VALIDATION`）, `filter?`, `graph_expand?=0`（0〜5、超過は `E_VALIDATION`） |
 | 3 | `skb_list_documents` | 一覧 | `limit?=50`, `offset?=0`, `order?=created_desc`（`created_desc` / `created_asc` / `title_asc` / `title_desc`） |
 | 4 | `skb_get_document` | 取得 | `id`, `include_chunks?=false` |
 | 5 | `skb_delete_document` | 削除 | `id` |

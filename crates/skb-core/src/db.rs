@@ -99,6 +99,42 @@ impl Db {
             .map_err(|e| SkbError::new(ErrorCode::Db, format!("migrate: {e}")))?
             .check()
             .map_err(|e| SkbError::new(ErrorCode::Db, format!("migrate check: {e}")))?;
+        // chunk_document_idx assumes (document, idx) is unique; a legacy store
+        // with duplicates would silently corrupt index lookups (graph
+        // expansion, deletes), so abort startup instead of building the index
+        // on top of bad data. Runs after the schema so `chunk` exists even on
+        // a fresh store (the index is non-UNIQUE, so the schema itself never
+        // fails on duplicates).
+        let dup_sql = "SELECT document, idx FROM \
+                       (SELECT document, idx, count() AS c FROM chunk \
+                        GROUP BY document, idx) WHERE c > 1 LIMIT 10";
+        let mut dup = self
+            .db
+            .query(dup_sql)
+            .await
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("migrate dup check: {e}")))?;
+        let dup_rows: Vec<serde_json::Value> = dup
+            .take(0)
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("migrate dup take: {e}")))?;
+        if !dup_rows.is_empty() {
+            let sample: Vec<String> = dup_rows
+                .iter()
+                .map(|r| {
+                    format!(
+                        "{} idx={}",
+                        r["document"].as_str().unwrap_or("?"),
+                        r["idx"].as_u64().unwrap_or(0)
+                    )
+                })
+                .collect();
+            return Err(SkbError::new(
+                ErrorCode::Db,
+                format!(
+                    "chunk table has duplicate (document, idx) rows; resolve before opening: {}",
+                    sample.join(", ")
+                ),
+            ));
+        }
         Ok(())
     }
 

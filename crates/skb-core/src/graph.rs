@@ -786,14 +786,24 @@ pub fn extract_entities(content: &str) -> Vec<EntityInfo> {
 /// match the chunking logic in tokenize.rs (which also skips fences).
 fn visible_headings(content: &str) -> Vec<(String, u32)> {
     let mut out = Vec::new();
-    let mut in_fence = false;
+    // Track the opening fence marker (` ``` ` or `~~~`) so a fence closes only
+    // on the same marker, per CommonMark (a `~~~` line inside a ``` block must
+    // not flip state).
+    let mut fence_marker: Option<&str> = None;
     for line in content.lines() {
         let trimmed = line.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            in_fence = !in_fence;
+        if let Some(open) = fence_marker {
+            if trimmed.starts_with(open) {
+                fence_marker = None;
+            }
             continue;
         }
-        if in_fence {
+        if trimmed.starts_with("```") {
+            fence_marker = Some("```");
+            continue;
+        }
+        if trimmed.starts_with("~~~") {
+            fence_marker = Some("~~~");
             continue;
         }
         if let Some(cap) = SECTION_RE.captures(trimmed) {

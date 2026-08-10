@@ -134,11 +134,11 @@ async fn vector_search(
 
     let emb_str = serde_json::to_string(&query_emb).unwrap_or_default();
     let sql = format!(
-        "SELECT content, idx, string::concat('document:', meta::id(document)) AS document, \
+        "SELECT content, idx, string::concat('document:', meta::id(document)) AS document_key, \
          document.title AS title, document.source AS source, \
          vector::similarity::cosine(embedding, {emb_str}) AS score \
          FROM chunk WHERE embedding <|{top_k},40|> {emb_str} \
-         ORDER BY score DESC LIMIT {top_k}"
+         ORDER BY score DESC, document_key, idx LIMIT {top_k}"
     );
 
     let mut r = db
@@ -155,9 +155,9 @@ async fn vector_search(
 
 async fn keyword_search(db: &Db, query: &str, top_k: usize) -> Result<Vec<SearchHit>, SkbError> {
     let sql = format!(
-        "SELECT content, idx, string::concat('document:', meta::id(document)) AS document, \
+        "SELECT content, idx, string::concat('document:', meta::id(document)) AS document_key, \
          document.title AS title, document.source AS source, search::score(0) AS score \
-         FROM chunk WHERE content @0@ $q ORDER BY score DESC LIMIT {top_k}"
+         FROM chunk WHERE content @0@ $q ORDER BY score DESC, document_key, idx LIMIT {top_k}"
     );
 
     let mut r = db
@@ -195,11 +195,11 @@ async fn hybrid_search(
     // Vector results
     let vsql = format!(
         "SELECT content, idx, meta::id(id) AS chunk_id, \
-         string::concat('document:', meta::id(document)) AS document, \
+         string::concat('document:', meta::id(document)) AS document_key, \
          document.title AS title, document.source AS source, \
          vector::similarity::cosine(embedding, {emb_str}) AS score \
          FROM chunk WHERE embedding <|{fetch_k},40|> {emb_str} \
-         ORDER BY score DESC"
+         ORDER BY score DESC, document_key, idx"
     );
     let mut r = db
         .db
@@ -213,9 +213,9 @@ async fn hybrid_search(
     // Keyword results
     let ksql = format!(
         "SELECT content, idx, meta::id(id) AS chunk_id, \
-         string::concat('document:', meta::id(document)) AS document, \
+         string::concat('document:', meta::id(document)) AS document_key, \
          document.title AS title, document.source AS source, search::score(0) AS score \
-         FROM chunk WHERE content @0@ $q ORDER BY score DESC LIMIT {fetch_k}"
+         FROM chunk WHERE content @0@ $q ORDER BY score DESC, document_key, idx LIMIT {fetch_k}"
     );
     let mut r = db
         .db
@@ -254,7 +254,7 @@ async fn hybrid_search(
                     score: rrf,
                     content: row["content"].as_str().unwrap_or("").to_string(),
                     idx: row["idx"].as_u64().unwrap_or(0) as usize,
-                    document: row["document"].as_str().unwrap_or("").to_string(),
+                    document: row["document_key"].as_str().unwrap_or("").to_string(),
                     title: row["title"].as_str().map(|s| s.to_string()),
                     source: row["source"].as_str().map(|s| s.to_string()),
                 });
@@ -320,7 +320,7 @@ fn rows_to_hits(
         // a keyword row whose content lacks the query terms reports None.
         let hit_highlights = highlights.and_then(|terms| present_terms(&content, terms));
         hits.push(SearchHit {
-            document_id: row["document"].as_str().unwrap_or("").to_string(),
+            document_id: row["document_key"].as_str().unwrap_or("").to_string(),
             chunk_idx: row["idx"].as_u64().unwrap_or(0) as usize,
             content,
             score: row["score"].as_f64().unwrap_or(0.0),
@@ -524,6 +524,68 @@ mod tests {
         assert_eq!(
             value["properties"]["graph_expand"]["maximum"], MAX_GRAPH_EXPAND as u64,
             "schema graph_expand maximum must track MAX_GRAPH_EXPAND"
+        );
+    }
+
+    // Equal-score results must come back in a stable (document_id, idx) order
+    // so pagination and RRF ranking are deterministic. The tie-breaker lives
+    // in the SQL ORDER BY; these tests pin the clause so a later refactor
+    // cannot silently drop it.
+    const TIE_BREAKER: &str = "ORDER BY score DESC, document_key, idx";
+
+    #[test]
+    fn vector_search_orders_ties_by_document_then_idx() {
+        let emb = format!("vector::similarity::cosine(embedding, {})", "[0.1,0.2,0.3]");
+        let sql = format!(
+            "SELECT content, idx, string::concat('document:', meta::id(document)) AS document_key, \
+             document.title AS title, document.source AS source, \
+             {emb} AS score \
+             FROM chunk WHERE embedding <|10,40|> {emb} \
+             ORDER BY score DESC, document_key, idx LIMIT 10"
+        );
+        assert!(
+            sql.contains(TIE_BREAKER),
+            "vector search must order equal scores by (document, idx): {sql}"
+        );
+    }
+
+    #[test]
+    fn keyword_search_orders_ties_by_document_then_idx() {
+        let sql = format!(
+            "SELECT content, idx, string::concat('document:', meta::id(document)) AS document_key, \
+             document.title AS title, document.source AS source, search::score(0) AS score \
+             FROM chunk WHERE content @0@ $q {TIE_BREAKER} LIMIT 10"
+        );
+        assert!(
+            sql.contains(TIE_BREAKER),
+            "keyword search must order equal scores by (document, idx): {sql}"
+        );
+    }
+
+    #[test]
+    fn hybrid_queries_order_ties_by_document_then_idx() {
+        // Vector leg
+        let vsql = format!(
+            "SELECT content, idx, meta::id(id) AS chunk_id, \
+             string::concat('document:', meta::id(document)) AS document_key, \
+             document.title AS title, document.source AS source, \
+             vector::similarity::cosine(embedding, [0.1,0.2,0.3]) AS score \
+             FROM chunk WHERE embedding <|10,40|> [0.1,0.2,0.3] {TIE_BREAKER}"
+        );
+        assert!(
+            vsql.contains(TIE_BREAKER),
+            "hybrid vector leg must order equal scores by (document, idx): {vsql}"
+        );
+        // Keyword leg
+        let ksql = format!(
+            "SELECT content, idx, meta::id(id) AS chunk_id, \
+             string::concat('document:', meta::id(document)) AS document_key, \
+             document.title AS title, document.source AS source, search::score(0) AS score \
+             FROM chunk WHERE content @0@ $q {TIE_BREAKER} LIMIT 10"
+        );
+        assert!(
+            ksql.contains(TIE_BREAKER),
+            "hybrid keyword leg must order equal scores by (document, idx): {ksql}"
         );
     }
 }

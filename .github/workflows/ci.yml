@@ -323,13 +323,11 @@ jobs:
           $deps = & $dumpbin.FullName /dependents npm-out\packages\win32-x64\bin\skb-mcp.exe
           $deps | Select-String '\.dll'
           if ($deps | Select-String 'onnxruntime') { Write-Error "onnxruntime.dll must not be imported"; exit 1 }
-          # Reject any OpenSSL-related DLL: versioned libssl/libcrypto names
-          # (libssl-3-x64.dll, libssl-1_1-x64.dll, ...) and the legacy
-          # ssleay32/libeay32 names, prefix-matched so new versions are caught.
-          if ($deps | Select-String 'libssl[-\d]') { Write-Error "OpenSSL DLL must not be imported"; exit 1 }
-          if ($deps | Select-String 'libcrypto[-\d]') { Write-Error "OpenSSL DLL must not be imported"; exit 1 }
-          if ($deps | Select-String 'ssleay32') { Write-Error "OpenSSL DLL must not be imported"; exit 1 }
-          if ($deps | Select-String 'libeay32') { Write-Error "OpenSSL DLL must not be imported"; exit 1 }
+          # Reject any OpenSSL-related DLL: versioned (libssl-3-x64.dll,
+          # libcrypto-3-x64.dll, ...), unversioned (libssl.dll,
+          # libcrypto.dll) and legacy (ssleay32/libeay32) names, prefix-matched
+          # so new variants are caught.
+          if ($deps | Select-String 'libssl|libcrypto|ssleay|libeay') { Write-Error "OpenSSL DLL must not be imported"; exit 1 }
           if (-not ($deps | Select-String 'MSVCP140.dll')) { Write-Error "MSVCP140.dll (VC++ runtime) must be imported"; exit 1 }
           if (-not ($deps | Select-String 'VCRUNTIME140.dll')) { Write-Error "VCRUNTIME140.dll (VC++ runtime) must be imported"; exit 1 }
           Write-Output "VC++ runtime present on runner: $(Test-Path "$env:WINDIR\System32\vcruntime140.dll")"

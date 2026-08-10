@@ -118,9 +118,12 @@ assert(toolNames.includes("skb_upload"), "tools/list must list skb_upload");
 assert(toolNames.includes("skb_search"), "tools/list must list skb_search");
 
 // Unique content per run so an existing store never dedupes the upload to
-// "skipped" (and the search assertion still finds the document).
+// "skipped" (and the search assertion still finds the document). The run
+// token makes the search assertion match only THIS run's upload, not a
+// smoke-doc left by an earlier run in the default database.
+const runToken = `smoketoken${Date.now()}x${process.pid}`;
 const uniqueContent =
-  "Smoke test document about HNSW vector search and BM25. " + Date.now();
+  `Smoke test document about HNSW vector search and BM25. ${runToken}`;
 
 const up = await request("tools/call", {
   name: "skb_upload",
@@ -142,7 +145,7 @@ assert(upJson.title === "smoke-doc", "skb_upload must echo the title");
 
 const search = await request("tools/call", {
   name: "skb_search",
-  arguments: { query: "HNSW", mode: "keyword", top_k: 5 },
+  arguments: { query: runToken, mode: "keyword", top_k: 5 },
 });
 assert(!search.result?.isError, "skb_search must succeed");
 const searchText = search.result?.content?.[0]?.text ?? "";
@@ -153,7 +156,7 @@ try {
   assert(false, `skb_search must return JSON, got: ${searchText}`);
 }
 assert(
-  (searchJson.hits ?? []).some((h) => h.title === "smoke-doc"),
+  (searchJson.hits ?? []).some((h) => h.content?.includes(runToken)),
   "skb_search must find the uploaded document",
 );
 
