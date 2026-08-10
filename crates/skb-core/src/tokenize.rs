@@ -61,6 +61,9 @@ impl Tokenize for TokenizersImpl {
     }
 
     fn config_json(&self) -> Result<serde_json::Value, SkbError> {
+        // Note: determinism of the fingerprint hash is guaranteed by the
+        // caller (`tokenizer_fingerprint` recursively sorts object keys before
+        // serialization); this file alone does not guarantee key order.
         serde_json::to_value(&self.tokenizer).map_err(|e| {
             SkbError::new(
                 ErrorCode::Tokenize,
@@ -167,7 +170,9 @@ fn is_heading_line(line: &str) -> bool {
             break;
         }
     }
-    (1..=6).contains(&hashes) && bytes.get(hashes) == Some(&b' ')
+    // Accept a space or a tab right after the hashes, matching the
+    // `#{1,6}\s+` heading rule used by entity extraction in graph.rs.
+    (1..=6).contains(&hashes) && matches!(bytes.get(hashes), Some(b' ') | Some(b'\t'))
 }
 
 /// The heading that owns a chunk spanning `[start, end)`: the first heading

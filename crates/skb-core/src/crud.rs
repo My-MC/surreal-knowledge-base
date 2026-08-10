@@ -89,7 +89,7 @@ impl OrderBy {
 
 /// Upper bound for list_documents / list_chunks limits: results are materialized
 /// in memory, so unbounded limits would let a single request exhaust memory.
-const MAX_LIST_LIMIT: usize = 10_000;
+pub(crate) const MAX_LIST_LIMIT: usize = 10_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
 pub struct ListQuery {
@@ -98,7 +98,6 @@ pub struct ListQuery {
     pub offset: Option<usize>,
     pub order: Option<OrderBy>,
 }
-
 
 impl ListQuery {
     pub fn validate(&self) -> Result<(), SkbError> {

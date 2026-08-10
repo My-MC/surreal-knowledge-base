@@ -56,8 +56,8 @@
 
 | 領域 | 現在確認できる実装 | 不足する検証/実装 | 次のPhase |
 |---|---|---|---|
-| 設定・モデル | `./skb.toml`/ユーザー設定探索、`SKB_*`環境変数オーバーライド、model名のmeta照合、dimension/max_inputのモデル解決と`E_VALIDATION`、tokenizer fingerprintの生成・meta保存・`E_MODEL_MISMATCH`、再起動検証（9-1完了） | config.jsonからの dimension / max_input_tokens 自動検出は未実装 | — |
-| Upload | 全経路のサイズ上限、SSRF（手動redirect各hop検証・IPブロック）、base64任意バイナリ分類、単一トランザクション+rollback、CLI部分失敗errors[]（9-3完了） | 検証済みIPへの接続固定（DNS rebindingは接続直前の再解決で緩和）、圧縮爆弾/ネスト深度/メモリ上限（PDFはページ数・時間上限のみ） | — |
+| 設定・モデル | `./skb.toml`/ユーザー設定探索、`SKB_*`環境変数オーバーライド、model名のmeta照合、dimension/max_inputのモデル解決と`E_VALIDATION`、tokenizer fingerprintの生成・meta保存・`E_MODEL_MISMATCH`、再起動検証（9-1完了） | config.jsonからの dimension / max_input_tokens 自動検出は未実装（残存リスク: 実装予定なし、設定ファイルでの明示を推奨） | なし |
+| Upload | 全経路のサイズ上限、SSRF（手動redirect各hop検証・IPブロック）、base64任意バイナリ分類、単一トランザクション+rollback、CLI部分失敗errors[]（9-3完了） | 検証済みIPへの接続固定（DNS rebindingは接続直前の再解決で緩和）、圧縮爆弾/ネスト深度/メモリ上限（PDFはページ数・時間上限のみ）（残存リスク: 実装予定なし） | なし |
 | Chunk/Graph/Search | 見出し境界チャンキング+heading永続化、EntityExtractor（WikiLink/frontmatter/見出し階層part-of）、N-hop+再ランク、検索応答title/source/highlights/matched_entities（9-4完了） | なし | — |
 | Reindex | ドキュメント単位のchunk置換transaction | mismatch時の起動、dimension/HNSW/meta、全体rollback、progress | 9-5 |
 | CLI/MCP | stdio MCP、主要CLI/MCP操作、resource-not-found、共通DTO/JSON Schema（9-2完了） | CLI parity、件数、query、JSON、progress、golden test | 9-6 |

@@ -26,19 +26,27 @@ pub(crate) trait MetaStore {
 
 impl MetaStore for Db {
     async fn set_meta(&self, key: &str, val: &str) -> Result<(), SkbError> {
-        Db::set_meta(self, key, val).await
+        self.db
+            .query(SET_META_SQL)
+            .bind(("key", key))
+            .bind(("val", val))
+            .await
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("set_meta: {e}")))?
+            .check()
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("set_meta check: {e}")))?;
+        Ok(())
     }
 }
 
 impl MetaStore for surrealdb::method::Transaction<surrealdb::engine::local::Db> {
     async fn set_meta(&self, key: &str, val: &str) -> Result<(), SkbError> {
         self.query(SET_META_SQL)
-        .bind(("key", key))
-        .bind(("val", val))
-        .await
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("set_meta: {e}")))?
-        .check()
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("set_meta check: {e}")))?;
+            .bind(("key", key))
+            .bind(("val", val))
+            .await
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("set_meta: {e}")))?
+            .check()
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("set_meta check: {e}")))?;
         Ok(())
     }
 }
@@ -96,18 +104,6 @@ impl Db {
         Ok(rows
             .first()
             .and_then(|v| v["meta_value"].as_str().map(|s| s.to_string())))
-    }
-
-    pub async fn set_meta(&self, key: &str, val: &str) -> Result<(), SkbError> {
-        self.db
-            .query(SET_META_SQL)
-            .bind(("key", key))
-            .bind(("val", val))
-            .await
-            .map_err(|e| SkbError::new(ErrorCode::Db, format!("set_meta: {e}")))?
-            .check()
-            .map_err(|e| SkbError::new(ErrorCode::Db, format!("set_meta check: {e}")))?;
-        Ok(())
     }
 }
 

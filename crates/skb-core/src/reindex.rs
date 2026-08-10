@@ -71,11 +71,16 @@ pub async fn reindex(
         }
 
         if dry_run {
-            all_entity_names.extend(
-                crate::graph::extract_entities(content)
-                    .into_iter()
-                    .map(|e| e.name),
-            );
+            // Match the execution path: extract entities per chunk (the same
+            // inputs index_chunk_entities_in_transaction receives), not from
+            // the full document content.
+            for chunk in chunks.iter() {
+                all_entity_names.extend(
+                    crate::graph::extract_entities(&chunk.content)
+                        .into_iter()
+                        .map(|e| e.name),
+                );
+            }
             result.entities_extracted = all_entity_names.len();
             result.documents_processed += 1;
             result.chunks_created += chunks.len();
@@ -223,8 +228,8 @@ async fn rebuild_document(
 
     let mut entity_names = std::collections::HashSet::new();
     for (cid, chunk) in chunk_ids.iter().zip(chunks.iter()) {
-        let names = crate::graph::index_chunk_entities_in_transaction(tx, cid, &chunk.content)
-            .await?;
+        let names =
+            crate::graph::index_chunk_entities_in_transaction(tx, cid, &chunk.content).await?;
         entity_names.extend(names);
     }
     Ok(entity_names.into_iter().collect())

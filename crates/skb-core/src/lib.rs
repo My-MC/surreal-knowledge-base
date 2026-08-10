@@ -14,7 +14,7 @@ use crate::crud::{
     DeleteDocumentRequest, DeleteResult, DocumentDetail, DocumentSummary, GetDocumentRequest,
     ListQuery, Stats as CrudStats,
 };
-use crate::db::Db;
+use crate::db::{Db, MetaStore};
 use crate::embed::{Embed, MockEmbedder};
 use crate::error::{ErrorCode, SkbError};
 use crate::graph::{EntityInfo, GraphQueryRequest, GraphQueryResult, LinkInfo};
@@ -148,10 +148,9 @@ impl KnowledgeBase {
         if req.mode.is_none() {
             req.mode = Some(self.config.search.default_mode);
         }
-        if req.top_k.is_none() {
-            req.top_k = Some(self.config.search.top_k);
-        }
-        let top_k = req.top_k.unwrap_or(10);
+        // validate() guarantees top_k >= 1, so a None here only occurs when
+        // the caller omitted it; use the config default directly.
+        let top_k = req.top_k.unwrap_or(self.config.search.top_k);
         let mut resp = search::search(
             &self.db,
             self.embedder.as_ref(),
@@ -318,12 +317,27 @@ pub(crate) fn tokenizer_fingerprint(
         .and_then(|v| v.as_str())
         .unwrap_or("unknown")
         .to_string();
+    // Sort every object key recursively so the hash is independent of JSON
+    // key order (serde_json without `preserve_order` serializes BTreeMap-style
+    // sorted keys, but nested values from the tokenizers crate may arrive in
+    // arbitrary order — Cargo.lock must not enable `preserve_order`).
+    fn sort_keys(value: serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Object(map) => {
+                serde_json::Value::Object(map.into_iter().map(|(k, v)| (k, sort_keys(v))).collect())
+            }
+            serde_json::Value::Array(arr) => {
+                serde_json::Value::Array(arr.into_iter().map(sort_keys).collect())
+            }
+            other => other,
+        }
+    }
     let canonical = serde_json::to_string(&serde_json::json!({
         "schema": TOKENIZER_FINGERPRINT_SCHEMA,
         "tokenizers": TOKENIZER_CRATE_VERSION,
         "source": source,
         "algorithm": algorithm,
-        "config": config,
+        "config": sort_keys(config.clone()),
     }))
     .map_err(|e| {
         SkbError::new(
@@ -760,7 +774,7 @@ mod tests {
         let mut config = Config::default();
         config.embedding.onnx_path = "mock".to_string();
         config.embedding.dimension = 8;
-        config.embedding.max_input_tokens = 4096; // mock detects 8192
+        config.embedding.max_input_tokens = 4096; // mock detects MOCK_EMBEDDER_MAX_INPUT_TOKENS
         config.storage.path = std::path::PathBuf::from(format!("./target/skb-test-max-{n}"));
         let _ = std::fs::remove_dir_all(&config.storage.path);
 
@@ -1254,6 +1268,21 @@ mod tests {
                 assert_eq!(schema["type"], serde_json::json!("null"));
             }
         }
+    }
+
+    #[test]
+    fn tokenizer_crate_version_matches_manifest() {
+        // Build-time guard: TOKENIZER_CRATE_VERSION must stay in sync with the
+        // Cargo.toml dependency so a tokenizers bump (any version update can
+        // change the fingerprint and trigger E_MODEL_MISMATCH) is noticed
+        // here, not as a mysterious fingerprint mismatch later.
+        let manifest = include_str!("../Cargo.toml");
+        let expected = format!("tokenizers = {{ version = \"{TOKENIZER_CRATE_VERSION}\"");
+        assert!(
+            manifest.contains(&expected)
+                || manifest.contains(&format!("tokenizers = \"{TOKENIZER_CRATE_VERSION}\"")),
+            "TOKENIZER_CRATE_VERSION ({TOKENIZER_CRATE_VERSION}) must match Cargo.toml"
+        );
     }
 
     #[test]

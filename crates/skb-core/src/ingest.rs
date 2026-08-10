@@ -818,12 +818,7 @@ fn is_documentation_v6(v6: std::net::Ipv6Addr) -> bool {
 /// 64:ff9b::/96 — NAT64 well-known prefix (maps to IPv4 destinations).
 fn is_nat64_v6(v6: std::net::Ipv6Addr) -> bool {
     let s = v6.segments();
-    s[0] == 0x64
-        && s[1] == 0xff9b
-        && s[2] == 0
-        && s[3] == 0
-        && s[4] == 0
-        && s[5] == 0
+    s[0] == 0x64 && s[1] == 0xff9b && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0
 }
 
 /// 2002::/16 — 6to4 (lower 32 bits embed an IPv4 destination).

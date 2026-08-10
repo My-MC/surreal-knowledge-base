@@ -295,11 +295,11 @@ fn rows_to_hits(
 }
 
 /// The query terms that a keyword search can highlight: whitespace/punctuation
-/// separated words of at least two characters.
+/// separated words of at least two characters (Unicode chars, not bytes).
 fn match_terms(query: &str) -> Vec<String> {
     let mut terms: Vec<String> = query
         .split(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
-        .filter(|t| t.len() >= 2)
+        .filter(|t| t.chars().count() >= 2)
         .map(|t| t.to_lowercase())
         .collect();
     terms.sort();

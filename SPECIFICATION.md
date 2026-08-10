@@ -287,7 +287,8 @@ LLM 抽出は `EntityExtractor` トレイトの差し替え実装として将来
 > serde_json 等のシリアライザを更新し、同じ `tokenizer.json` に対する canonical JSON 出力が
 > 変わった場合、schema version（`TOKENIZER_FINGERPRINT_SCHEMA`）が同一でも fingerprint は
 > 変化し `E_MODEL_MISMATCH` になる。fingerprint には `tokenizers` のバージョン（`tokenizer_version`）
-> も含まれるため、`tokenizers` のメジャー/マイナー更新は通常この不一致を引き起こす。
+> も含まれるため、`tokenizers` の**メジャー/マイナー更新に限らずパッチ更新も含む任意の**
+> バージョン更新は fingerprint を変え得る。
 > 対応手順: (a) 影響のない変更か fingerprint 差の確認、(b) canonicalization 規則や対象フィールドを
 > 変えた場合のみ `TOKENIZER_FINGERPRINT_SCHEMA` を更新、(c) 利用者は `skb reindex` を実行する。
 > `tokenizer_version` / `tokenizer_fingerprint_schema` は `meta` に保存されるため `skb doctor`

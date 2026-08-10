@@ -203,51 +203,35 @@ impl Config {
         if let Some(v) = env_opt("SKB_EMBEDDING_TOKENIZER")? {
             self.embedding.tokenizer = v;
         }
-        if let Some(v) = env_opt("SKB_EMBEDDING_DIMENSION")? {
-            self.embedding.dimension = v
-                .parse()
-                .with_context(|| format!("SKB_EMBEDDING_DIMENSION must be a number, got '{v}'"))?;
+        if let Some(v) = env_parse("SKB_EMBEDDING_DIMENSION")? {
+            self.embedding.dimension = v;
         }
-        if let Some(v) = env_opt("SKB_EMBEDDING_MAX_INPUT_TOKENS")? {
-            self.embedding.max_input_tokens = v.parse().with_context(|| {
-                format!("SKB_EMBEDDING_MAX_INPUT_TOKENS must be a number, got '{v}'")
-            })?;
+        if let Some(v) = env_parse("SKB_EMBEDDING_MAX_INPUT_TOKENS")? {
+            self.embedding.max_input_tokens = v;
         }
         if let Some(v) = env_opt("SKB_EMBEDDING_DEVICE")? {
             self.embedding.device = v;
         }
-        if let Some(v) = env_opt("SKB_EMBEDDING_BATCH_SIZE")? {
-            self.embedding.batch_size = v
-                .parse()
-                .with_context(|| format!("SKB_EMBEDDING_BATCH_SIZE must be a number, got '{v}'"))?;
+        if let Some(v) = env_parse("SKB_EMBEDDING_BATCH_SIZE")? {
+            self.embedding.batch_size = v;
         }
-        if let Some(v) = env_opt("SKB_CHUNKING_MAX_TOKENS")? {
-            self.chunking.max_tokens = v
-                .parse()
-                .with_context(|| format!("SKB_CHUNKING_MAX_TOKENS must be a number, got '{v}'"))?;
+        if let Some(v) = env_parse("SKB_CHUNKING_MAX_TOKENS")? {
+            self.chunking.max_tokens = v;
         }
-        if let Some(v) = env_opt("SKB_CHUNKING_OVERLAP_TOKENS")? {
-            self.chunking.overlap_tokens = v.parse().with_context(|| {
-                format!("SKB_CHUNKING_OVERLAP_TOKENS must be a number, got '{v}'")
-            })?;
+        if let Some(v) = env_parse("SKB_CHUNKING_OVERLAP_TOKENS")? {
+            self.chunking.overlap_tokens = v;
         }
         if let Some(v) = env_opt("SKB_SEARCH_DEFAULT_MODE")? {
             self.search.default_mode = v.parse::<SearchMode>()?;
         }
-        if let Some(v) = env_opt("SKB_SEARCH_TOP_K")? {
-            self.search.top_k = v
-                .parse()
-                .with_context(|| format!("SKB_SEARCH_TOP_K must be a number, got '{v}'"))?;
+        if let Some(v) = env_parse("SKB_SEARCH_TOP_K")? {
+            self.search.top_k = v;
         }
-        if let Some(v) = env_opt("SKB_SEARCH_RRF_K")? {
-            self.search.rrf_k = v
-                .parse()
-                .with_context(|| format!("SKB_SEARCH_RRF_K must be a number, got '{v}'"))?;
+        if let Some(v) = env_parse("SKB_SEARCH_RRF_K")? {
+            self.search.rrf_k = v;
         }
-        if let Some(v) = env_opt("SKB_UPLOAD_MAX_FILE_MB")? {
-            self.upload.max_file_mb = v
-                .parse()
-                .with_context(|| format!("SKB_UPLOAD_MAX_FILE_MB must be a number, got '{v}'"))?;
+        if let Some(v) = env_parse("SKB_UPLOAD_MAX_FILE_MB")? {
+            self.upload.max_file_mb = v;
         }
         if let Some(v) = env_opt("SKB_UPLOAD_ALLOWED_DIRS")? {
             self.upload.allowed_dirs = v
@@ -402,6 +386,28 @@ fn env_opt(key: &str) -> anyhow::Result<Option<String>> {
         Ok(value) => Ok(Some(value)),
         Err(std::env::VarError::NotPresent) => Ok(None),
         Err(std::env::VarError::NotUnicode(_)) => Err(anyhow::anyhow!("{key} must be unicode")),
+    }
+}
+
+/// Parse a numeric `SKB_*` environment value, mapping parse failures to
+/// `E_VALIDATION` (SkbError) so CLI/MCP startup surfaces a typed error
+/// instead of a bare ParseIntError.
+fn env_parse<T>(key: &str) -> Result<Option<T>, SkbError>
+where
+    T: std::str::FromStr,
+{
+    match std::env::var(key) {
+        Ok(v) => v.parse::<T>().map(Some).map_err(|_| {
+            SkbError::new(
+                ErrorCode::Validation,
+                format!("{key} must be a number, got '{v}'"),
+            )
+        }),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(SkbError::new(
+            ErrorCode::Validation,
+            format!("{key} must be unicode"),
+        )),
     }
 }
 
@@ -572,9 +578,19 @@ mod tests {
     fn load_works_without_config_file_when_env_set() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let _model = EnvGuard::set("SKB_EMBEDDING_MODEL", "env-only-model");
-        // No config file exists for this process cwd in CI; load() must fall
-        // back to defaults + env instead of failing.
-        let config = Config::load().unwrap();
+        // Run from an isolated directory under ./target (never /tmp) so an
+        // existing ./skb.toml in the caller's cwd cannot be loaded; load()
+        // must fall back to defaults + env instead of failing. cwd is
+        // preserved/restored even on panic.
+        let original = std::env::current_dir().unwrap();
+        let isolated =
+            std::path::PathBuf::from(format!("./target/skb-config-test-{}", std::process::id()));
+        std::fs::create_dir_all(&isolated).unwrap();
+        std::env::set_current_dir(&isolated).unwrap();
+        let result = Config::load();
+        let _ = std::fs::remove_dir_all(&isolated);
+        std::env::set_current_dir(&original).unwrap();
+        let config = result.unwrap();
         assert_eq!(config.embedding.model, "env-only-model");
     }
 }
