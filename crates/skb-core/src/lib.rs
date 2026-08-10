@@ -100,10 +100,10 @@ impl KnowledgeBase {
         let is_new = db.is_new_database().await?;
         if !is_new && !allow_mismatch {
             // A reindex interrupted between the transition and update_metas
-            // leaves the in-progress marker; refuse normal opens so the store
-            // is never used half-rebuilt (spec §9-5).
+            // leaves the in-progress marker (value "1"); refuse normal opens
+            // so the store is never used half-rebuilt (spec §9-5).
             let in_progress = db.get_meta("reindex_in_progress").await?;
-            if in_progress.as_deref().is_some_and(|v| !v.is_empty()) {
+            if in_progress.as_deref() == Some("1") {
                 return Err(SkbError::new(
                     ErrorCode::ModelMismatch,
                     "a reindex is in progress or was interrupted; run `skb reindex` to complete it",

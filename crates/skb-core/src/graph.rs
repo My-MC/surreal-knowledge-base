@@ -497,8 +497,14 @@ pub async fn expand_search_hits(
         .map(|h| (h.document_id.clone(), h.chunk_idx))
         .collect();
 
-    for hit in hits.iter().take(3) {
+    // Direct-hit entity metadata is recorded for EVERY hit (each chunk's
+    // hop-1 query runs once), while graph expansion is bounded to the top
+    // EXPAND_ORIGIN_LIMIT hits so dense result sets stay cheap.
+    const EXPAND_ORIGIN_LIMIT: usize = 3;
+
+    for (hit_idx, hit) in hits.iter().enumerate() {
         let origin_score = hit.score.max(0.0);
+        let do_expand = hit_idx < EXPAND_ORIGIN_LIMIT && max_expand > 0;
 
         // Hop 1: entities mentioned by this chunk (bound parameters; no
         // manual string escaping).
@@ -518,12 +524,25 @@ pub async fn expand_search_hits(
         let mut frontier: Vec<(String, f64)> = Vec::new(); // (entity, decay)
         for row in rows.iter() {
             for ename in to_string_vec(&row["e"]) {
-                frontier.push((ename.clone(), 1.0_f64));
+                // Decay below 1.0 so expanded results can never tie direct
+                // hits in the re-rank (spec §6).
+                frontier.push((ename.clone(), 0.95_f64));
                 origin_entities
                     .entry(format!("{}/{}", hit.document_id, hit.chunk_idx))
                     .or_default()
                     .push(ename);
             }
+        }
+
+        if !do_expand {
+            continue;
+        }
+
+        // Cap each hop's frontier so a dense graph cannot issue unbounded
+        // related_to queries (request-level bound on query fan-out).
+        const FRONTIER_MAX: usize = 100;
+        if frontier.len() > FRONTIER_MAX {
+            frontier.truncate(FRONTIER_MAX);
         }
 
         // Hops 2..: follow related_to edges with distance decay.
@@ -552,7 +571,12 @@ pub async fn expand_search_hits(
                     }
                 }
             }
+            // Cap the frontier at the end of each hop so a dense graph
+            // cannot grow it unboundedly across hops (request-level bound).
             frontier.extend(next);
+            if frontier.len() > FRONTIER_MAX {
+                frontier.truncate(FRONTIER_MAX);
+            }
         }
 
         // Dedup the frontier by entity name, keeping the best (closest hop =

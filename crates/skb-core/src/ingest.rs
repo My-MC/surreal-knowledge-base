@@ -360,11 +360,14 @@ async fn extract_document_data(
             .to_string();
         let config = config.clone();
         let raw = tokio::task::spawn_blocking(move || -> Result<RawInput, SkbError> {
-            validate_path(&path, &config)?;
-            let meta = std::fs::metadata(&path)
+            // The canonicalized path returned by validate_path is the one
+            // used for metadata and reads, so the validated path is the path
+            // actually opened (no TOCTOU re-resolution window).
+            let canonical = validate_path(&path, &config)?;
+            let meta = std::fs::metadata(&canonical)
                 .map_err(|e| SkbError::new(ErrorCode::Io, format!("stat file: {e}")))?;
             check_size(meta.len(), &config)?;
-            let bytes = read_file_bytes(&path)?;
+            let bytes = read_file_bytes(&canonical)?;
             Ok(RawInput::Bytes(bytes))
         })
         .await
@@ -855,6 +858,11 @@ fn is_teredo_v6(v6: std::net::Ipv6Addr) -> bool {
 
 fn base64_decode_checked(b64: &str, config: &Config) -> Result<Vec<u8>, SkbError> {
     use base64::Engine;
+    // Check the raw input length before allocating the whitespace-stripped
+    // copy, so an oversized payload is rejected without duplicating it.
+    // Whitespace only shrinks the payload, so the decoded-length estimate
+    // from the original length is a safe upper bound.
+    check_size(base64::decoded_len_estimate(b64.len()) as u64, config)?;
     let compact: String = b64.chars().filter(|c| !c.is_whitespace()).collect();
     let estimated = base64::decoded_len_estimate(compact.len());
     check_size(estimated as u64, config)?;
@@ -865,10 +873,14 @@ fn base64_decode_checked(b64: &str, config: &Config) -> Result<Vec<u8>, SkbError
     Ok(bytes)
 }
 
-fn validate_path(path: &std::path::Path, config: &Config) -> Result<(), SkbError> {
+/// Validate that `path` is inside an allowed directory and return the
+/// canonicalized path. Callers must use the returned path for the subsequent
+/// metadata / read operations so the validated path is the one actually read
+/// (no re-resolution window between validation and use).
+fn validate_path(path: &std::path::Path, config: &Config) -> Result<std::path::PathBuf, SkbError> {
     let allowed = &config.upload.allowed_dirs;
     if allowed.is_empty() {
-        return Ok(());
+        return Ok(path.to_path_buf());
     }
     let canonical = path
         .canonicalize()
@@ -878,7 +890,7 @@ fn validate_path(path: &std::path::Path, config: &Config) -> Result<(), SkbError
             .canonicalize()
             .map_err(|e| SkbError::new(ErrorCode::Io, format!("resolve allowed dir: {e}")))?;
         if canonical.starts_with(&can_dir) {
-            return Ok(());
+            return Ok(canonical);
         }
     }
     Err(SkbError::new(

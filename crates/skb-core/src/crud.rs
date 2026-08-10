@@ -277,9 +277,10 @@ pub async fn delete_document(
 ) -> Result<DeleteResult, SkbError> {
     req.validate()?;
     let record_id = document_record_id(&req.id)?;
-    // Count the matching chunks before deletion (a single number, not full
-    // records), then delete without RETURN BEFORE.
-    let count_sql = "SELECT count() AS c FROM chunk WHERE document = $id";
+    // Count the matching chunks before deletion (a single aggregated number,
+    // not full records), then delete without RETURN BEFORE. GROUP ALL yields
+    // one row even with zero matches.
+    let count_sql = "SELECT count() AS c FROM chunk WHERE document = $id GROUP ALL";
     let mut c = db
         .db
         .query(count_sql)

@@ -344,7 +344,7 @@ impl KnowledgeBase {
 - すべての Request/Response 型は `Serialize`/`Deserialize`/`JsonSchema` を derive し、**CLI の JSON 入出力と MCP ツールスキーマの双方をこの型から生成**する。
 - 非同期（`tokio`）。長時間処理（upload）は内部で進捗コールバックを受け取れる設計とし、MCP では progress notification、CLI ではプログレスバーへ写像する。
 
-上記は v1 の目標API契約である。全 Request/Response 型は `Serialize`/`Deserialize`/`JsonSchema` を derive し、MCP ツールスキーマは CLI と同じ `skb-core` DTO から自動生成される（Phase 9-2 完了）。進捗コールバック（Phase 9-5）と CLI/MCP のゴールデン契約テスト（Phase 9-6）は未完了である。
+上記は v1 の目標API契約である。全 Request/Response 型は `Serialize`/`Deserialize`/`JsonSchema` を derive し、MCP ツールスキーマは CLI と同じ `skb-core` DTO から自動生成される（Phase 9-2 完了）。reindex の進捗コールバックは実装済み（Phase 9-5 完了）で、MCP は `notifications/progress`、CLI は stderr の `reindexed n/total` に写像される。**upload の進捗コールバックは未実装**（残作業）であり、upload は現状完了通知のみを返す。CLI/MCP のゴールデン契約テスト（Phase 9-6）は未完了である。
 
 ### 7.2 設定
 

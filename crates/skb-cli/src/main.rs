@@ -326,29 +326,23 @@ async fn run(cli: &Cli) -> Result<u8> {
 
             if *stdin {
                 // Bound stdin reads by upload.max_file_mb (spec §12.3).
+                // Both branches share one read + byte-size validation + UTF-8
+                // conversion; only the build argument differs (base64 vs
+                // content).
                 let max = kb.config().upload.max_file_mb.saturating_mul(1024 * 1024);
                 let read_cap = max.saturating_add(1);
-                if *base64 {
-                    let mut raw = Vec::new();
-                    std::io::stdin().take(read_cap).read_to_end(&mut raw)?;
-                    if raw.len() as u64 > max {
-                        anyhow::bail!("stdin exceeds upload.max_file_mb");
-                    }
-                    let content = String::from_utf8(raw)?;
-                    let result = kb.upload(build(None, None, Some(content))).await?;
-                    output(&result, &fmt)?;
-                } else {
-                    // Read stdin as bytes, size-check the byte length, then
-                    // decode UTF-8 — same order as the base64 path.
-                    let mut raw = Vec::new();
-                    std::io::stdin().take(read_cap).read_to_end(&mut raw)?;
-                    if raw.len() as u64 > max {
-                        anyhow::bail!("stdin exceeds upload.max_file_mb");
-                    }
-                    let content = String::from_utf8(raw)?;
-                    let result = kb.upload(build(None, Some(content), None)).await?;
-                    output(&result, &fmt)?;
+                let mut raw = Vec::new();
+                std::io::stdin().take(read_cap).read_to_end(&mut raw)?;
+                if raw.len() as u64 > max {
+                    anyhow::bail!("stdin exceeds upload.max_file_mb");
                 }
+                let content = String::from_utf8(raw)?;
+                let result = if *base64 {
+                    kb.upload(build(None, None, Some(content))).await?
+                } else {
+                    kb.upload(build(None, Some(content), None)).await?
+                };
+                output(&result, &fmt)?;
             } else if paths.len() > 1 {
                 // Multi-input uploads: successful uploads are committed and
                 // returned in `results`, failures are aggregated in `errors`
@@ -383,9 +377,14 @@ async fn run(cli: &Cli) -> Result<u8> {
                     let _ = std::io::stdout().flush();
                     return Ok(1);
                 }
-            } else {
-                let result = kb.upload(build(path.clone(), None, None)).await?;
+            } else if let Some(p) = paths.first() {
+                // Single collected input: use the discovered file (recursive
+                // expansions with exactly one file included), never the
+                // original directory path.
+                let result = kb.upload(build(Some(p.clone()), None, None)).await?;
                 output(&result, &fmt)?;
+            } else {
+                anyhow::bail!("no files to upload");
             }
         }
         Commands::Search {
@@ -474,14 +473,14 @@ async fn run(cli: &Cli) -> Result<u8> {
         }
         Commands::Reindex { dry_run } => {
             // A model/dimension/tokenizer mismatch blocks normal open; reindex
-            // is the management path out of that state (spec §9-5).
+            // is the management path out of that state (spec §9-5). The
+            // initial failed open releases the SurrealKV file lock
+            // asynchronously, so reopening the same datastore retries a few
+            // times to settle the lock before falling back.
             let config = cfg()?;
-            let kb = match KnowledgeBase::open(config.clone()).await {
-                Ok(kb) => kb,
-                Err(e) if e.code == skb_core::error::ErrorCode::ModelMismatch => {
-                    KnowledgeBase::open_for_reindex(config).await?
-                }
-                Err(e) => return Err(e.into()),
+            let kb = match open_with_lock_retry(config.clone()).await? {
+                Some(kb) => kb,
+                None => KnowledgeBase::open_for_reindex(config).await?,
             };
             let req = skb_core::reindex::ReindexRequest { dry_run: *dry_run };
             let progress = |done: usize, total: usize| {
@@ -582,6 +581,28 @@ fn parse_scalar_item(raw: &str) -> toml_edit::Item {
 
 fn cfg() -> Result<Config> {
     Config::load()
+}
+
+/// Open the store, returning `Ok(None)` when a model mismatch is detected so
+/// the caller can fall back to `open_for_reindex`. A failed open releases the
+/// embedded SurrealKV file lock asynchronously, so the reopen is retried a
+/// bounded number of times to settle the lock before the mismatch fallback.
+async fn open_with_lock_retry(config: Config) -> Result<Option<skb_core::KnowledgeBase>> {
+    const ATTEMPTS: usize = 8;
+    let mut last: Option<anyhow::Error> = None;
+    for _ in 0..ATTEMPTS {
+        match skb_core::KnowledgeBase::open(config.clone()).await {
+            Ok(kb) => return Ok(Some(kb)),
+            Err(e) if e.code == skb_core::error::ErrorCode::ModelMismatch => {
+                return Ok(None);
+            }
+            Err(e) => {
+                last = Some(anyhow::anyhow!("{e:#}"));
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            }
+        }
+    }
+    Err(last.expect("ATTEMPTS is non-zero"))
 }
 
 #[cfg(test)]

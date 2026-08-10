@@ -24,6 +24,21 @@ pub(crate) trait MetaStore {
     ) -> impl std::future::Future<Output = Result<(), SkbError>> + Send;
 }
 
+/// Delete a `meta` row (used to remove transient markers such as
+/// `reindex_in_progress` once the operation completes).
+pub(crate) async fn delete_meta(
+    db: &Surreal<surrealdb::engine::local::Db>,
+    key: &str,
+) -> Result<(), SkbError> {
+    db.query("DELETE FROM meta WHERE key = $key")
+        .bind(("key", key))
+        .await
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete_meta: {e}")))?
+        .check()
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete_meta check: {e}")))?;
+    Ok(())
+}
+
 impl MetaStore for Db {
     async fn set_meta(&self, key: &str, val: &str) -> Result<(), SkbError> {
         Db::set_meta(self, key, val).await

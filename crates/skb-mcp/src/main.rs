@@ -386,23 +386,40 @@ impl SkbServer {
                     .map_err(|e| valid_err(&format!("invalid reindex parameters: {e}")))?;
                 let progress: Option<Box<skb_core::reindex::ProgressFn>> =
                     context.meta.get_progress_token().map(|token| {
-                        let peer = context.peer.clone();
-                        Box::new(move |done: usize, total: usize| {
-                            let peer = peer.clone();
-                            let token = token.clone();
-                            tokio::spawn(async move {
+                        // Bounded channel + one forwarding task: the
+                        // ProgressFn callback is sync (Fn(usize, usize)), so
+                        // try_send pushes into the channel without awaiting;
+                        // a single task drains it and forwards notifications
+                        // sequentially in callback order (no task per update).
+                        // When kb.reindex returns, the callback closure is
+                        // dropped, closing the channel; the forwarder then
+                        // exits after draining.
+                        let (tx, mut rx) = tokio::sync::mpsc::channel::<(usize, usize)>(32);
+                        let peer2 = context.peer.clone();
+                        let token2 = token.clone();
+                        let forwarder = tokio::spawn(async move {
+                            while let Some((done, total)) = rx.recv().await {
                                 let notification = rmcp::model::Notification::new(
-                                    rmcp::model::ProgressNotificationParam::new(token, done as f64)
-                                        .with_total(total as f64),
+                                    rmcp::model::ProgressNotificationParam::new(
+                                        token2.clone(),
+                                        done as f64,
+                                    )
+                                    .with_total(total as f64),
                                 );
-                                let _ = peer
+                                let _ = peer2
                                     .send_notification(
                                         rmcp::model::ServerNotification::ProgressNotification(
                                             notification,
                                         ),
                                     )
                                     .await;
-                            });
+                            }
+                        });
+                        // Detach the forwarder: it exits on its own once the
+                        // channel closes (when the callback closure drops).
+                        std::mem::drop(forwarder);
+                        Box::new(move |done: usize, total: usize| {
+                            let _ = tx.try_send((done, total));
                         }) as Box<skb_core::reindex::ProgressFn>
                     });
                 kb.reindex(&params, progress.as_deref())
@@ -413,6 +430,28 @@ impl SkbServer {
             name => Err(format!("unknown tool: {name}")),
         }
     }
+}
+
+/// Open the store, returning `Ok(None)` when a model mismatch is detected so
+/// the caller can fall back to `open_for_reindex`. A failed open releases the
+/// embedded SurrealKV file lock asynchronously, so the reopen is retried a
+/// bounded number of times to settle the lock before the mismatch fallback.
+async fn open_with_lock_retry(config: Config) -> Result<Option<skb_core::KnowledgeBase>> {
+    const ATTEMPTS: usize = 8;
+    let mut last: Option<anyhow::Error> = None;
+    for _ in 0..ATTEMPTS {
+        match skb_core::KnowledgeBase::open(config.clone()).await {
+            Ok(kb) => return Ok(Some(kb)),
+            Err(e) if e.code == skb_core::error::ErrorCode::ModelMismatch => {
+                return Ok(None);
+            }
+            Err(e) => {
+                last = Some(anyhow::anyhow!("{e:#}"));
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            }
+        }
+    }
+    Err(last.expect("ATTEMPTS is non-zero"))
 }
 
 #[tokio::main]
@@ -427,14 +466,15 @@ async fn main() -> Result<()> {
     // stop startup. Propagate the anyhow error with its file-path context.
     let config = Config::load().context("failed to load config")?;
     // In a model/tokenizer mismatch state, start anyway so `skb_reindex`
-    // can rebuild the database (spec §9-5).
-    let kb = match KnowledgeBase::open(config.clone()).await {
-        Ok(kb) => kb,
-        Err(e) if e.code == skb_core::error::ErrorCode::ModelMismatch => {
+    // can rebuild the database (spec §9-5). A failed open releases the
+    // SurrealKV file lock asynchronously, so the reopen is retried to settle
+    // the lock before the mismatch fallback.
+    let kb = match open_with_lock_retry(config.clone()).await? {
+        Some(kb) => kb,
+        None => {
             tracing::warn!("model mismatch detected; starting for reindex");
             KnowledgeBase::open_for_reindex(config).await?
         }
-        Err(e) => return Err(e.into()),
     };
     let server = SkbServer::new(kb);
 
