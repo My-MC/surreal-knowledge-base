@@ -483,10 +483,13 @@ fn is_pdf_bytes(bytes: &[u8]) -> bool {
 /// accumulate blocking workers and their input buffers.
 const MAX_CONCURRENT_PDF_JOBS: usize = 4;
 
-static PDF_SEMAPHORE: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+static PDF_SEMAPHORE: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+    std::sync::OnceLock::new();
 
-fn pdf_semaphore() -> &'static tokio::sync::Semaphore {
-    PDF_SEMAPHORE.get_or_init(|| tokio::sync::Semaphore::new(MAX_CONCURRENT_PDF_JOBS))
+fn pdf_semaphore() -> std::sync::Arc<tokio::sync::Semaphore> {
+    PDF_SEMAPHORE
+        .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PDF_JOBS)))
+        .clone()
 }
 
 /// Extract PDF text with resource guards: page count, wall-clock time and
@@ -495,8 +498,13 @@ fn pdf_semaphore() -> &'static tokio::sync::Semaphore {
 /// under a wall-clock timeout so a slow document cannot hang the request. A
 /// fixed concurrency cap bounds how many blocking jobs may pile up.
 async fn extract_pdf_checked(bytes: &[u8]) -> Result<String, SkbError> {
-    let _permit = pdf_semaphore()
-        .acquire()
+    // Each permit is acquired (owned) before the job starts and moved into
+    // its spawn_blocking closure so it stays held until the blocking task
+    // finishes — a timed-out caller cannot free the slot while the job still
+    // runs, so actual concurrent PDF jobs never exceed
+    // MAX_CONCURRENT_PDF_JOBS.
+    let parse_permit = pdf_semaphore()
+        .acquire_owned()
         .await
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("pdf semaphore: {e}")))?;
     let start = Instant::now();
@@ -505,7 +513,10 @@ async fn extract_pdf_checked(bytes: &[u8]) -> Result<String, SkbError> {
         Duration::from_secs(MAX_PROCESS_SECONDS),
         tokio::task::spawn_blocking({
             let shared = shared.clone();
-            move || lopdf::Document::load_mem(&shared)
+            move || {
+                let _permit = parse_permit;
+                lopdf::Document::load_mem(&shared)
+            }
         }),
     )
     .await
@@ -522,13 +533,21 @@ async fn extract_pdf_checked(bytes: &[u8]) -> Result<String, SkbError> {
     // The extraction itself is synchronous and cannot be cancelled; the
     // timeout bounds how long the caller waits. Parse and extraction share
     // one MAX_PROCESS_SECONDS budget so a slow parse cannot be followed by a
-    // full second timeout.
+    // full second timeout. The extract permit is owned and moved into the
+    // closure like the parse permit.
     let remaining = Duration::from_secs(MAX_PROCESS_SECONDS).saturating_sub(start.elapsed());
+    let extract_permit = pdf_semaphore()
+        .acquire_owned()
+        .await
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("pdf semaphore: {e}")))?;
     let text = tokio::time::timeout(
         remaining,
         tokio::task::spawn_blocking({
             let shared = shared.clone();
-            move || pdf_extract::extract_text_from_mem(&shared)
+            move || {
+                let _permit = extract_permit;
+                pdf_extract::extract_text_from_mem(&shared)
+            }
         }),
     )
     .await

@@ -503,36 +503,65 @@ pub async fn expand_search_hits(
     const EXPAND_ORIGIN_LIMIT: usize = 3;
     const FRONTIER_MAX: usize = 100;
 
+    // Hop 1 for all hits in ONE batched query, using direct RecordId
+    // comparison (no string-based document matching). document_id in search
+    // results is the raw key; rebuild the `document:<key>` record id for the
+    // chunk's document link. The (document, idx) pair filter is applied in
+    // Rust so an IN x IN cross product cannot match wrong pairs.
+    let wanted: std::collections::HashSet<(String, usize)> = hits
+        .iter()
+        .map(|h| (h.document_id.clone(), h.chunk_idx))
+        .collect();
+    let unique_docs: Vec<RecordId> = hits
+        .iter()
+        .map(|h| format!("document:{}", h.document_id))
+        .filter_map(|s| RecordId::parse_simple(&s).ok())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    let sql = "SELECT meta::id(document) AS document, idx, ->mentions->entity.name AS e \
+               FROM chunk WHERE document IN $docs";
+    let mut r = db
+        .db
+        .query(sql)
+        .bind(("docs", unique_docs))
+        .await
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand: {e}")))?;
+    let rows: Vec<serde_json::Value> = r
+        .take(0)
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand take: {e}")))?;
+
+    // Bucket entities by hit (document, idx); the bucket key matches the
+    // origin_entities key format used by the caller.
+    let mut by_hit: std::collections::HashMap<(String, usize), Vec<String>> =
+        std::collections::HashMap::new();
+    for row in rows.iter() {
+        let doc = row["document"].as_str().unwrap_or("").to_string();
+        let idx = row["idx"].as_u64().unwrap_or(0) as usize;
+        if !wanted.contains(&(doc.clone(), idx)) {
+            continue;
+        }
+        for ename in to_string_vec(&row["e"]) {
+            by_hit.entry((doc.clone(), idx)).or_default().push(ename);
+        }
+    }
+
     for (hit_idx, hit) in hits.iter().enumerate() {
         let origin_score = hit.score.max(0.0);
         let do_expand = hit_idx < EXPAND_ORIGIN_LIMIT && max_expand > 0;
 
-        // Hop 1: entities mentioned by this chunk (bound parameters; no
-        // manual string escaping).
-        let sql = "SELECT ->mentions->entity.name AS e \
-                   FROM chunk WHERE idx = $idx AND meta::id(document) = $document";
-        let mut r = db
-            .db
-            .query(sql)
-            .bind(("idx", hit.chunk_idx as i64))
-            .bind(("document", hit.document_id.clone()))
-            .await
-            .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand: {e}")))?;
-        let rows: Vec<serde_json::Value> = r
-            .take(0)
-            .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand take: {e}")))?;
-
         let mut frontier: Vec<(String, f64)> = Vec::new(); // (entity, decay)
-        for row in rows.iter() {
-            for ename in to_string_vec(&row["e"]) {
-                // Decay below 1.0 so expanded results can never tie direct
-                // hits in the re-rank (spec §6).
-                frontier.push((ename.clone(), 0.95_f64));
-                origin_entities
-                    .entry(format!("{}/{}", hit.document_id, hit.chunk_idx))
-                    .or_default()
-                    .push(ename);
-            }
+        let hit_entities = by_hit
+            .remove(&(hit.document_id.clone(), hit.chunk_idx))
+            .unwrap_or_default();
+        for ename in hit_entities {
+            // Decay below 1.0 so expanded results can never tie direct
+            // hits in the re-rank (spec §6).
+            frontier.push((ename.clone(), 0.95_f64));
+            origin_entities
+                .entry(format!("{}/{}", hit.document_id, hit.chunk_idx))
+                .or_default()
+                .push(ename);
         }
 
         if !do_expand {
@@ -603,6 +632,8 @@ pub async fn expand_search_hits(
         // Chunks mentioning any frontier entity; scores are the origin hit's
         // score decayed by hop distance (spec §6 re-rank). All frontier
         // entities are resolved in one batched query to avoid N+1 round trips.
+        // The predicate runs through the mentions edge on entity (selective:
+        // candidate chunks are filtered before LIMIT, not scanned and cut).
         let names: Vec<String> = frontier.iter().map(|(e, _)| e.clone()).collect();
         let decay_map: std::collections::HashMap<String, f64> = frontier.into_iter().collect();
         let esql = "SELECT content, idx, meta::id(document) AS document, \
@@ -627,11 +658,13 @@ pub async fn expand_search_hits(
                 continue;
             }
             let matched = to_string_vec(&erow["e"]);
+            // Missing-decay fallback stays below 1.0 so an expanded result
+            // can never tie a direct hit in the re-rank (spec §6).
             let (decay, entity) = matched
                 .iter()
                 .filter_map(|e| decay_map.get(e).map(|d| (d, e.clone())))
                 .max_by(|a, b| a.0.partial_cmp(b.0).unwrap_or(std::cmp::Ordering::Equal))
-                .unwrap_or((&1.0, matched.into_iter().next().unwrap_or_default()));
+                .unwrap_or((&0.95, matched.into_iter().next().unwrap_or_default()));
             expanded.push(SearchHit {
                 document_id,
                 chunk_idx,

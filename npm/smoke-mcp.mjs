@@ -14,10 +14,32 @@ if (!bin) {
   process.exit(2);
 }
 
-const child = spawn(bin, [], { stdio: ["pipe", "pipe", "inherit"] });
+// Dedicated store under ./target so the smoke run never touches the default
+// database (SKB_STORAGE_PATH is the env override handled by Config::load).
+const dbPath = `./target/skb-smoke-db-${process.pid}`;
+const child = spawn(bin, [], {
+  stdio: ["pipe", "pipe", "inherit"],
+  env: { ...process.env, SKB_STORAGE_PATH: dbPath },
+});
 const rl = createInterface({ input: child.stdout });
 const pending = new Map();
 let nextId = 1;
+
+// Every failure path must terminate the child before exiting so its
+// SurrealKV file handles are released (the smoke DB is under ./target).
+let shuttingDown = false;
+function fail(message) {
+  console.error("FAIL: " + message);
+  shuttingDown = true;
+  try {
+    child.kill();
+  } catch {}
+  process.exit(1);
+}
+
+child.on("exit", () => {
+  shuttingDown = true;
+});
 
 rl.on("line", (line) => {
   let msg;
@@ -41,6 +63,9 @@ function request(method, params) {
     setTimeout(() => {
       if (pending.has(id)) {
         pending.delete(id);
+        if (!shuttingDown) {
+          child.kill();
+        }
         reject(new Error(`timeout waiting for response to ${method}`));
       }
     }, 30000);
@@ -53,8 +78,7 @@ function notify(method, params) {
 
 function assert(cond, message) {
   if (!cond) {
-    console.error("FAIL: " + message);
-    process.exit(1);
+    fail(message);
   }
 }
 
@@ -100,5 +124,6 @@ const searchText = search.result?.content?.[0]?.text ?? "";
 assert(searchText.includes("smoke-doc"), "skb_search must find the uploaded document");
 
 console.log("SMOKE OK");
+shuttingDown = true;
 child.kill();
 process.exit(0);

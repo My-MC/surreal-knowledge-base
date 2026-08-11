@@ -266,8 +266,9 @@ impl KnowledgeBase {
             .query(surql)
             .await
             .map_err(|e| SkbError::new(ErrorCode::Db, format!("query: {e}")))?;
-        // Each statement's result is exposed as its own JSON value; a missing
-        // index (Value::None) marks the end of the statement list.
+        // Statement-level errors must surface (e.g. a bad query), not be
+        // swallowed as end-of-list. check() consumes the response, so the
+        // statements are collected first.
         let mut statements: Vec<serde_json::Value> = Vec::new();
         let mut idx = 0usize;
         loop {
@@ -279,6 +280,8 @@ impl KnowledgeBase {
             }
             idx += 1;
         }
+        r.check()
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("query check: {e}")))?;
         Ok(serde_json::json!({ "statements": statements }))
     }
 

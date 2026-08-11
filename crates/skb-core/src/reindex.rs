@@ -97,8 +97,17 @@ pub async fn reindex(
             result.chunks_created += chunks.len();
             result.tokens_total += chunks.iter().map(|c| c.token_count).sum::<usize>();
         }
+        // Dry runs are side-effect free: no marker, no metadata writes.
         return Ok(result);
     }
+
+    // Reindex-in-progress marker: set before the transition begins so an
+    // interrupted reindex (crash, kill) is detected on the next normal open;
+    // deleted only after update_metas completes. `open_inner` treats the
+    // value "1" as active. Covers both the dimension-change and the
+    // tokenizer-only path (a failure after rebuild_all, including
+    // update_metas failures, stays detectable).
+    db.set_meta("reindex_in_progress", "1").await?;
 
     if dimension_changed {
         // 1. Atomic transition: wipe old chunks/mentions and redefine the
@@ -156,6 +165,14 @@ pub async fn reindex(
         // Always refresh metadata after a successful rebuild: even a
         // tokenizer-only change must record the new fingerprint (§5.4).
         update_metas(db, embedder, tokenizer, config).await?;
+    }
+
+    // Reindex completed: delete the in-progress marker (set above), then
+    // report completion so CLI/MCP progress reaches 100% even when the last
+    // documents were skipped by the empty did/content/chunks checks.
+    crate::db::delete_meta(&db.db, "reindex_in_progress").await?;
+    if let Some(report) = progress {
+        report(docs.len(), docs.len());
     }
 
     Ok(result)
@@ -223,6 +240,11 @@ async fn rebuild_all(
         let did = doc["did"].as_str().unwrap_or("");
         let content = doc["content"].as_str().unwrap_or("");
         if did.is_empty() || content.is_empty() {
+            // Skipped documents still report progress so the final
+            // notification always reaches total (MCP + CLI).
+            if let Some(report) = progress {
+                report(i + 1, total);
+            }
             continue;
         }
         let chunks = tokenizer.chunk(
@@ -231,6 +253,9 @@ async fn rebuild_all(
             config.chunking.overlap_tokens,
         )?;
         if chunks.is_empty() {
+            if let Some(report) = progress {
+                report(i + 1, total);
+            }
             continue;
         }
         let texts: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();

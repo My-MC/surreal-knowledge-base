@@ -325,6 +325,17 @@ async fn run(cli: &Cli) -> Result<u8> {
                 .transpose()?
                 .unwrap_or_default();
 
+            // Exactly one input source may be given (spec §12.3); a conflict
+            // between --stdin, --url, and paths is rejected before any
+            // expansion or work.
+            let active_sources = [*stdin, url.is_some(), !paths.is_empty()]
+                .into_iter()
+                .filter(|present| *present)
+                .count();
+            if active_sources > 1 {
+                anyhow::bail!("specify exactly one of --stdin, --url, or paths, not several");
+            }
+
             // Expand positional paths: glob patterns, and directories when
             // --recursive (spec §12.2: 複数・glob・--recursive).
             let mut expanded: Vec<String> = Vec::new();
@@ -367,16 +378,6 @@ async fn run(cli: &Cli) -> Result<u8> {
                 anyhow::bail!(
                     "no files to upload: matched entries are directories; use --recursive"
                 );
-            }
-
-            // Exactly one input source may be given (spec §12.3); a conflict
-            // between --stdin, --url, and paths is rejected before any work.
-            let active_sources = [*stdin, url.is_some(), !paths.is_empty()]
-                .into_iter()
-                .filter(|present| *present)
-                .count();
-            if active_sources > 1 {
-                anyhow::bail!("specify exactly one of --stdin, --url, or paths, not several");
             }
 
             let build = |p: Option<String>,

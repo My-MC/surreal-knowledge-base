@@ -29,7 +29,7 @@ fn golden_root() -> PathBuf {
 struct McpClient {
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<std::process::ChildStdout>,
+    rx: std::sync::mpsc::Receiver<Value>,
     next_id: u64,
 }
 
@@ -44,10 +44,32 @@ impl McpClient {
             .expect("failed to spawn skb-mcp (build with: cargo build -p skb-mcp)");
         let stdin = child.stdin.take().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
+        // A dedicated reader thread pushes every stdout line into an mpsc
+        // channel; the main thread consumes with recv_timeout so both a
+        // silent child hang and unrelated-message floods are detected within
+        // the deadline (the child is killed before failing).
+        let (tx, rx) = std::sync::mpsc::channel::<Value>();
+        std::thread::spawn(move || {
+            let mut stdout = stdout;
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match stdout.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        if let Ok(msg) = serde_json::from_str::<Value>(&line) {
+                            if tx.send(msg).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
         McpClient {
             child,
             stdin,
-            stdout,
+            rx,
             next_id: 1,
         }
     }
@@ -67,25 +89,22 @@ impl McpClient {
     }
 
     fn read_response(&mut self, id: u64) -> Value {
-        // Bounded wait: the child may hang (or die) without responding;
-        // kill it and fail the test instead of blocking indefinitely.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        // Bounded wait via recv_timeout: the reader thread keeps pushing
+        // unrelated messages; if the child hangs (or dies) without the
+        // expected response, kill it and fail the test instead of blocking
+        // indefinitely.
+        let deadline = std::time::Duration::from_secs(60);
         loop {
-            let mut line = String::new();
-            match self.stdout.read_line(&mut line) {
-                Ok(0) | Err(_) => {
-                    let _ = self.child.kill();
-                    panic!("MCP child stopped responding while waiting for id {id}");
+            match self.rx.recv_timeout(deadline) {
+                Ok(msg) => {
+                    if msg["id"] == json!(id) {
+                        return msg;
+                    }
                 }
-                Ok(_) => {}
-            }
-            let msg: Value = serde_json::from_str(&line).unwrap();
-            if msg["id"] == json!(id) {
-                return msg;
-            }
-            if std::time::Instant::now() > deadline {
-                let _ = self.child.kill();
-                panic!("timed out waiting for id {id}");
+                Err(_) => {
+                    let _ = self.child.kill();
+                    panic!("timed out waiting for id {id}");
+                }
             }
         }
     }

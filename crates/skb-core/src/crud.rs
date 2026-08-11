@@ -201,17 +201,21 @@ pub async fn list_documents(db: &Db, q: &ListQuery) -> Result<Vec<DocumentSummar
 
     // Per-document chunk counts restricted to the documents on this page
     // (the count query reuses the fetched ids instead of grouping every chunk
-    // row in the table).
-    let page_ids: Vec<String> = rows
+    // row in the table). Direct RecordId comparison: the page ids are
+    // `document:<key>` strings parsed back into record ids.
+    let page_ids: Vec<surrealdb::types::RecordId> = rows
         .iter()
-        .filter_map(|row| row["id"].as_str().map(|s| s.to_string()))
+        .filter_map(|row| {
+            row["id"]
+                .as_str()
+                .and_then(|s| surrealdb::types::RecordId::parse_simple(s).ok())
+        })
         .collect();
     let mut r = db
         .db
         .query(
             "SELECT string::concat('document:', meta::id(document)) AS document, \
-             count() AS c FROM chunk WHERE string::concat('document:', meta::id(document)) \
-             IN $ids GROUP BY document",
+             count() AS c FROM chunk WHERE document IN $ids GROUP BY document",
         )
         .bind(("ids", page_ids))
         .await
@@ -405,6 +409,11 @@ pub struct DoctorReport {
     pub tokenizer_vocab: usize,
     pub model: String,
     pub schema_version: String,
+    /// `tokenizers` crate version recorded in `meta` at open/reindex time
+    /// (spec §5.4 rule 3; visible via `skb doctor`).
+    pub tokenizer_version: String,
+    /// Fingerprint schema version recorded in `meta` (spec §5.4 rule 3).
+    pub tokenizer_fingerprint_schema: String,
     /// Environment/connectivity problems detected (empty when healthy).
     pub errors: Vec<String>,
 }
@@ -426,6 +435,8 @@ pub async fn doctor(
         tokenizer_vocab: tokenizer.vocab_size(),
         model: String::new(),
         schema_version: String::new(),
+        tokenizer_version: String::new(),
+        tokenizer_fingerprint_schema: String::new(),
         errors: Vec::new(),
     };
     // Connectivity first: the point of doctor is to report problems, so a
@@ -444,6 +455,18 @@ pub async fn doctor(
     match db.get_meta("schema_version").await {
         Ok(version) => report.schema_version = version.unwrap_or_default(),
         Err(e) => report.errors.push(format!("read schema_version meta: {e}")),
+    }
+    match db.get_meta("tokenizer_version").await {
+        Ok(v) => report.tokenizer_version = v.unwrap_or_default(),
+        Err(e) => report
+            .errors
+            .push(format!("read tokenizer_version meta: {e}")),
+    }
+    match db.get_meta("tokenizer_fingerprint_schema").await {
+        Ok(v) => report.tokenizer_fingerprint_schema = v.unwrap_or_default(),
+        Err(e) => report
+            .errors
+            .push(format!("read tokenizer_fingerprint_schema meta: {e}")),
     }
     if report.embedding_dimension == 0 {
         report
