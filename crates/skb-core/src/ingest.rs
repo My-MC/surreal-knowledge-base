@@ -534,12 +534,20 @@ async fn extract_pdf_checked(bytes: &[u8]) -> Result<String, SkbError> {
     // timeout bounds how long the caller waits. Parse and extraction share
     // one MAX_PROCESS_SECONDS budget so a slow parse cannot be followed by a
     // full second timeout. The extract permit is owned and moved into the
-    // closure like the parse permit.
+    // closure like the parse permit; the acquisition itself is bounded by
+    // the same remaining budget so waiting for a slot cannot exceed
+    // MAX_PROCESS_SECONDS.
     let remaining = Duration::from_secs(MAX_PROCESS_SECONDS).saturating_sub(start.elapsed());
-    let extract_permit = pdf_semaphore()
-        .acquire_owned()
+    let extract_permit = tokio::time::timeout(remaining, pdf_semaphore().acquire_owned())
         .await
+        .map_err(|_| {
+            SkbError::new(
+                ErrorCode::Validation,
+                "pdf semaphore wait exceeded time limit",
+            )
+        })?
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("pdf semaphore: {e}")))?;
+    let remaining = Duration::from_secs(MAX_PROCESS_SECONDS).saturating_sub(start.elapsed());
     let text = tokio::time::timeout(
         remaining,
         tokio::task::spawn_blocking({

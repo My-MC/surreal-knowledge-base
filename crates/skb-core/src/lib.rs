@@ -31,8 +31,10 @@ pub const TOKENIZER_FINGERPRINT_SCHEMA: &str = "1";
 /// `tokenizers` crate version the fingerprint is bound to. Keep in sync with
 /// `crates/skb-core/Cargo.toml`; bumping `tokenizers` (or the serializer)
 /// changes the canonical JSON output, so a fingerprint mismatch is expected and
-/// users must `skb reindex` (§5.4 rule 3).
-pub const TOKENIZER_CRATE_VERSION: &str = "0.23";
+/// users must `skb reindex` (§5.4 rule 3). This is the EXACT locked version
+/// from Cargo.lock (not the truncated "0.23" requirement), so the fingerprint
+/// records the precise crate revision; bump it together with Cargo.lock.
+pub const TOKENIZER_CRATE_VERSION: &str = "0.23.1";
 
 pub struct KnowledgeBase {
     db: Db,
@@ -99,6 +101,16 @@ impl KnowledgeBase {
         // database has no meta table yet and takes the initialization path.
         let is_new = db.is_new_database().await?;
         if !is_new && !allow_mismatch {
+            // A reindex interrupted between the transition and update_metas
+            // leaves the in-progress marker (value "1"); refuse normal opens
+            // so the store is never used half-rebuilt (spec §9-5).
+            let in_progress = db.get_meta("reindex_in_progress").await?;
+            if in_progress.as_deref() == Some("1") {
+                return Err(SkbError::new(
+                    ErrorCode::ModelMismatch,
+                    "a reindex is in progress or was interrupted; run `skb reindex` to complete it",
+                ));
+            }
             if let Some(ref stored) = db.get_meta("embedding_model").await? {
                 if stored != &config.embedding.model {
                     return Err(SkbError::new(

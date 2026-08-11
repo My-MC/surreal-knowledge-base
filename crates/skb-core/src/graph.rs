@@ -606,8 +606,12 @@ pub async fn expand_search_hits(
             }
             // Cap the frontier at the end of each hop so a dense graph
             // cannot grow it unboundedly across hops (request-level bound).
+            // Sort by decay descending first so truncation keeps the closest
+            // (highest-decay) entities, independent of insertion/HashMap
+            // order.
             frontier.extend(next);
             if frontier.len() > FRONTIER_MAX {
+                frontier.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                 frontier.truncate(FRONTIER_MAX);
             }
         }
@@ -624,10 +628,12 @@ pub async fn expand_search_hits(
                 })
                 .or_insert(decay);
         }
-        let frontier: Vec<(String, f64)> = best.into_iter().collect();
         // Same request-level fan-out bound: the chunk-query loop below must
-        // not exceed the cap either.
-        let frontier: Vec<(String, f64)> = frontier.into_iter().take(FRONTIER_MAX).collect();
+        // not exceed the cap either. Sort by decay descending so truncation
+        // keeps the closest entities regardless of HashMap iteration order.
+        let mut frontier: Vec<(String, f64)> = best.into_iter().collect();
+        frontier.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        frontier.truncate(FRONTIER_MAX);
 
         // Chunks mentioning any frontier entity; scores are the origin hit's
         // score decayed by hop distance (spec §6 re-rank). All frontier
@@ -912,18 +918,28 @@ pub(crate) async fn link_section_hierarchy(
             stack.pop();
         }
         if let Some((parent, _)) = stack.last() {
-            let sql = "INSERT INTO entity (id, name, kind, description) \
-                       VALUES ($id, $name, $kind, $description) \
-                       ON DUPLICATE KEY UPDATE description = $description";
-            tx.query(sql)
-                .bind(("id", entity_record_id(parent)?))
-                .bind(("name", parent.clone()))
-                .bind(("kind", "section"))
-                .bind(("description", ""))
-                .await
-                .map_err(|e| SkbError::new(ErrorCode::Db, format!("section upsert: {e}")))?
-                .check()
-                .map_err(|e| SkbError::new(ErrorCode::Db, format!("section upsert check: {e}")))?;
+            let upsert_sql = "INSERT INTO entity (id, name, kind, description) \
+                              VALUES ($id, $name, $kind, $description) \
+                              ON DUPLICATE KEY UPDATE description = $description";
+            // Both endpoints of the part-of edge are sections; upsert the
+            // parent (ancestor) and the child (current section) so the child
+            // exists as an entity even when it is a leaf with no descendants.
+            for (name, id) in [
+                (parent.clone(), entity_record_id(parent)?),
+                (section.name.clone(), entity_record_id(&section.name)?),
+            ] {
+                tx.query(upsert_sql)
+                    .bind(("id", id))
+                    .bind(("name", name))
+                    .bind(("kind", "section"))
+                    .bind(("description", ""))
+                    .await
+                    .map_err(|e| SkbError::new(ErrorCode::Db, format!("section upsert: {e}")))?
+                    .check()
+                    .map_err(|e| {
+                        SkbError::new(ErrorCode::Db, format!("section upsert check: {e}"))
+                    })?;
+            }
             // Idempotent edge: `RELATE` always creates a new edge, so remove
             // an existing part-of edge between the same pair first. Section
             // entities are global (shared across documents), so the dedup is

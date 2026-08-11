@@ -89,13 +89,19 @@ impl McpClient {
     }
 
     fn read_response(&mut self, id: u64) -> Value {
-        // Bounded wait via recv_timeout: the reader thread keeps pushing
-        // unrelated messages; if the child hangs (or dies) without the
-        // expected response, kill it and fail the test instead of blocking
-        // indefinitely.
-        let deadline = std::time::Duration::from_secs(60);
+        // Bounded wait via recv_timeout: an absolute deadline is fixed once
+        // before the loop; each recv_timeout receives only the REMAINING
+        // duration. The reader thread keeps pushing unrelated messages; if
+        // the overall deadline expires without the expected response, kill
+        // the child and fail the test instead of blocking indefinitely.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         loop {
-            match self.rx.recv_timeout(deadline) {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                let _ = self.child.kill();
+                panic!("timed out waiting for id {id}");
+            }
+            match self.rx.recv_timeout(remaining) {
                 Ok(msg) => {
                     if msg["id"] == json!(id) {
                         return msg;

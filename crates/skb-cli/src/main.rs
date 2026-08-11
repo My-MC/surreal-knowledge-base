@@ -338,9 +338,16 @@ async fn run(cli: &Cli) -> Result<u8> {
 
             // Expand positional paths: glob patterns, and directories when
             // --recursive (spec §12.2: 複数・glob・--recursive).
+            // The output shape depends on the ORIGINAL input form: glob
+            // patterns and multiple positional inputs are multi-input
+            // uploads ({results, errors} envelope), even when a glob matches
+            // exactly one file; only one explicitly provided path keeps the
+            // direct UploadResult shape.
             let mut expanded: Vec<String> = Vec::new();
+            let mut multi_input = paths.len() > 1 || *recursive;
             for pattern in paths {
                 if pattern.contains(['*', '?', '[']) {
+                    multi_input = true;
                     let entries = glob::glob(pattern)
                         .map_err(|e| anyhow::anyhow!("invalid glob '{pattern}': {e}"))?;
                     let mut matched = false;
@@ -418,7 +425,7 @@ async fn run(cli: &Cli) -> Result<u8> {
                     let result = kb.upload(build(None, None, Some(content), None)).await?;
                     output(&result, &fmt)?;
                 }
-            } else if expanded.len() > 1 {
+            } else if expanded.len() > 1 || multi_input {
                 // Multi-input uploads: successful uploads are committed and
                 // returned in `results`, failures are aggregated in `errors`
                 // (spec §12.3). A single input keeps the direct UploadResult

@@ -52,6 +52,11 @@ pub async fn reindex(
         .await?
         .and_then(|v| v.parse::<usize>().ok());
     let dimension_changed = stored_dim.is_some_and(|d| d != dimension);
+    // An active reindex-in-progress marker means a previous run was
+    // interrupted; even when stored_dim matches dimension, the recovery path
+    // (including redefine_index) must run to complete the rebuild.
+    let interrupted = db.get_meta("reindex_in_progress").await?.as_deref() == Some("1");
+    let dimension_changed = dimension_changed || interrupted;
 
     // Get all documents
     let find =

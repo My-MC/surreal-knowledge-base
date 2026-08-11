@@ -372,6 +372,14 @@ fn contract_upload_glob_and_multiple_paths() {
     assert_eq!(val["status"], "created");
     assert!(val["document_id"].is_string());
 
+    // Two explicit positional inputs are a multi-input upload: {results,
+    // errors} with two results and zero errors.
+    let a = docs.join("a.md").to_str().unwrap().to_string();
+    let b = docs.join("b.md").to_str().unwrap().to_string();
+    let val = run_skb(&["upload", &a, &b, "--force"], None);
+    assert_eq!(val["results"].as_array().unwrap().len(), 2);
+    assert_eq!(val["errors"].as_array().unwrap().len(), 0);
+
     let list = run_skb(&["list"], None);
     assert_eq!(list.as_array().unwrap().len(), 3);
 }
