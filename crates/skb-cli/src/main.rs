@@ -584,10 +584,6 @@ fn cfg() -> Result<Config> {
     Config::load()
 }
 
-/// Open the store, returning `Ok(None)` when a model mismatch is detected so
-/// the caller can fall back to `open_for_reindex`. A failed open releases the
-/// embedded SurrealKV file lock asynchronously, so the reopen is retried a
-/// bounded number of times to settle the lock before the mismatch fallback.
 #[cfg(test)]
 mod tests {
     use super::*;

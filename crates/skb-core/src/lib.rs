@@ -65,16 +65,22 @@ impl KnowledgeBase {
     pub async fn open_or_for_reindex(config: Config) -> Result<Self, SkbError> {
         const ATTEMPTS: usize = 8;
         let mut last: Option<SkbError> = None;
-        for _ in 0..ATTEMPTS {
+        for attempt in 0..ATTEMPTS {
             match Self::open(config.clone()).await {
                 Ok(kb) => return Ok(kb),
+                // Only transient datastore errors (e.g. file-lock races from
+                // a previous in-process connection) are retried; validation,
+                // embedding and other errors are definitive.
                 Err(e) if e.code == ErrorCode::ModelMismatch => {
                     return Self::open_for_reindex(config).await;
                 }
-                Err(e) => {
+                Err(e) if e.code == ErrorCode::Db => {
                     last = Some(e);
-                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    if attempt + 1 < ATTEMPTS {
+                        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    }
                 }
+                Err(e) => return Err(e),
             }
         }
         Err(last.expect("ATTEMPTS is non-zero"))
@@ -569,12 +575,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&kb.config().storage.path);
     }
 
-    /// In-process reopening of the same SurrealKv path needs the previous
-    /// connection's router task to finish the datastore shutdown (file lock).
-    async fn settle_db_lock() {
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    }
-
     /// Write a minimal but valid `tokenizer.json` (single-token BPE) for
     /// fingerprint tests; `word` changes the vocabulary so fingerprints differ.
     fn write_fixture_tokenizer(path: &std::path::Path, word: &str) {
@@ -597,8 +597,10 @@ mod tests {
         std::fs::write(path, serde_json::to_string(&tok).unwrap()).unwrap();
     }
 
+    /// Open expecting failure; transient file-lock races from a previous
+    /// in-process connection are absorbed by the bounded retry.
     async fn open_expecting_error(config: Config) -> SkbError {
-        match KnowledgeBase::open(config).await {
+        match open_retrying(config).await {
             Ok(_) => panic!("expected open to fail"),
             Err(e) => e,
         }
@@ -612,6 +614,25 @@ mod tests {
         let mut last = None;
         for _ in 0..ATTEMPTS {
             match KnowledgeBase::open(config.clone()).await {
+                Ok(kb) => return Ok(kb),
+                // A model mismatch is the definitive answer; do not retry it.
+                Err(e) if e.code == ErrorCode::ModelMismatch => return Err(e),
+                Err(e) => {
+                    last = Some(e);
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                }
+            }
+        }
+        Err(last.expect("ATTEMPTS is non-zero"))
+    }
+
+    /// Retry-open the reindex management path, absorbing transient file-lock
+    /// races from a previous in-process connection.
+    async fn open_for_reindex_retrying(config: Config) -> Result<KnowledgeBase, SkbError> {
+        const ATTEMPTS: usize = 8;
+        let mut last = None;
+        for _ in 0..ATTEMPTS {
+            match KnowledgeBase::open_for_reindex(config.clone()).await {
                 Ok(kb) => return Ok(kb),
                 Err(e) => {
                     last = Some(e);
@@ -871,29 +892,24 @@ mod tests {
         .await
         .unwrap();
         drop(kb);
-        settle_db_lock().await;
 
         // Same database, different model: normal open refuses to operate.
         let mut config_b = config_a.clone();
         config_b.embedding.model = "model-b".to_string();
         let err = open_expecting_error(config_b.clone()).await;
         assert!(matches!(err.code, ErrorCode::ModelMismatch));
-        settle_db_lock().await;
 
         // The management path can open and rebuild.
-        let kb = KnowledgeBase::open_for_reindex(config_b.clone())
-            .await
-            .unwrap();
+        let kb = open_for_reindex_retrying(config_b.clone()).await.unwrap();
         let result = kb
             .reindex(&reindex::ReindexRequest::default(), None)
             .await
             .unwrap();
         assert_eq!(result.documents_processed, 1);
         drop(kb);
-        settle_db_lock().await;
 
         // After the rebuild the new model opens normally.
-        KnowledgeBase::open(config_b).await.unwrap();
+        open_retrying(config_b).await.unwrap();
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -943,25 +959,20 @@ mod tests {
         let stored_dim = kb.db().get_meta("embedding_dimension").await.unwrap();
         assert_eq!(stored_dim.as_deref(), Some("16"));
         drop(kb);
-        settle_db_lock().await;
 
         // A normal open with the old 8-dim config now reports a mismatch.
         let err = open_expecting_error(config.clone()).await;
         assert!(matches!(err.code, ErrorCode::ModelMismatch));
-        settle_db_lock().await;
 
         // Rebuild back to 8 via the reindex path, then normal open works again.
-        let kb = KnowledgeBase::open_for_reindex(config.clone())
-            .await
-            .unwrap();
+        let kb = open_for_reindex_retrying(config.clone()).await.unwrap();
         let result = kb
             .reindex(&reindex::ReindexRequest::default(), None)
             .await
             .unwrap();
         assert_eq!(result.documents_processed, 1);
         drop(kb);
-        settle_db_lock().await;
-        KnowledgeBase::open(config).await.unwrap();
+        open_retrying(config).await.unwrap();
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1013,27 +1024,22 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err.code, ErrorCode::Db));
         drop(kb);
-        settle_db_lock().await;
 
         // The interrupted state is detectable: a plain open with the old
         // config must refuse to operate.
         let err = open_expecting_error(config.clone()).await;
         assert!(matches!(err.code, ErrorCode::ModelMismatch));
-        settle_db_lock().await;
 
         // Re-running reindex through the management path completes the
         // rebuild back to dimension 8, then normal open works again.
-        let kb = KnowledgeBase::open_for_reindex(config.clone())
-            .await
-            .unwrap();
+        let kb = open_for_reindex_retrying(config.clone()).await.unwrap();
         let result = kb
             .reindex(&reindex::ReindexRequest::default(), None)
             .await
             .unwrap();
         assert_eq!(result.documents_processed, 1);
         drop(kb);
-        settle_db_lock().await;
-        KnowledgeBase::open(config).await.unwrap();
+        open_retrying(config).await.unwrap();
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1117,12 +1123,16 @@ mod tests {
         // Cargo.toml dependency so a tokenizers bump (any version update can
         // change the fingerprint and trigger E_MODEL_MISMATCH) is noticed
         // here, not as a mysterious fingerprint mismatch later.
+        // Note: this checks the literal declaration; workspace-inherited or
+        // multiline declarations require revising this test (the resolved
+        // version then lives in the workspace root manifest).
         let manifest = include_str!("../Cargo.toml");
         let expected = format!("tokenizers = {{ version = \"{TOKENIZER_CRATE_VERSION}\"");
         assert!(
             manifest.contains(&expected)
                 || manifest.contains(&format!("tokenizers = \"{TOKENIZER_CRATE_VERSION}\"")),
-            "TOKENIZER_CRATE_VERSION ({TOKENIZER_CRATE_VERSION}) must match Cargo.toml"
+            "TOKENIZER_CRATE_VERSION ({TOKENIZER_CRATE_VERSION}) must match Cargo.toml; \
+             revise this test if the declaration moved to the workspace root"
         );
     }
 
@@ -1203,7 +1213,7 @@ mod tests {
             // Absorb the same transient file-lock race as open_retrying.
             let mut opened = None;
             for _ in 0..8 {
-                match KnowledgeBase::open_for_reindex(config_b.clone()).await {
+                match open_for_reindex_retrying(config_b.clone()).await {
                     Ok(kb) => {
                         opened = Some(kb);
                         break;
@@ -1239,7 +1249,7 @@ mod tests {
         let mut config = small_limit_config(1);
         config.storage.path = std::path::PathBuf::from(format!("./target/skb-test-b64-{n}"));
         let _ = std::fs::remove_dir_all(&config.storage.path);
-        let kb = KnowledgeBase::open(config).await.unwrap();
+        let kb = open_retrying(config).await.unwrap();
         let path = kb.config().storage.path.clone();
 
         let big = vec![b'x'; 2 * 1024 * 1024];
@@ -1267,7 +1277,7 @@ mod tests {
         let mut config = small_limit_config(1);
         config.storage.path = std::path::PathBuf::from(format!("./target/skb-test-ct-{n}"));
         let _ = std::fs::remove_dir_all(&config.storage.path);
-        let kb = KnowledgeBase::open(config).await.unwrap();
+        let kb = open_retrying(config).await.unwrap();
         let path = kb.config().storage.path.clone();
 
         let big = "x".repeat(2 * 1024 * 1024);

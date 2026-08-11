@@ -498,10 +498,6 @@ fn pdf_semaphore() -> &'static tokio::sync::Semaphore {
 /// under a wall-clock timeout so a slow document cannot hang the request. A
 /// fixed concurrency cap bounds how many blocking jobs may pile up.
 async fn extract_pdf_checked(bytes: &[u8]) -> Result<String, SkbError> {
-    // The permit is acquired inside each spawn_blocking job so it is held for
-    // the full lifetime of the blocking task — a timed-out caller cannot
-    // release the slot while the job still runs, so actual concurrent PDF
-    // jobs never exceed MAX_CONCURRENT_PDF_JOBS.
     let start = Instant::now();
     let shared = std::sync::Arc::new(bytes.to_vec());
     // The permit is acquired (async) before the job starts and moved into the
@@ -538,12 +534,14 @@ async fn extract_pdf_checked(bytes: &[u8]) -> Result<String, SkbError> {
     // The extraction itself is synchronous and cannot be cancelled; the
     // timeout bounds how long the caller waits. Parse and extraction share
     // one MAX_PROCESS_SECONDS budget so a slow parse cannot be followed by a
-    // full second timeout.
-    let remaining = Duration::from_secs(MAX_PROCESS_SECONDS).saturating_sub(start.elapsed());
+    // full second timeout. The permit is acquired FIRST, then the remaining
+    // budget is recalculated so the wait for the slot does not count as
+    // processing time.
     let extract_permit = pdf_semaphore()
         .acquire()
         .await
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("pdf semaphore: {e}")))?;
+    let remaining = Duration::from_secs(MAX_PROCESS_SECONDS).saturating_sub(start.elapsed());
     let text = tokio::time::timeout(
         remaining,
         tokio::task::spawn_blocking({
@@ -1117,10 +1115,12 @@ mod tests {
     }
 
     /// Serve an HTTP response repeatedly on a loopback listener in a background
-    /// thread, returning the base URL.
-    fn serve_repeatedly(response: &'static str, times: usize) -> String {
+    /// thread, returning the base URL. The response is shared with the thread
+    /// via Arc so it is reclaimed when the test ends.
+    fn serve_repeatedly(response: String, times: usize) -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
+        let response = std::sync::Arc::new(response);
         std::thread::spawn(move || {
             for stream in listener.incoming().take(times) {
                 let mut stream = stream.unwrap();
@@ -1138,7 +1138,7 @@ mod tests {
         // A 302 pointing back at itself never terminates; the manual redirect
         // loop must cap at MAX_REDIRECTS.
         let url = serve_repeatedly(
-            "HTTP/1.1 302 Found\r\nlocation: /self\r\ncontent-length: 0\r\n\r\n",
+            "HTTP/1.1 302 Found\r\nlocation: /self\r\ncontent-length: 0\r\n\r\n".to_string(),
             MAX_REDIRECTS + 1,
         );
         let config = Config::default();
@@ -1161,7 +1161,7 @@ mod tests {
             body.len(),
             body
         );
-        let url = serve_repeatedly(Box::leak(response.into_boxed_str()), 1);
+        let url = serve_repeatedly(response, 1);
         let mut config = Config::default();
         config.upload.max_file_mb = 1;
         assert!(matches!(

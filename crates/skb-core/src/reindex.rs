@@ -169,15 +169,17 @@ pub async fn reindex(
             }
         }
         update_metas(db, embedder, tokenizer, config).await?;
-        // Reindex completed: delete the in-progress marker (set at entry of
-        // the dimension-change branch).
-        crate::db::delete_meta(&db.db, "reindex_in_progress").await?;
     } else {
         result = rebuild_all(db, embedder, tokenizer, config, &docs, progress).await?;
         // Always refresh metadata after a successful rebuild: even a
         // tokenizer-only change must record the new fingerprint (§5.4).
         update_metas(db, embedder, tokenizer, config).await?;
     }
+
+    // Shared success path: delete the in-progress marker (set before the
+    // transition) so it also runs when update_metas succeeds and the next
+    // reindex retry takes the dimension-match else branch.
+    crate::db::delete_meta(&db.db, "reindex_in_progress").await?;
 
     Ok(result)
 }

@@ -125,7 +125,12 @@ async fn vector_search(
         .next()
         .ok_or_else(|| SkbError::new(ErrorCode::Embedding, "no embedding"))?;
 
-    let emb_str = serde_json::to_string(&query_emb).unwrap_or_default();
+    let emb_str = serde_json::to_string(&query_emb).map_err(|e| {
+        SkbError::new(
+            ErrorCode::Embedding,
+            format!("serialize query embedding: {e}"),
+        )
+    })?;
     let sql = format!(
         "SELECT content, idx, meta::id(document) AS document, \
          document.title AS title, document.source AS source, \
@@ -182,7 +187,12 @@ async fn hybrid_search(
         .into_iter()
         .next()
         .ok_or_else(|| SkbError::new(ErrorCode::Embedding, "no embedding"))?;
-    let emb_str = serde_json::to_string(&query_emb).unwrap_or_default();
+    let emb_str = serde_json::to_string(&query_emb).map_err(|e| {
+        SkbError::new(
+            ErrorCode::Embedding,
+            format!("serialize query embedding: {e}"),
+        )
+    })?;
 
     // Vector results
     let vsql = format!(

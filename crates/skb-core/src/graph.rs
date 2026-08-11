@@ -503,9 +503,8 @@ pub async fn expand_search_hits(
     const EXPAND_ORIGIN_LIMIT: usize = 3;
 
     // Hop 1 for all hits: entities mentioned by each (document_id, chunk_idx)
-    // pair. Batched per unique document (a document can have many hit chunks,
-    // but hit sets are small); the idx filter is applied in Rust so an IN x IN
-    // cross product cannot match wrong pairs. document_id matches the search
+    // pair. Batched per unique document with idx also constrained in SQL; the
+    // wanted set remains the final pair check. document_id matches the search
     // result format (meta::id(document) key, no table prefix).
     let unique_docs: std::collections::HashSet<&String> =
         hits.iter().map(|h| &h.document_id).collect();
@@ -513,9 +512,10 @@ pub async fn expand_search_hits(
         .iter()
         .map(|h| (h.document_id.clone(), h.chunk_idx))
         .collect();
+    let all_idxs: Vec<i64> = hits.iter().map(|h| h.chunk_idx as i64).collect();
     let sql = "SELECT meta::id(document) AS document, \
                idx, ->mentions->entity.name AS e \
-               FROM chunk WHERE meta::id(document) IN $documents";
+               FROM chunk WHERE meta::id(document) IN $documents AND idx IN $idxs";
     let mut r = db
         .db
         .query(sql)
@@ -523,6 +523,7 @@ pub async fn expand_search_hits(
             "documents",
             unique_docs.into_iter().cloned().collect::<Vec<_>>(),
         ))
+        .bind(("idxs", all_idxs))
         .await
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand: {e}")))?;
     let rows: Vec<serde_json::Value> = r
@@ -573,30 +574,35 @@ pub async fn expand_search_hits(
             frontier.truncate(FRONTIER_MAX);
         }
 
-        // Hops 2..: follow related_to edges with distance decay.
+        // Hops 2..: follow related_to edges with distance decay. Each hop is
+        // ONE batched query (IN $names) that returns each originating entity
+        // name alongside its related entities; decay is applied in Rust.
         let mut visited: HashSet<String> = HashSet::new();
         for hop in 2..=max_expand {
             let mut next: Vec<(String, f64)> = Vec::new();
-            for (entity, _) in frontier.iter() {
-                if !visited.insert(entity.clone()) {
-                    continue;
-                }
-                let decay = 1.0 / hop as f64;
-                let esql =
-                    "SELECT ->related_to->entity.name AS n FROM entity WHERE name = $name LIMIT 1";
-                let mut r = db
-                    .db
-                    .query(esql)
-                    .bind(("name", entity.clone()))
-                    .await
-                    .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand hop: {e}")))?;
-                let erows: Vec<serde_json::Value> = r
-                    .take(0)
-                    .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand hop take: {e}")))?;
-                for erow in erows.iter() {
-                    for nname in to_string_vec(&erow["n"]) {
-                        next.push((nname, decay));
-                    }
+            let hop_names: Vec<String> = frontier
+                .iter()
+                .filter(|(e, _)| visited.insert(e.clone()))
+                .map(|(e, _)| e.clone())
+                .collect();
+            if hop_names.is_empty() {
+                continue;
+            }
+            let decay = 1.0 / hop as f64;
+            let esql = "SELECT name, ->related_to->entity.name AS n \
+                        FROM entity WHERE name IN $names";
+            let mut r = db
+                .db
+                .query(esql)
+                .bind(("names", hop_names))
+                .await
+                .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand hop: {e}")))?;
+            let erows: Vec<serde_json::Value> = r
+                .take(0)
+                .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand hop take: {e}")))?;
+            for erow in erows.iter() {
+                for nname in to_string_vec(&erow["n"]) {
+                    next.push((nname, decay));
                 }
             }
             // Cap the frontier at the end of each hop so a dense graph
@@ -779,7 +785,7 @@ pub fn extract_entities(content: &str) -> Vec<EntityInfo> {
     let heading_re = regex::Regex::new(r"(?m)^#{1,6}\s+(.+)").unwrap();
     for cap in heading_re.captures_iter(content) {
         let heading = cap.get(1).map(|m| m.as_str()).unwrap_or("");
-        if heading.len() > 2 {
+        if heading_name_visible(heading) {
             entities.push(EntityInfo {
                 name: heading.trim().to_string(),
                 kind: "section".into(),
@@ -867,6 +873,14 @@ pub struct Section {
     pub level: u32,
 }
 
+/// Shared heading-inclusion rule: a heading name must be more than two
+/// Unicode characters (not UTF-8 bytes) to become a section entity / section
+/// hierarchy node. Used by both extract_entities and extract_sections so the
+/// two paths stay consistent across languages.
+fn heading_name_visible(name: &str) -> bool {
+    name.chars().count() > 2
+}
+
 /// Extract heading sections with levels for hierarchy linking.
 pub fn extract_sections(content: &str) -> Vec<Section> {
     let mut sections = Vec::new();
@@ -874,7 +888,7 @@ pub fn extract_sections(content: &str) -> Vec<Section> {
     for cap in heading_re.captures_iter(content) {
         let level = cap.get(1).map(|m| m.as_str().len()).unwrap_or(1) as u32;
         let name = cap.get(2).map(|m| m.as_str().trim()).unwrap_or("");
-        if name.chars().count() > 2 {
+        if heading_name_visible(name) {
             sections.push(Section {
                 name: name.to_string(),
                 level,

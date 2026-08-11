@@ -384,48 +384,65 @@ impl SkbServer {
             "skb_reindex" => {
                 let params: ReindexRequest = serde_json::from_value(Value::Object(args))
                     .map_err(|e| valid_err(&format!("invalid reindex parameters: {e}")))?;
-                let progress: Option<Box<skb_core::reindex::ProgressFn>> =
-                    context.meta.get_progress_token().map(|token| {
-                        // Bounded channel + one forwarding task: the
-                        // ProgressFn callback is sync (Fn(usize, usize)), so
-                        // try_send pushes into the channel without awaiting;
-                        // a single task drains it and forwards notifications
-                        // sequentially in callback order (no task per update).
-                        // When kb.reindex returns, the callback closure is
-                        // dropped, closing the channel; the forwarder then
-                        // exits after draining.
-                        let (tx, mut rx) = tokio::sync::mpsc::channel::<(usize, usize)>(32);
-                        let peer2 = context.peer.clone();
-                        let token2 = token.clone();
-                        let forwarder = tokio::spawn(async move {
-                            while let Some((done, total)) = rx.recv().await {
-                                let notification = rmcp::model::Notification::new(
-                                    rmcp::model::ProgressNotificationParam::new(
-                                        token2.clone(),
-                                        done as f64,
-                                    )
-                                    .with_total(total as f64),
-                                );
-                                let _ = peer2
-                                    .send_notification(
-                                        rmcp::model::ServerNotification::ProgressNotification(
-                                            notification,
-                                        ),
-                                    )
-                                    .await;
-                            }
-                        });
-                        // Detach the forwarder: it exits on its own once the
-                        // channel closes (when the callback closure drops).
-                        std::mem::drop(forwarder);
+                // Bounded channel + one forwarding task, kept alive until the
+                // reindex finishes: the sync ProgressFn pushes into the
+                // channel via try_send (no awaiting), a single task drains it
+                // and forwards notifications sequentially in order. After
+                // kb.reindex returns, progress (and its channel sender) is
+                // dropped, closing the channel; the forwarder is awaited so
+                // every notification, including done == total, is delivered.
+                let progress_handle: Option<(
+                    Box<skb_core::reindex::ProgressFn>,
+                    tokio::task::JoinHandle<()>,
+                )> = context.meta.get_progress_token().map(|token| {
+                    let (tx, mut rx) = tokio::sync::mpsc::channel::<(usize, usize)>(32);
+                    let peer2 = context.peer.clone();
+                    let token2 = token.clone();
+                    let forwarder = tokio::spawn(async move {
+                        while let Some((done, total)) = rx.recv().await {
+                            let notification = rmcp::model::Notification::new(
+                                rmcp::model::ProgressNotificationParam::new(
+                                    token2.clone(),
+                                    done as f64,
+                                )
+                                .with_total(total as f64),
+                            );
+                            let _ = peer2
+                                .send_notification(
+                                    rmcp::model::ServerNotification::ProgressNotification(
+                                        notification,
+                                    ),
+                                )
+                                .await;
+                        }
+                    });
+                    let callback: Box<skb_core::reindex::ProgressFn> =
                         Box::new(move |done: usize, total: usize| {
                             let _ = tx.try_send((done, total));
-                        }) as Box<skb_core::reindex::ProgressFn>
-                    });
-                kb.reindex(&params, progress.as_deref())
-                    .await
-                    .map(|r| serde_json::to_value(r).unwrap_or_default())
-                    .map_err(|e| format!("{e}"))
+                        });
+                    (callback, forwarder)
+                });
+                let result = match progress_handle {
+                    Some((progress, forwarder)) => {
+                        let r = kb
+                            .reindex(&params, Some(progress.as_ref()))
+                            .await
+                            .map(|r| serde_json::to_value(r).unwrap_or_default())
+                            .map_err(|e| format!("{e}"));
+                        // Drop the callback (closes the channel), then await
+                        // the forwarder so the final progress notification is
+                        // sent before the tool returns.
+                        drop(progress);
+                        let _ = forwarder.await;
+                        r
+                    }
+                    None => kb
+                        .reindex(&params, None)
+                        .await
+                        .map(|r| serde_json::to_value(r).unwrap_or_default())
+                        .map_err(|e| format!("{e}")),
+                };
+                result
             }
             name => Err(format!("unknown tool: {name}")),
         }
