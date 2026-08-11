@@ -57,6 +57,29 @@ impl KnowledgeBase {
         Self::open_inner(config, true).await
     }
 
+    /// Open the knowledge base, falling back to [`KnowledgeBase::open_for_reindex`]
+    /// on `E_MODEL_MISMATCH`. A failed open releases the embedded SurrealKV
+    /// file lock asynchronously, so the reopen is retried a bounded number of
+    /// times to settle the lock before the mismatch fallback (CLI/MCP startup
+    /// share this single implementation).
+    pub async fn open_or_for_reindex(config: Config) -> Result<Self, SkbError> {
+        const ATTEMPTS: usize = 8;
+        let mut last: Option<SkbError> = None;
+        for _ in 0..ATTEMPTS {
+            match Self::open(config.clone()).await {
+                Ok(kb) => return Ok(kb),
+                Err(e) if e.code == ErrorCode::ModelMismatch => {
+                    return Self::open_for_reindex(config).await;
+                }
+                Err(e) => {
+                    last = Some(e);
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                }
+            }
+        }
+        Err(last.expect("ATTEMPTS is non-zero"))
+    }
+
     async fn open_inner(config: Config, allow_mismatch: bool) -> Result<Self, SkbError> {
         let db = Db::open(&config).await?;
 

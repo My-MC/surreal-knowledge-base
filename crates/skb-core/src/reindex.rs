@@ -33,10 +33,12 @@ pub struct ReindexRequest {
 /// - Model or dimension change: the schema (embedding field + HNSW index) is
 ///   redefined and every document rebuilt. The transition is split into
 ///   atomic steps because SurrealDB's `DEFINE INDEX` rebuild cannot see
-///   uncommitted deletes inside the same transaction; each step is idempotent
-///   and the stored `meta` is only updated at the end, so any interruption
-///   leaves a detectable `E_MODEL_MISMATCH` state that a re-run of `reindex`
-///   completes (spec §9-5).
+///   uncommitted deletes inside the same transaction; each step is idempotent.
+///   `embedding_dimension` / `embedding_model` in `meta` are updated
+///   immediately after the transition begins, and the `reindex_in_progress`
+///   marker is set before it, so any interruption is detected through the
+///   marker (and the dimension mismatch) on the next normal open — a re-run
+///   of `reindex` completes the rebuild (spec §9-5).
 pub async fn reindex(
     db: &Db,
     embedder: &dyn Embed,
@@ -45,6 +47,10 @@ pub async fn reindex(
     req: &ReindexRequest,
     progress: Option<&ProgressFn>,
 ) -> Result<ReindexResult, SkbError> {
+    // Validate configuration up front so invalid values (e.g. batch_size = 0,
+    // which would make texts.chunks(0) panic) are rejected before any chunk
+    // processing or embedding happens.
+    config.validate()?;
     let dry_run = req.dry_run;
     let dimension = embedder.dimension();
     let stored_dim = db
@@ -96,23 +102,23 @@ pub async fn reindex(
                         .map(|e| e.name),
                 );
             }
-            result.entities_extracted = dry_entity_names.len();
             result.documents_processed += 1;
             result.chunks_created += chunks.len();
             result.tokens_total += chunks.iter().map(|c| c.token_count).sum::<usize>();
         }
+        // One assignment after the loop: unique entity count across all docs.
+        result.entities_extracted = dry_entity_names.len();
         // Dry runs are side-effect free: no marker, no metadata writes.
         return Ok(result);
     }
 
-    // Reindex-in-progress marker: set only after dry-run handling, before the
-    // transition begins, so an interrupted reindex (crash, kill) is detected
-    // on the next normal open even if the stored dimension still matches the
-    // schema; deleted only after update_metas completes. `open_inner` treats
-    // the value "1" as active.
-    db.set_meta("reindex_in_progress", "1").await?;
-
     if dimension_changed {
+        // Reindex-in-progress marker: set only for dimension-changing
+        // reindexes, before the transition begins, so an interrupted
+        // transition (crash, kill) is detected on the next normal open;
+        // deleted only after update_metas completes. `open_inner` treats
+        // the value "1" as active. Tokenizer-only reindexes need no marker.
+        db.set_meta("reindex_in_progress", "1").await?;
         // 1. Atomic transition: wipe old chunks/mentions and redefine the
         //    embedding field for the new dimension (the HNSW index is rebuilt
         //    after all new chunks exist — its rebuild cannot see uncommitted
@@ -163,15 +169,15 @@ pub async fn reindex(
             }
         }
         update_metas(db, embedder, tokenizer, config).await?;
+        // Reindex completed: delete the in-progress marker (set at entry of
+        // the dimension-change branch).
+        crate::db::delete_meta(&db.db, "reindex_in_progress").await?;
     } else {
         result = rebuild_all(db, embedder, tokenizer, config, &docs, progress).await?;
         // Always refresh metadata after a successful rebuild: even a
         // tokenizer-only change must record the new fingerprint (§5.4).
         update_metas(db, embedder, tokenizer, config).await?;
     }
-
-    // Reindex completed: delete the in-progress marker (set at entry).
-    crate::db::delete_meta(&db.db, "reindex_in_progress").await?;
 
     Ok(result)
 }

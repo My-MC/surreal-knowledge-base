@@ -277,12 +277,20 @@ pub async fn delete_document(
 ) -> Result<DeleteResult, SkbError> {
     req.validate()?;
     let record_id = document_record_id(&req.id)?;
-    // Count the matching chunks before deletion (a single aggregated number,
-    // not full records), then delete without RETURN BEFORE. GROUP ALL yields
-    // one row even with zero matches.
-    let count_sql = "SELECT count() AS c FROM chunk WHERE document = $id GROUP ALL";
-    let mut c = db
+    // Everything runs inside one transaction so the count, chunk deletes and
+    // document delete are transaction-consistent: commit on success, cancel
+    // on any failure.
+    let tx = db
         .db
+        .clone()
+        .begin()
+        .await
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete begin: {e}")))?;
+
+    // Count the matching chunks before deletion (a single aggregated number,
+    // not full records). GROUP ALL yields one row even with zero matches.
+    let count_sql = "SELECT count() AS c FROM chunk WHERE document = $id GROUP ALL";
+    let mut c = tx
         .query(count_sql)
         .bind(("id", record_id.clone()))
         .await
@@ -296,13 +304,15 @@ pub async fn delete_document(
         .unwrap_or(0) as usize;
 
     let query = "DELETE FROM chunk WHERE document = $id; DELETE $id;";
-    db.db
-        .query(query)
+    tx.query(query)
         .bind(("id", record_id))
         .await
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete: {e}")))?
         .check()
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete check: {e}")))?;
+    tx.commit()
+        .await
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete commit: {e}")))?;
 
     Ok(DeleteResult {
         document_id: req.id.clone(),

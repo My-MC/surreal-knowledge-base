@@ -498,17 +498,30 @@ fn pdf_semaphore() -> &'static tokio::sync::Semaphore {
 /// under a wall-clock timeout so a slow document cannot hang the request. A
 /// fixed concurrency cap bounds how many blocking jobs may pile up.
 async fn extract_pdf_checked(bytes: &[u8]) -> Result<String, SkbError> {
-    let _permit = pdf_semaphore()
+    // The permit is acquired inside each spawn_blocking job so it is held for
+    // the full lifetime of the blocking task — a timed-out caller cannot
+    // release the slot while the job still runs, so actual concurrent PDF
+    // jobs never exceed MAX_CONCURRENT_PDF_JOBS.
+    let start = Instant::now();
+    let shared = std::sync::Arc::new(bytes.to_vec());
+    // The permit is acquired (async) before the job starts and moved into the
+    // spawn_blocking closure so it is held for the full lifetime of the
+    // blocking task — a timed-out caller cannot release the slot while the
+    // job still runs, so actual concurrent PDF jobs never exceed
+    // MAX_CONCURRENT_PDF_JOBS.
+    let parse_permit = pdf_semaphore()
         .acquire()
         .await
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("pdf semaphore: {e}")))?;
-    let start = Instant::now();
-    let shared = std::sync::Arc::new(bytes.to_vec());
     let doc = tokio::time::timeout(
         Duration::from_secs(MAX_PROCESS_SECONDS),
         tokio::task::spawn_blocking({
             let shared = shared.clone();
-            move || lopdf::Document::load_mem(&shared)
+            move || {
+                let _permit = parse_permit;
+                lopdf::Document::load_mem(&shared)
+                    .map_err(|e| SkbError::new(ErrorCode::Io, format!("pdf parse: {e}")))
+            }
         }),
     )
     .await
@@ -527,11 +540,19 @@ async fn extract_pdf_checked(bytes: &[u8]) -> Result<String, SkbError> {
     // one MAX_PROCESS_SECONDS budget so a slow parse cannot be followed by a
     // full second timeout.
     let remaining = Duration::from_secs(MAX_PROCESS_SECONDS).saturating_sub(start.elapsed());
+    let extract_permit = pdf_semaphore()
+        .acquire()
+        .await
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("pdf semaphore: {e}")))?;
     let text = tokio::time::timeout(
         remaining,
         tokio::task::spawn_blocking({
             let shared = shared.clone();
-            move || pdf_extract::extract_text_from_mem(&shared)
+            move || {
+                let _permit = extract_permit;
+                pdf_extract::extract_text_from_mem(&shared)
+                    .map_err(|e| SkbError::new(ErrorCode::Io, format!("pdf extract: {e}")))
+            }
         }),
     )
     .await

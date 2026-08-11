@@ -563,9 +563,11 @@ mod tests {
     fn load_works_without_config_file_when_env_set() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let _model = EnvGuard::set("SKB_EMBEDDING_MODEL", "env-only-model");
-        // No config file exists for this process cwd in CI; load() must fall
-        // back to defaults + env instead of failing.
-        let config = Config::load().unwrap();
+        // Exercise the env-override path directly (Config::default() + env),
+        // independent of any ./skb.toml that may exist in the caller's cwd:
+        // the env value must win over the default config.
+        let mut config = Config::default();
+        config.apply_env_overrides().unwrap();
         assert_eq!(config.embedding.model, "env-only-model");
     }
 }

@@ -212,7 +212,7 @@ fn emit_error(fmt: &str, e: &anyhow::Error) {
         println!(
             "{}",
             serde_json::json!({
-                "error": code.unwrap_or_else(|| "E_INTERNAL".to_string()),
+                "error": code.unwrap_or_else(|| "E_IO".to_string()),
                 "message": msg,
             })
         );
@@ -357,7 +357,7 @@ async fn run(cli: &Cli) -> Result<u8> {
                             "input": p,
                             "error": skb_core::error::ErrorCode::from_std(&e)
                                 .map(|c| c.code_str().to_string())
-                                .unwrap_or_else(|| "E_INTERNAL".to_string()),
+                                .unwrap_or_else(|| "E_IO".to_string()),
                             "message": format!("{e:#}"),
                         })),
                     }
@@ -382,6 +382,11 @@ async fn run(cli: &Cli) -> Result<u8> {
                 // expansions with exactly one file included), never the
                 // original directory path.
                 let result = kb.upload(build(Some(p.clone()), None, None)).await?;
+                output(&result, &fmt)?;
+            } else if url.is_some() {
+                // URL-only upload: no path input; build with an empty path so
+                // the URL is preserved and upload proceeds.
+                let result = kb.upload(build(None, None, None)).await?;
                 output(&result, &fmt)?;
             } else {
                 anyhow::bail!("no files to upload");
@@ -473,15 +478,11 @@ async fn run(cli: &Cli) -> Result<u8> {
         }
         Commands::Reindex { dry_run } => {
             // A model/dimension/tokenizer mismatch blocks normal open; reindex
-            // is the management path out of that state (spec §9-5). The
-            // initial failed open releases the SurrealKV file lock
-            // asynchronously, so reopening the same datastore retries a few
-            // times to settle the lock before falling back.
+            // is the management path out of that state (spec §9-5).
+            // open_or_for_reindex retries transient file-lock races from the
+            // first failed open and falls back to open_for_reindex on mismatch.
             let config = cfg()?;
-            let kb = match open_with_lock_retry(config.clone()).await? {
-                Some(kb) => kb,
-                None => KnowledgeBase::open_for_reindex(config).await?,
-            };
+            let kb = skb_core::KnowledgeBase::open_or_for_reindex(config).await?;
             let req = skb_core::reindex::ReindexRequest { dry_run: *dry_run };
             let progress = |done: usize, total: usize| {
                 eprint!("\rreindexed {done}/{total}");
@@ -587,24 +588,6 @@ fn cfg() -> Result<Config> {
 /// the caller can fall back to `open_for_reindex`. A failed open releases the
 /// embedded SurrealKV file lock asynchronously, so the reopen is retried a
 /// bounded number of times to settle the lock before the mismatch fallback.
-async fn open_with_lock_retry(config: Config) -> Result<Option<skb_core::KnowledgeBase>> {
-    const ATTEMPTS: usize = 8;
-    let mut last: Option<anyhow::Error> = None;
-    for _ in 0..ATTEMPTS {
-        match skb_core::KnowledgeBase::open(config.clone()).await {
-            Ok(kb) => return Ok(Some(kb)),
-            Err(e) if e.code == skb_core::error::ErrorCode::ModelMismatch => {
-                return Ok(None);
-            }
-            Err(e) => {
-                last = Some(anyhow::anyhow!("{e:#}"));
-                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-            }
-        }
-    }
-    Err(last.expect("ATTEMPTS is non-zero"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

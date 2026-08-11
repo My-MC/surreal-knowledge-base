@@ -432,26 +432,11 @@ impl SkbServer {
     }
 }
 
-/// Open the store, returning `Ok(None)` when a model mismatch is detected so
-/// the caller can fall back to `open_for_reindex`. A failed open releases the
-/// embedded SurrealKV file lock asynchronously, so the reopen is retried a
-/// bounded number of times to settle the lock before the mismatch fallback.
-async fn open_with_lock_retry(config: Config) -> Result<Option<skb_core::KnowledgeBase>> {
-    const ATTEMPTS: usize = 8;
-    let mut last: Option<anyhow::Error> = None;
-    for _ in 0..ATTEMPTS {
-        match skb_core::KnowledgeBase::open(config.clone()).await {
-            Ok(kb) => return Ok(Some(kb)),
-            Err(e) if e.code == skb_core::error::ErrorCode::ModelMismatch => {
-                return Ok(None);
-            }
-            Err(e) => {
-                last = Some(anyhow::anyhow!("{e:#}"));
-                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-            }
-        }
-    }
-    Err(last.expect("ATTEMPTS is non-zero"))
+/// Open the store via the shared skb-core API: retries transient file-lock
+/// races from a failed open and falls back to `open_for_reindex` on model
+/// mismatch (spec §9-5).
+async fn open_with_lock_retry(config: Config) -> Result<skb_core::KnowledgeBase> {
+    Ok(skb_core::KnowledgeBase::open_or_for_reindex(config).await?)
 }
 
 #[tokio::main]
@@ -466,16 +451,9 @@ async fn main() -> Result<()> {
     // stop startup. Propagate the anyhow error with its file-path context.
     let config = Config::load().context("failed to load config")?;
     // In a model/tokenizer mismatch state, start anyway so `skb_reindex`
-    // can rebuild the database (spec §9-5). A failed open releases the
-    // SurrealKV file lock asynchronously, so the reopen is retried to settle
-    // the lock before the mismatch fallback.
-    let kb = match open_with_lock_retry(config.clone()).await? {
-        Some(kb) => kb,
-        None => {
-            tracing::warn!("model mismatch detected; starting for reindex");
-            KnowledgeBase::open_for_reindex(config).await?
-        }
-    };
+    // can rebuild the database (spec §9-5). open_or_for_reindex retries
+    // transient file-lock races and falls back to open_for_reindex.
+    let kb = open_with_lock_retry(config.clone()).await?;
     let server = SkbServer::new(kb);
 
     tracing::info!("MCP server starting (stdio)");

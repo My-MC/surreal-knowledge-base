@@ -218,56 +218,68 @@ async fn hybrid_search(
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("hybrid kw take: {e}")))?;
 
     // RRF merge
-    type RankedHit = (f64, String, usize, String, Option<String>, Option<String>);
+    struct RankedHit {
+        score: f64,
+        content: String,
+        idx: usize,
+        document: String,
+        title: Option<String>,
+        source: Option<String>,
+    }
     let rrf_k = rrf_k.max(1) as f64;
     let mut scores: HashMap<String, RankedHit> = HashMap::new();
 
     for (rank, row) in vrows.iter().enumerate() {
         let id = row["chunk_id"].as_str().unwrap_or("").to_string();
-        let content = row["content"].as_str().unwrap_or("").to_string();
-        let idx = row["idx"].as_u64().unwrap_or(0) as usize;
-        let doc = row["document"].as_str().unwrap_or("").to_string();
-        let title = row["title"].as_str().map(|s| s.to_string());
-        let source = row["source"].as_str().map(|s| s.to_string());
         let rrf = 1.0 / (rrf_k + (rank as f64 + 1.0));
-        scores
-            .entry(id)
-            .and_modify(|e| e.0 += rrf)
-            .or_insert((rrf, content, idx, doc, title, source));
+        scores.entry(id).or_insert(RankedHit {
+            score: rrf,
+            content: row["content"].as_str().unwrap_or("").to_string(),
+            idx: row["idx"].as_u64().unwrap_or(0) as usize,
+            document: row["document"].as_str().unwrap_or("").to_string(),
+            title: row["title"].as_str().map(|s| s.to_string()),
+            source: row["source"].as_str().map(|s| s.to_string()),
+        });
     }
 
     let highlights = match_terms(query);
     for (rank, row) in krows.iter().enumerate() {
         let id = row["chunk_id"].as_str().unwrap_or("").to_string();
-        let content = row["content"].as_str().unwrap_or("").to_string();
-        let idx = row["idx"].as_u64().unwrap_or(0) as usize;
-        let doc = row["document"].as_str().unwrap_or("").to_string();
-        let title = row["title"].as_str().map(|s| s.to_string());
-        let source = row["source"].as_str().map(|s| s.to_string());
         let rrf = 1.0 / (rrf_k + (rank as f64 + 1.0));
-        scores
-            .entry(id)
-            .and_modify(|e| e.0 += rrf)
-            .or_insert((rrf, content, idx, doc, title, source));
+        if let Some(e) = scores.get_mut(&id) {
+            e.score += rrf;
+        } else {
+            scores.insert(
+                id,
+                RankedHit {
+                    score: rrf,
+                    content: row["content"].as_str().unwrap_or("").to_string(),
+                    idx: row["idx"].as_u64().unwrap_or(0) as usize,
+                    document: row["document"].as_str().unwrap_or("").to_string(),
+                    title: row["title"].as_str().map(|s| s.to_string()),
+                    source: row["source"].as_str().map(|s| s.to_string()),
+                },
+            );
+        }
     }
 
     let mut sorted: Vec<_> = scores.into_iter().collect();
     sorted.sort_by(|a, b| {
-        b.1 .0
-            .partial_cmp(&a.1 .0)
+        b.1.score
+            .partial_cmp(&a.1.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     sorted.truncate(top_k);
 
     Ok(sorted
         .into_iter()
-        .map(|(_, (score, content, idx, doc, title, source))| SearchHit {
-            document_id: doc,
-            chunk_idx: idx,
-            content,
-            score,
-            title,
-            source,
+        .map(|(_, hit)| SearchHit {
+            document_id: hit.document,
+            chunk_idx: hit.idx,
+            content: hit.content,
+            score: hit.score,
+            title: hit.title,
+            source: hit.source,
             highlights: Some(highlights.clone()),
             matched_entities: None,
         })

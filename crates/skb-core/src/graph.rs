@@ -497,41 +497,69 @@ pub async fn expand_search_hits(
         .map(|h| (h.document_id.clone(), h.chunk_idx))
         .collect();
 
-    // Direct-hit entity metadata is recorded for EVERY hit (each chunk's
-    // hop-1 query runs once), while graph expansion is bounded to the top
-    // EXPAND_ORIGIN_LIMIT hits so dense result sets stay cheap.
+    // Direct-hit entity metadata is recorded for EVERY hit, while graph
+    // expansion is bounded to the top EXPAND_ORIGIN_LIMIT hits so dense
+    // result sets stay cheap.
     const EXPAND_ORIGIN_LIMIT: usize = 3;
+
+    // Hop 1 for all hits: entities mentioned by each (document_id, chunk_idx)
+    // pair. Batched per unique document (a document can have many hit chunks,
+    // but hit sets are small); the idx filter is applied in Rust so an IN x IN
+    // cross product cannot match wrong pairs. document_id matches the search
+    // result format (meta::id(document) key, no table prefix).
+    let unique_docs: std::collections::HashSet<&String> =
+        hits.iter().map(|h| &h.document_id).collect();
+    let wanted: std::collections::HashSet<(String, usize)> = hits
+        .iter()
+        .map(|h| (h.document_id.clone(), h.chunk_idx))
+        .collect();
+    let sql = "SELECT meta::id(document) AS document, \
+               idx, ->mentions->entity.name AS e \
+               FROM chunk WHERE meta::id(document) IN $documents";
+    let mut r = db
+        .db
+        .query(sql)
+        .bind((
+            "documents",
+            unique_docs.into_iter().cloned().collect::<Vec<_>>(),
+        ))
+        .await
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand: {e}")))?;
+    let rows: Vec<serde_json::Value> = r
+        .take(0)
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand take: {e}")))?;
+
+    // Bucket entities by hit (document, idx); the bucket key matches the
+    // origin_entities key format used by the caller.
+    let mut by_hit: std::collections::HashMap<(String, usize), Vec<String>> =
+        std::collections::HashMap::new();
+    for row in rows.iter() {
+        let doc = row["document"].as_str().unwrap_or("").to_string();
+        let idx = row["idx"].as_u64().unwrap_or(0) as usize;
+        if !wanted.contains(&(doc.clone(), idx)) {
+            continue;
+        }
+        for ename in to_string_vec(&row["e"]) {
+            by_hit.entry((doc.clone(), idx)).or_default().push(ename);
+        }
+    }
 
     for (hit_idx, hit) in hits.iter().enumerate() {
         let origin_score = hit.score.max(0.0);
         let do_expand = hit_idx < EXPAND_ORIGIN_LIMIT && max_expand > 0;
 
-        // Hop 1: entities mentioned by this chunk (bound parameters; no
-        // manual string escaping).
-        let sql = "SELECT ->mentions->entity.name AS e \
-                   FROM chunk WHERE idx = $idx AND meta::id(document) = $document";
-        let mut r = db
-            .db
-            .query(sql)
-            .bind(("idx", hit.chunk_idx as i64))
-            .bind(("document", hit.document_id.clone()))
-            .await
-            .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand: {e}")))?;
-        let rows: Vec<serde_json::Value> = r
-            .take(0)
-            .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand take: {e}")))?;
+        let hit_key = (hit.document_id.clone(), hit.chunk_idx);
+        let hit_entities = by_hit.remove(&hit_key).unwrap_or_default();
 
         let mut frontier: Vec<(String, f64)> = Vec::new(); // (entity, decay)
-        for row in rows.iter() {
-            for ename in to_string_vec(&row["e"]) {
-                // Decay below 1.0 so expanded results can never tie direct
-                // hits in the re-rank (spec §6).
-                frontier.push((ename.clone(), 0.95_f64));
-                origin_entities
-                    .entry(format!("{}/{}", hit.document_id, hit.chunk_idx))
-                    .or_default()
-                    .push(ename);
-            }
+        for ename in hit_entities {
+            // Decay below 1.0 so expanded results can never tie direct
+            // hits in the re-rank (spec §6).
+            frontier.push((ename.clone(), 0.95_f64));
+            origin_entities
+                .entry(format!("{}/{}", hit.document_id, hit.chunk_idx))
+                .or_default()
+                .push(ename);
         }
 
         if !do_expand {
