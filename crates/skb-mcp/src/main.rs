@@ -388,51 +388,75 @@ impl SkbServer {
                 // reindex finishes: the sync ProgressFn pushes into the
                 // channel via try_send (no awaiting), a single task drains it
                 // and forwards notifications sequentially in order. After
-                // kb.reindex returns, progress (and its channel sender) is
-                // dropped, closing the channel; the forwarder is awaited so
-                // every notification, including done == total, is delivered.
-                let progress_handle: Option<(
+                // kb.reindex returns, the final (total, total) value is
+                // enqueued with an awaited send so it is guaranteed not to be
+                // dropped on a full channel; the forwarder is awaited so the
+                // notification is delivered before the tool returns.
+                type ProgressHandle = (
                     Box<skb_core::reindex::ProgressFn>,
+                    tokio::sync::mpsc::Sender<(usize, usize)>,
+                    std::sync::Arc<std::sync::Mutex<Option<(usize, usize)>>>,
                     tokio::task::JoinHandle<()>,
-                )> = context.meta.get_progress_token().map(|token| {
-                    let (tx, mut rx) = tokio::sync::mpsc::channel::<(usize, usize)>(32);
-                    let peer2 = context.peer.clone();
-                    let token2 = token.clone();
-                    let forwarder = tokio::spawn(async move {
-                        while let Some((done, total)) = rx.recv().await {
-                            let notification = rmcp::model::Notification::new(
-                                rmcp::model::ProgressNotificationParam::new(
-                                    token2.clone(),
-                                    done as f64,
-                                )
-                                .with_total(total as f64),
-                            );
-                            let _ = peer2
-                                .send_notification(
-                                    rmcp::model::ServerNotification::ProgressNotification(
-                                        notification,
-                                    ),
-                                )
-                                .await;
-                        }
-                    });
-                    let callback: Box<skb_core::reindex::ProgressFn> =
-                        Box::new(move |done: usize, total: usize| {
-                            let _ = tx.try_send((done, total));
+                );
+                let progress_handle: Option<ProgressHandle> =
+                    context.meta.get_progress_token().map(|token| {
+                        let (tx, mut rx) = tokio::sync::mpsc::channel::<(usize, usize)>(32);
+                        let peer2 = context.peer.clone();
+                        let token2 = token.clone();
+                        let forwarder = tokio::spawn(async move {
+                            while let Some((done, total)) = rx.recv().await {
+                                let notification = rmcp::model::Notification::new(
+                                    rmcp::model::ProgressNotificationParam::new(
+                                        token2.clone(),
+                                        done as f64,
+                                    )
+                                    .with_total(total as f64),
+                                );
+                                let _ = peer2
+                                    .send_notification(
+                                        rmcp::model::ServerNotification::ProgressNotification(
+                                            notification,
+                                        ),
+                                    )
+                                    .await;
+                            }
                         });
-                    (callback, forwarder)
-                });
+                        // The latest (done, total) is retained separately so the
+                        // final value can be re-enqueued with an awaited send.
+                        let latest = std::sync::Arc::new(std::sync::Mutex::new(None));
+                        let latest_cb = latest.clone();
+                        let tx_cb = tx.clone();
+                        let callback: Box<skb_core::reindex::ProgressFn> =
+                            Box::new(move |done: usize, total: usize| {
+                                if let Ok(mut guard) = latest_cb.lock() {
+                                    *guard = Some((done, total));
+                                }
+                                let _ = tx_cb.try_send((done, total));
+                            });
+                        (callback, tx, latest, forwarder)
+                    });
                 let result = match progress_handle {
-                    Some((progress, forwarder)) => {
+                    Some((progress, tx, latest, forwarder)) => {
                         let r = kb
                             .reindex(&params, Some(progress.as_ref()))
                             .await
                             .map(|r| serde_json::to_value(r).unwrap_or_default())
                             .map_err(|e| format!("{e}"));
-                        // Drop the callback (closes the channel), then await
-                        // the forwarder so the final progress notification is
-                        // sent before the tool returns.
+                        // Drop the callback, then re-enqueue the retained
+                        // final value with an awaited send (never try_send: a
+                        // full channel must not lose the terminal
+                        // notification), drop the sender to close the
+                        // channel, and await the forwarder so the final
+                        // progress notification is delivered before the tool
+                        // returns.
                         drop(progress);
+                        // Extract the retained final value BEFORE any await
+                        // so the MutexGuard does not cross an await boundary.
+                        let final_value = *latest.lock().unwrap_or_else(|p| p.into_inner());
+                        if let Some((done, total)) = final_value {
+                            let _ = tx.send((done, total)).await;
+                        }
+                        drop(tx);
                         let _ = forwarder.await;
                         r
                     }
@@ -449,13 +473,6 @@ impl SkbServer {
     }
 }
 
-/// Open the store via the shared skb-core API: retries transient file-lock
-/// races from a failed open and falls back to `open_for_reindex` on model
-/// mismatch (spec §9-5).
-async fn open_with_lock_retry(config: Config) -> Result<skb_core::KnowledgeBase> {
-    Ok(skb_core::KnowledgeBase::open_or_for_reindex(config).await?)
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -470,7 +487,7 @@ async fn main() -> Result<()> {
     // In a model/tokenizer mismatch state, start anyway so `skb_reindex`
     // can rebuild the database (spec §9-5). open_or_for_reindex retries
     // transient file-lock races and falls back to open_for_reindex.
-    let kb = open_with_lock_retry(config.clone()).await?;
+    let kb = skb_core::KnowledgeBase::open_or_for_reindex(config.clone()).await?;
     let server = SkbServer::new(kb);
 
     tracing::info!("MCP server starting (stdio)");

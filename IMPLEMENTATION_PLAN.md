@@ -44,8 +44,8 @@
 | 0 | 技術検証スパイク | 部分完了 | 0-2/0-3の検証証跡を成果物として整理する |
 | 1 | `skb-core` 基盤 | 部分完了 | 設定検証、入力安全性、DTO、CRUD件数、検索応答の不足 |
 | 2 | グラフ + reindex | 部分完了 | N-hop、再ランク、dimension/HNSW/meta整合性の不足 |
-| 3 | CLI | 部分完了 | 仕様上の入力形式、glob、JSON doctor、query、progressの不足 |
-| 4 | MCP | 部分完了 | progressの不足 |
+| 3 | CLI | 部分完了 | 仕様上の入力形式、glob、JSON doctor、queryの不足（reindex progressは実装済み） |
+| 4 | MCP | 部分完了 | reindex progress（notifications/progress）は実装済み。upload progressは対象外（文書ごとのサイズ制限により単発完了応答で十分） |
 | 5 | 契約テスト + npm | 部分完了 | MCP/CLI比較、全ターゲットE2E、upload/search smokeの不足 |
 | 6 | Skill | 部分完了 | 実装済みレスポンスとSkillの引用・エラー説明の同期が必要 |
 | 7 | 仕上げ | 進行中 | ベンチ結果の判定、日本語FTS評価、公開手順の整理が必要 |

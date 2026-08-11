@@ -586,7 +586,9 @@ pub async fn expand_search_hits(
                 .map(|(e, _)| e.clone())
                 .collect();
             if hop_names.is_empty() {
-                continue;
+                // No unvisited entities remain: further hops would be
+                // identical, so expansion terminates.
+                break;
             }
             let decay = 1.0 / hop as f64;
             let esql = "SELECT name, ->related_to->entity.name AS n \
@@ -654,11 +656,13 @@ pub async fn expand_search_hits(
                 continue;
             }
             let matched = to_string_vec(&erow["e"]);
+            // Missing-decay fallback stays below 1.0 so an expanded result
+            // can never receive the origin score unchanged (spec §6).
             let (decay, entity) = matched
                 .iter()
                 .filter_map(|e| decay_map.get(e).map(|d| (d, e.clone())))
                 .max_by(|a, b| a.0.partial_cmp(b.0).unwrap_or(std::cmp::Ordering::Equal))
-                .unwrap_or((&1.0, matched.into_iter().next().unwrap_or_default()));
+                .unwrap_or((&0.95, matched.into_iter().next().unwrap_or_default()));
             expanded.push(SearchHit {
                 document_id,
                 chunk_idx,

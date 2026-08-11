@@ -58,6 +58,10 @@ pub async fn reindex(
         .await?
         .and_then(|v| v.parse::<usize>().ok());
     let dimension_changed = stored_dim.is_some_and(|d| d != dimension);
+    // An active reindex-in-progress marker means a previous run was
+    // interrupted; even when stored_dim matches dimension, the recovery path
+    // (including redefine_index) must run to complete the rebuild.
+    let interrupted = db.get_meta("reindex_in_progress").await?.as_deref() == Some("1");
 
     // Get all documents
     let find =
@@ -112,44 +116,52 @@ pub async fn reindex(
         return Ok(result);
     }
 
-    if dimension_changed {
-        // Reindex-in-progress marker: set only for dimension-changing
-        // reindexes, before the transition begins, so an interrupted
-        // transition (crash, kill) is detected on the next normal open;
-        // deleted only after update_metas completes. `open_inner` treats
-        // the value "1" as active. Tokenizer-only reindexes need no marker.
-        db.set_meta("reindex_in_progress", "1").await?;
-        // 1. Atomic transition: wipe old chunks/mentions and redefine the
-        //    embedding field for the new dimension (the HNSW index is rebuilt
-        //    after all new chunks exist — its rebuild cannot see uncommitted
-        //    deletes, and the field must exist again before inserts).
-        let tx = db
-            .db
-            .clone()
-            .begin()
-            .await
-            .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex begin: {e}")))?;
-        let transition = transition_dimension(&tx, dimension).await;
-        match transition {
-            Ok(()) => {
-                tx.commit()
-                    .await
-                    .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex commit: {e}")))?;
+    // An interrupted reindex (marker active) must run the recovery path
+    // including redefine_index even when stored_dim already matches the
+    // dimension; the transition (wipe + field redefinition) only runs for a
+    // genuine dimension change.
+    if dimension_changed || interrupted {
+        if dimension_changed {
+            // Reindex-in-progress marker: set before the transition begins
+            // so an interrupted transition (crash, kill) is detected on the
+            // next normal open; deleted only after update_metas completes.
+            // `open_inner` treats the value "1" as active.
+            db.set_meta("reindex_in_progress", "1").await?;
+            // 1. Atomic transition: wipe old chunks/mentions and redefine the
+            //    embedding field for the new dimension (the HNSW index is
+            //    rebuilt after all new chunks exist — its rebuild cannot see
+            //    uncommitted deletes, and the field must exist again before
+            //    inserts).
+            let tx = db
+                .db
+                .clone()
+                .begin()
+                .await
+                .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex begin: {e}")))?;
+            let transition = transition_dimension(&tx, dimension).await;
+            match transition {
+                Ok(()) => {
+                    tx.commit().await.map_err(|e| {
+                        SkbError::new(ErrorCode::Db, format!("reindex commit: {e}"))
+                    })?;
+                }
+                Err(e) => {
+                    let _ = tx.cancel().await;
+                    return Err(e);
+                }
             }
-            Err(e) => {
-                let _ = tx.cancel().await;
-                return Err(e);
-            }
+            // Mark the transition immediately: from here on the stored
+            // dimension matches the schema, so any interruption is detectable
+            // and a re-run of `reindex` completes the rebuild (spec §9-5).
+            db.set_meta("embedding_dimension", &dimension.to_string())
+                .await?;
+            db.set_meta("embedding_model", &config.embedding.model)
+                .await?;
         }
-        // Mark the transition immediately: from here on the stored dimension
-        // matches the schema, so any interruption is detectable and a re-run
-        // of `reindex` completes the rebuild (spec §9-5).
-        db.set_meta("embedding_dimension", &dimension.to_string())
-            .await?;
-        db.set_meta("embedding_model", &config.embedding.model)
-            .await?;
+        // 2. Rebuild every document, then rebuild the HNSW index over the
+        //    chunks (the recovery path reaches this for an interrupted
+        //    reindex even when stored_dim already matches the dimension).
         result = rebuild_all(db, embedder, tokenizer, config, &docs, progress).await?;
-        // 2. Rebuild the HNSW index over the fresh new-dimension chunks.
         let tx = db
             .db
             .clone()

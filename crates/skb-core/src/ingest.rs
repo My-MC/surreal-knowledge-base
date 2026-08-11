@@ -897,13 +897,15 @@ fn base64_decode_checked(b64: &str, config: &Config) -> Result<Vec<u8>, SkbError
 /// metadata / read operations so the validated path is the one actually read
 /// (no re-resolution window between validation and use).
 fn validate_path(path: &std::path::Path, config: &Config) -> Result<std::path::PathBuf, SkbError> {
-    let allowed = &config.upload.allowed_dirs;
-    if allowed.is_empty() {
-        return Ok(path.to_path_buf());
-    }
+    // Always canonicalize so the returned path is the resolved one used for
+    // the subsequent metadata / read operations (no re-resolution window).
     let canonical = path
         .canonicalize()
         .map_err(|e| SkbError::new(ErrorCode::Io, format!("resolve path: {e}")))?;
+    let allowed = &config.upload.allowed_dirs;
+    if allowed.is_empty() {
+        return Ok(canonical);
+    }
     for dir in allowed {
         let can_dir = dir
             .canonicalize()
