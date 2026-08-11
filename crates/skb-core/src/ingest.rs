@@ -498,16 +498,26 @@ fn pdf_semaphore() -> std::sync::Arc<tokio::sync::Semaphore> {
 /// under a wall-clock timeout so a slow document cannot hang the request. A
 /// fixed concurrency cap bounds how many blocking jobs may pile up.
 async fn extract_pdf_checked(bytes: &[u8]) -> Result<String, SkbError> {
+    // The wall-clock budget starts before the permit wait so waiting for a
+    // slot counts against MAX_PROCESS_SECONDS (bounded via timeout below).
+    let start = Instant::now();
     // Each permit is acquired (owned) before the job starts and moved into
     // its spawn_blocking closure so it stays held until the blocking task
     // finishes — a timed-out caller cannot free the slot while the job still
     // runs, so actual concurrent PDF jobs never exceed
     // MAX_CONCURRENT_PDF_JOBS.
-    let parse_permit = pdf_semaphore()
-        .acquire_owned()
-        .await
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("pdf semaphore: {e}")))?;
-    let start = Instant::now();
+    let parse_permit = tokio::time::timeout(
+        Duration::from_secs(MAX_PROCESS_SECONDS),
+        pdf_semaphore().acquire_owned(),
+    )
+    .await
+    .map_err(|_| {
+        SkbError::new(
+            ErrorCode::Validation,
+            "pdf semaphore wait exceeded time limit",
+        )
+    })?
+    .map_err(|e| SkbError::new(ErrorCode::Db, format!("pdf semaphore: {e}")))?;
     let shared = std::sync::Arc::new(bytes.to_vec());
     let doc = tokio::time::timeout(
         Duration::from_secs(MAX_PROCESS_SECONDS),

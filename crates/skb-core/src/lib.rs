@@ -148,8 +148,18 @@ impl KnowledgeBase {
             .await?;
             db.set_meta("schema_version", "1").await?;
         } else {
-            // Backfill embedding_max_input_tokens for stores created before the
-            // key existed; it is read by doctor and dimension/mismatch checks.
+            // Backfill metadata for stores created before the keys existed;
+            // read by doctor and dimension/mismatch checks. Existing values
+            // are preserved (the mismatch check above already refuses to
+            // operate when they disagree with the config).
+            if db.get_meta("embedding_model").await?.is_none() {
+                db.set_meta("embedding_model", &config.embedding.model)
+                    .await?;
+            }
+            if db.get_meta("embedding_dimension").await?.is_none() {
+                db.set_meta("embedding_dimension", &dimension.to_string())
+                    .await?;
+            }
             if db.get_meta("embedding_max_input_tokens").await?.is_none() {
                 db.set_meta(
                     "embedding_max_input_tokens",
@@ -272,15 +282,18 @@ impl KnowledgeBase {
                 "query must not be empty",
             ));
         }
-        let mut r = self
+        let r = self
             .db
             .db
             .query(surql)
             .await
             .map_err(|e| SkbError::new(ErrorCode::Db, format!("query: {e}")))?;
         // Statement-level errors must surface (e.g. a bad query), not be
-        // swallowed as end-of-list. check() consumes the response, so the
-        // statements are collected first.
+        // swallowed as end-of-list: check() validates every statement and
+        // returns the (reusable) response.
+        let mut r = r
+            .check()
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("query check: {e}")))?;
         let mut statements: Vec<serde_json::Value> = Vec::new();
         let mut idx = 0usize;
         loop {
@@ -292,8 +305,6 @@ impl KnowledgeBase {
             }
             idx += 1;
         }
-        r.check()
-            .map_err(|e| SkbError::new(ErrorCode::Db, format!("query check: {e}")))?;
         Ok(serde_json::json!({ "statements": statements }))
     }
 
@@ -499,6 +510,20 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn tokenizer_crate_version_matches_lockfile() {
+        // Build-time guard: TOKENIZER_CRATE_VERSION must match the LOCKED
+        // tokenizers version so a dependency update cannot leave the
+        // fingerprint version stale (a bump changes the fingerprint and
+        // triggers E_MODEL_MISMATCH).
+        let lockfile = include_str!("../../../Cargo.lock");
+        let needle = format!("name = \"tokenizers\"\nversion = \"{TOKENIZER_CRATE_VERSION}\"");
+        assert!(
+            lockfile.contains(&needle),
+            "TOKENIZER_CRATE_VERSION ({TOKENIZER_CRATE_VERSION}) must match Cargo.lock"
+        );
+    }
 
     fn is_upload_source(name: &str) -> bool {
         matches!(name, "path" | "url" | "content" | "content_base64")

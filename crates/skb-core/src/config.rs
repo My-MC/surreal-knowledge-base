@@ -232,7 +232,9 @@ impl Config {
             })?;
         }
         if let Some(v) = env_opt("SKB_SEARCH_DEFAULT_MODE")? {
-            self.search.default_mode = v.parse::<SearchMode>()?;
+            self.search.default_mode = v
+                .parse::<SearchMode>()
+                .with_context(|| format!("SKB_SEARCH_DEFAULT_MODE invalid, got '{v}'"))?;
         }
         if let Some(v) = env_opt("SKB_SEARCH_TOP_K")? {
             self.search.top_k = v
@@ -572,9 +574,11 @@ mod tests {
     fn load_works_without_config_file_when_env_set() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let _model = EnvGuard::set("SKB_EMBEDDING_MODEL", "env-only-model");
-        // No config file exists for this process cwd in CI; load() must fall
-        // back to defaults + env instead of failing.
-        let config = Config::load().unwrap();
+        // Construct from defaults and apply the environment overrides
+        // directly: independent of any ./skb.toml / find_config_path in the
+        // caller's cwd. The env value must win over the default config.
+        let mut config = Config::default();
+        config.apply_env_overrides().unwrap();
         assert_eq!(config.embedding.model, "env-only-model");
     }
 }

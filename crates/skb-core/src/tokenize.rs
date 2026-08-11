@@ -95,6 +95,11 @@ impl Tokenize for TokenizersImpl {
 
         let mut chunks = Vec::new();
         let mut start = 0;
+        // Track the previous end position: heading-boundary breaks can
+        // push end below the previous chunk's end when combined with
+        // overlap, which would duplicate content in an endless loop.
+        // Such a range is skipped (start advances to end).
+        let mut prev_end = 0usize;
 
         while start < ids.len() {
             let window_end = (start + max_tokens).min(ids.len());
@@ -116,6 +121,15 @@ impl Tokenize for TokenizersImpl {
                     end = i;
                 }
             }
+
+            if end <= prev_end {
+                // The heading break would produce a range no further than
+                // the previous chunk: skip it and advance, never emitting
+                // a duplicate chunk.
+                start = end.max(start + 1);
+                continue;
+            }
+            prev_end = end;
 
             let (chunk_offsets_start, chunk_offsets_end) = if let (Some(first), Some(last)) = (
                 offsets.get(start),

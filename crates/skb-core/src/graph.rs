@@ -585,7 +585,9 @@ pub async fn expand_search_hits(
                 .map(|(e, _)| e.clone())
                 .collect();
             if hop_names.is_empty() {
-                continue;
+                // No unvisited entities remain: further hops would be
+                // identical, so expansion terminates.
+                break;
             }
             let decay = 1.0 / hop as f64;
             let esql = "SELECT name, ->related_to->entity.name AS n \
@@ -822,6 +824,17 @@ fn frontmatter_list(content: &str, key: &str) -> Vec<String> {
         if trimmed.starts_with("---") {
             break;
         }
+        // Bullet items are handled BEFORE key parsing: a value like
+        // "- name: x" contains a colon but is a list item, not a key line.
+        if let Some(rest) = trimmed.strip_prefix('-') {
+            let item = rest.trim();
+            if in_list && !item.is_empty() {
+                out.push(item.to_string());
+            }
+            // A bullet before any target key simply starts nothing; bullets
+            // continue the current list without resetting it.
+            continue;
+        }
         if let Some((k, rest)) = trimmed.split_once(':') {
             let is_target = k.trim() == key;
             let rest = rest.trim();
@@ -836,15 +849,8 @@ fn frontmatter_list(content: &str, key: &str) -> Vec<String> {
             // Any other key ends the current list: the following bullets
             // belong to that key's value, not to the one we are collecting.
             in_list = false;
-        } else if in_list {
-            if let Some(item) = trimmed.strip_prefix("-") {
-                let item = item.trim();
-                if !item.is_empty() {
-                    out.push(item.to_string());
-                }
-            } else {
-                in_list = false;
-            }
+        } else {
+            in_list = false;
         }
     }
     out

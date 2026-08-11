@@ -321,10 +321,18 @@ pub async fn delete_document(
 ) -> Result<DeleteResult, SkbError> {
     req.validate()?;
     let record_id = document_record_id(&req.id)?;
+    // Everything runs inside one transaction so the existence check, chunk
+    // count and all deletes are transaction-consistent: commit on success,
+    // cancel on any failure.
+    let tx = db
+        .db
+        .clone()
+        .begin()
+        .await
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete begin: {e}")))?;
 
     // A missing document is an explicit error (spec §9-6).
-    let mut r = db
-        .db
+    let mut r = tx
         .query("SELECT id FROM $id LIMIT 1")
         .bind(("id", record_id.clone()))
         .await
@@ -333,6 +341,7 @@ pub async fn delete_document(
         .take(0)
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete lookup take: {e}")))?;
     if rows.is_empty() {
+        let _ = tx.cancel().await;
         return Err(SkbError::new(
             ErrorCode::DocumentNotFound,
             format!("not found: {}", req.id),
@@ -340,8 +349,7 @@ pub async fn delete_document(
     }
 
     // Count the chunks that will be removed (spec §9-6).
-    let mut r = db
-        .db
+    let mut r = tx
         .query("SELECT count() AS c FROM chunk WHERE document = $id GROUP ALL")
         .bind(("id", record_id.clone()))
         .await
@@ -352,13 +360,15 @@ pub async fn delete_document(
     let chunks_deleted = rows.first().and_then(|v| v["c"].as_u64()).unwrap_or(0) as usize;
 
     let query = "DELETE FROM mentions WHERE in.document = $id; DELETE FROM chunk WHERE document = $id; DELETE $id;";
-    db.db
-        .query(query)
+    tx.query(query)
         .bind(("id", record_id))
         .await
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete: {e}")))?
         .check()
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete check: {e}")))?;
+    tx.commit()
+        .await
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete commit: {e}")))?;
 
     Ok(DeleteResult {
         document_id: req.id.clone(),
@@ -447,33 +457,37 @@ pub async fn doctor(
         errors: Vec::new(),
     };
     // Connectivity first: the point of doctor is to report problems, so a
-    // broken database must never make the report itself fail.
+    // broken database must never make the report itself fail. Meta reads
+    // only run when the connection succeeded (a dead store would fail every
+    // read; one recorded connection error is enough).
     match db.db.query("RETURN 1").await {
-        Ok(_) => report.db_connected = true,
+        Ok(_) => {
+            report.db_connected = true;
+            // Meta reads can also fail; record instead of propagating.
+            match db.get_meta("embedding_model").await {
+                Ok(model) => report.model = model.unwrap_or_default(),
+                Err(e) => report
+                    .errors
+                    .push(format!("read embedding_model meta: {e}")),
+            }
+            match db.get_meta("schema_version").await {
+                Ok(version) => report.schema_version = version.unwrap_or_default(),
+                Err(e) => report.errors.push(format!("read schema_version meta: {e}")),
+            }
+            match db.get_meta("tokenizer_version").await {
+                Ok(v) => report.tokenizer_version = v.unwrap_or_default(),
+                Err(e) => report
+                    .errors
+                    .push(format!("read tokenizer_version meta: {e}")),
+            }
+            match db.get_meta("tokenizer_fingerprint_schema").await {
+                Ok(v) => report.tokenizer_fingerprint_schema = v.unwrap_or_default(),
+                Err(e) => report
+                    .errors
+                    .push(format!("read tokenizer_fingerprint_schema meta: {e}")),
+            }
+        }
         Err(e) => report.errors.push(format!("SurrealDB connection: {e}")),
-    }
-    // Meta reads can also fail; record instead of propagating.
-    match db.get_meta("embedding_model").await {
-        Ok(model) => report.model = model.unwrap_or_default(),
-        Err(e) => report
-            .errors
-            .push(format!("read embedding_model meta: {e}")),
-    }
-    match db.get_meta("schema_version").await {
-        Ok(version) => report.schema_version = version.unwrap_or_default(),
-        Err(e) => report.errors.push(format!("read schema_version meta: {e}")),
-    }
-    match db.get_meta("tokenizer_version").await {
-        Ok(v) => report.tokenizer_version = v.unwrap_or_default(),
-        Err(e) => report
-            .errors
-            .push(format!("read tokenizer_version meta: {e}")),
-    }
-    match db.get_meta("tokenizer_fingerprint_schema").await {
-        Ok(v) => report.tokenizer_fingerprint_schema = v.unwrap_or_default(),
-        Err(e) => report
-            .errors
-            .push(format!("read tokenizer_fingerprint_schema meta: {e}")),
     }
     if report.embedding_dimension == 0 {
         report

@@ -214,7 +214,7 @@ fn emit_error(fmt: &str, e: &anyhow::Error) {
         println!(
             "{}",
             serde_json::json!({
-                "error": code.unwrap_or_else(|| "E_INTERNAL".to_string()),
+                "error": code.unwrap_or_else(|| "E_IO".to_string()),
                 "message": msg,
             })
         );
@@ -344,7 +344,7 @@ async fn run(cli: &Cli) -> Result<u8> {
             // exactly one file; only one explicitly provided path keeps the
             // direct UploadResult shape.
             let mut expanded: Vec<String> = Vec::new();
-            let mut multi_input = paths.len() > 1 || *recursive;
+            let mut multi_input = paths.len() > 1;
             for pattern in paths {
                 if pattern.contains(['*', '?', '[']) {
                     multi_input = true;
@@ -439,7 +439,7 @@ async fn run(cli: &Cli) -> Result<u8> {
                             "input": p,
                             "error": skb_core::error::ErrorCode::from_std(&e)
                                 .map(|c| c.code_str().to_string())
-                                .unwrap_or_else(|| "E_INTERNAL".to_string()),
+                                .unwrap_or_else(|| "E_IO".to_string()),
                             "message": format!("{e:#}"),
                         })),
                     }

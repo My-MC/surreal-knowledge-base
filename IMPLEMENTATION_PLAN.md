@@ -278,7 +278,8 @@ Phase 0〜8 で確定した方針（`tokenizers`、SurrealKV 組込み、ORT 静
 - `KnowledgeBase::open` は `Db::migrate` より前に保存済みの `embedding_model` と `embedding_dimension` を現在値と比較し、mismatch時は `E_MODEL_MISMATCH` を返してschema、field、index、metaを変更しない。dimension変更はreindex経路でのみ実施し、migrateはモデル一致時または本当に不足している定義への適用に限る。
 - reindexを起動時のmodel mismatch状態から実行できる管理経路を用意する。
 - dimension変更時に`chunk.embedding`フィールドとHNSWインデックスを再定義し、旧chunk/mentions削除、新chunk/entity索引、model metadata更新を同一transaction境界で処理する。
-- 中断時は旧schema、旧chunk、旧metaを維持し、再起動後も整合性を検証する。
+- 中断・失敗時は `E_MODEL_MISMATCH` と `reindex_in_progress` マーカーで検出し、`reindex` 再実行が次元変更経路（`redefine_index` を含む）を強制して復旧する。完全 rollback は遷移トランザクション内のみで、wipe/HNSW 再構築分割後の中間状態は再実行で修復する。
+- 中断の検出と復旧は `E_MODEL_MISMATCH` + `reindex_in_progress` マーカーで行い、`reindex` 再実行が次元変更経路を強制して完了させる（完全 rollback は遷移トランザクション内のみ）。
 - MCP progress notificationとCLI progress barを実装する。
 - **完了条件**: dimension変更、HNSW再構築、metadata更新、途中失敗rollback、再起動復旧、progressのテストが緑。
 

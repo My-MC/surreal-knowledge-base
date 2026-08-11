@@ -14,9 +14,11 @@ if (!bin) {
   process.exit(2);
 }
 
-// Dedicated store under ./target so the smoke run never touches the default
-// database (SKB_STORAGE_PATH is the env override handled by Config::load).
-const dbPath = `./target/skb-smoke-db-${process.pid}`;
+// Dedicated store under the repository's target directory (absolute path, so
+// it is independent of the process working directory; SKB_STORAGE_PATH is the
+// env override handled by Config::load).
+const repoRoot = new URL("..", import.meta.url).pathname;
+const dbPath = `${repoRoot}target/skb-smoke-db-${process.pid}`;
 const child = spawn(bin, [], {
   stdio: ["pipe", "pipe", "inherit"],
   env: { ...process.env, SKB_STORAGE_PATH: dbPath },
