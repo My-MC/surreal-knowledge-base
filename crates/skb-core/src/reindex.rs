@@ -37,6 +37,11 @@ pub async fn reindex(
     // succeeds.
     if !dry_run {
         db.set_meta("reindex_in_progress", "1").await?;
+        // The dimension migration is deferred here (open_for_reindex skips
+        // it): apply the schema now that the marker is set, so an interrupted
+        // migration leaves the marker for detection. Dry runs never touch
+        // the schema.
+        db.migrate(config.embedding.dimension).await?;
     }
     // Get all documents
     let find =
@@ -145,6 +150,16 @@ pub async fn reindex(
             let source = crate::tokenizer_source_for(config);
             let meta = crate::tokenizer_fingerprint(&source, &tokenizer.config_json()?)?;
             crate::save_tokenizer_meta(&tx, config, &source, &meta).await?;
+            // The metadata update and the marker removal commit atomically:
+            // the store only opens normally once BOTH are persisted.
+            tx.query("DELETE FROM meta WHERE key = $key")
+                .bind(("key", "reindex_in_progress"))
+                .await
+                .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex marker delete: {e}")))?
+                .check()
+                .map_err(|e| {
+                    SkbError::new(ErrorCode::Db, format!("reindex marker delete check: {e}"))
+                })?;
             Ok::<(), SkbError>(())
         }
         .await;
@@ -159,9 +174,6 @@ pub async fn reindex(
                 return Err(e);
             }
         }
-        // Reindex completed successfully: remove the in-progress marker so
-        // the store opens normally again.
-        crate::db::delete_meta(&db.db, "reindex_in_progress").await?;
     }
 
     Ok(result)

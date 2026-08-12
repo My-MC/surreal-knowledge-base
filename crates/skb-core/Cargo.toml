@@ -34,9 +34,6 @@ pdf-extract = "0.12"
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["async_tokio"] }
-# tokenizers' Vocab (bpe) is an ahash map and `model` is private, so the
-# fixture tokenizer construction keeps a direct dev-dependency.
-ahash = "0.8"
 
 [[bench]]
 name = "skb"

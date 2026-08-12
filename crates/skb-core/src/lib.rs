@@ -197,9 +197,11 @@ impl KnowledgeBase {
             db.migrate(dimension).await?;
         } else {
             // allow_mismatch on an existing store (open_for_reindex): skip the
-            // mismatch checks, but still apply the schema (embedding field and
-            // indexes) for the target dimension so reindex can rebuild.
-            db.migrate(dimension).await?;
+            // mismatch checks AND defer the schema migration — reindex applies
+            // db.migrate after setting the reindex_in_progress marker, so an
+            // interrupted migration leaves a detectable marker. Dry runs
+            // never touch the schema.
+            let _ = db;
         }
 
         // Tokenizer fingerprint: compute, then compare against the stored
@@ -551,12 +553,13 @@ mod tests {
     /// Write a minimal but valid `tokenizer.json` (single-token BPE) for
     /// fingerprint tests; `word` changes the vocabulary so fingerprints differ.
     fn write_fixture_tokenizer(path: &std::path::Path, word: &str) {
-        use tokenizers::models::bpe::BPE;
+        use tokenizers::models::bpe::{Vocab, BPE};
         use tokenizers::Tokenizer;
 
-        // BPE::builder().vocab_and_merges expects tokenizers' Vocab type
-        // (an ahash map); ahash stays a dev-dependency for this construction.
-        let mut vocab = ahash::AHashMap::default();
+        // BPE::builder().vocab_and_merges expects tokenizers' public Vocab
+        // type (an AHashMap alias), so no separate ahash dependency is
+        // needed for this construction.
+        let mut vocab = Vocab::default();
         vocab.insert("<unk>".to_string(), 0);
         vocab.insert(word.to_string(), 1);
         let bpe = BPE::builder()
