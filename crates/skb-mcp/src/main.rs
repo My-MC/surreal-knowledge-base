@@ -404,7 +404,15 @@ impl SkbServer {
                         let peer2 = context.peer.clone();
                         let token2 = token.clone();
                         let forwarder = tokio::spawn(async move {
+                            // Only strictly increasing progress is forwarded:
+                            // duplicate or non-increasing values (retry paths,
+                            // re-sent final values) are discarded.
+                            let mut max_sent = 0usize;
                             while let Some((done, total)) = rx.recv().await {
+                                if done <= max_sent {
+                                    continue;
+                                }
+                                max_sent = done;
                                 let notification = rmcp::model::Notification::new(
                                     rmcp::model::ProgressNotificationParam::new(
                                         token2.clone(),

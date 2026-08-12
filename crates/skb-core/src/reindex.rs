@@ -85,8 +85,11 @@ pub async fn reindex(
     if dry_run {
         let mut dry_entity_names = std::collections::HashSet::new();
         for doc in docs.iter() {
+            let did = doc["did"].as_str().unwrap_or("");
             let content = doc["content"].as_str().unwrap_or("");
-            if content.is_empty() {
+            // Same did-empty filter as the execution path so dry-run counts
+            // match the real reindex.
+            if did.is_empty() || content.is_empty() {
                 continue;
             }
             let chunks = tokenizer.chunk(
@@ -131,25 +134,9 @@ pub async fn reindex(
             //    embedding field for the new dimension (the HNSW index is
             //    rebuilt after all new chunks exist — its rebuild cannot see
             //    uncommitted deletes, and the field must exist again before
-            //    inserts).
-            let tx = db
-                .db
-                .clone()
-                .begin()
-                .await
-                .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex begin: {e}")))?;
-            let transition = transition_dimension(&tx, dimension).await;
-            match transition {
-                Ok(()) => {
-                    tx.commit().await.map_err(|e| {
-                        SkbError::new(ErrorCode::Db, format!("reindex commit: {e}"))
-                    })?;
-                }
-                Err(e) => {
-                    let _ = tx.cancel().await;
-                    return Err(e);
-                }
-            }
+            //    inserts). Retried on retryable write conflicts like every
+            //    other reindex transaction.
+            transition_retrying(db, dimension).await?;
             // Mark the transition immediately: from here on the stored
             // dimension matches the schema, so any interruption is detectable
             // and a re-run of `reindex` completes the rebuild (spec §9-5).
@@ -161,25 +148,11 @@ pub async fn reindex(
         // 2. Rebuild every document, then rebuild the HNSW index over the
         //    chunks (the recovery path reaches this for an interrupted
         //    reindex even when stored_dim already matches the dimension).
+        //    The begin -> redefine_index -> commit sequence is retried as a
+        //    whole: embedded SurrealKV commits can fail with a retryable
+        //    write conflict, and a transaction cannot be re-committed.
         result = rebuild_all(db, embedder, tokenizer, config, &docs, progress).await?;
-        let tx = db
-            .db
-            .clone()
-            .begin()
-            .await
-            .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex begin: {e}")))?;
-        let indexed = redefine_index(&tx, dimension).await;
-        match indexed {
-            Ok(()) => {
-                tx.commit()
-                    .await
-                    .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex commit: {e}")))?;
-            }
-            Err(e) => {
-                let _ = tx.cancel().await;
-                return Err(e);
-            }
-        }
+        redefine_index_retrying(db, dimension).await?;
         update_metas(db, embedder, tokenizer, config).await?;
     } else {
         result = rebuild_all(db, embedder, tokenizer, config, &docs, progress).await?;
@@ -196,7 +169,88 @@ pub async fn reindex(
     Ok(result)
 }
 
+/// Redefine the HNSW index, retrying the whole begin -> redefine -> commit
+/// sequence on retryable transaction write conflicts (embedded SurrealKV; a
+/// transaction cannot be re-committed, so a new one is started per attempt).
+async fn redefine_index_retrying(db: &Db, dimension: usize) -> Result<(), SkbError> {
+    const ATTEMPTS: usize = 8;
+    let mut last = None;
+    for _ in 0..ATTEMPTS {
+        let tx = db
+            .db
+            .clone()
+            .begin()
+            .await
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex begin: {e}")))?;
+        match redefine_index(&tx, dimension).await {
+            Ok(()) => match tx.commit().await {
+                Ok(_) => return Ok(()),
+                Err(e) if e.to_string().contains("Transaction write conflict") => {
+                    last = Some(e);
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                }
+                Err(e) => {
+                    // commit consumed the transaction; nothing to cancel.
+                    return Err(SkbError::new(ErrorCode::Db, format!("reindex commit: {e}")));
+                }
+            },
+            Err(e) => {
+                let _ = tx.cancel().await;
+                return Err(e);
+            }
+        }
+    }
+    Err(SkbError::new(
+        ErrorCode::Db,
+        format!(
+            "reindex commit: {}",
+            last.map(|e| e.to_string()).unwrap_or_default()
+        ),
+    ))
+}
+
 type LocalTransaction = surrealdb::method::Transaction<surrealdb::engine::local::Db>;
+
+/// Run the dimension transition, retrying the whole begin -> transition ->
+/// commit sequence on retryable write conflicts (embedded SurrealKV; a
+/// transaction cannot be re-committed, so a fresh one is started per attempt;
+/// transition_dimension is idempotent — wipe + field redefinition).
+async fn transition_retrying(db: &Db, dimension: usize) -> Result<(), SkbError> {
+    const ATTEMPTS: usize = 8;
+    let mut last = None;
+    for _ in 0..ATTEMPTS {
+        let tx = db
+            .db
+            .clone()
+            .begin()
+            .await
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex begin: {e}")))?;
+        match transition_dimension(&tx, dimension).await {
+            Ok(()) => match tx.commit().await {
+                Ok(_) => return Ok(()),
+                Err(e) if e.to_string().contains("Transaction write conflict") => {
+                    last = Some(e);
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                }
+                Err(e) => {
+                    // commit consumed the transaction; nothing to cancel.
+                    return Err(SkbError::new(ErrorCode::Db, format!("reindex commit: {e}")));
+                }
+            },
+            Err(e) => {
+                let _ = tx.cancel().await;
+                return Err(e);
+            }
+        }
+    }
+    Err(SkbError::new(
+        ErrorCode::Db,
+        format!(
+            "reindex commit: {}",
+            last.map(|e| e.to_string()).unwrap_or_default()
+        ),
+    ))
+}
 
 /// Wipe old chunks/mentions and redefine the embedding field for a new
 /// dimension. Atomic: on failure nothing is committed.
@@ -279,25 +333,12 @@ async fn rebuild_all(
         let texts: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
         let embeddings = embed_in_batches(embedder, &texts, config.embedding.batch_size)?;
 
-        let tx = db
-            .db
-            .clone()
-            .begin()
-            .await
-            .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex begin: {e}")))?;
-        let rebuilt = rebuild_document(&tx, did, content, &chunks, &embeddings).await;
-        let entity_names = match rebuilt {
-            Ok(names) => {
-                tx.commit()
-                    .await
-                    .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex commit: {e}")))?;
-                names
-            }
-            Err(e) => {
-                let _ = tx.cancel().await;
-                return Err(e);
-            }
-        };
+        // begin -> rebuild -> commit as a whole, retrying retryable write
+        // conflicts (embedded SurrealKV; a transaction cannot be re-committed,
+        // so a fresh one is started per attempt; rebuild_document is
+        // idempotent for a given (did, chunks)).
+        let entity_names =
+            rebuild_document_retrying(db, did, content, &chunks, &embeddings).await?;
         entity_names.into_iter().for_each(|n| {
             all_entity_names.insert(n);
         });
@@ -323,44 +364,112 @@ async fn update_metas(
     tokenizer: &dyn Tokenize,
     config: &Config,
 ) -> Result<(), SkbError> {
-    let tx = db
-        .db
-        .clone()
-        .begin()
-        .await
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex meta begin: {e}")))?;
-    let result = async {
-        tx.set_meta("embedding_model", &config.embedding.model)
+    // begin -> writes -> commit retried as a whole on retryable write
+    // conflicts (embedded SurrealKV; a transaction cannot be re-committed).
+    const ATTEMPTS: usize = 8;
+    let mut last = None;
+    for _ in 0..ATTEMPTS {
+        let tx = db
+            .db
+            .clone()
+            .begin()
+            .await
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex meta begin: {e}")))?;
+        let result = async {
+            tx.set_meta("embedding_model", &config.embedding.model)
+                .await?;
+            tx.set_meta("embedding_dimension", &embedder.dimension().to_string())
+                .await?;
+            tx.set_meta(
+                "embedding_max_input_tokens",
+                &embedder.max_input_tokens().to_string(),
+            )
             .await?;
-        tx.set_meta("embedding_dimension", &embedder.dimension().to_string())
-            .await?;
-        tx.set_meta(
-            "embedding_max_input_tokens",
-            &embedder.max_input_tokens().to_string(),
-        )
-        .await?;
-        tx.set_meta("schema_version", "1").await?;
-        let source = crate::tokenizer_source_for(config);
-        let meta = crate::tokenizer_fingerprint(&source, &tokenizer.config_json()?)?;
-        crate::save_tokenizer_meta(&tx, config, &source, &meta).await?;
-        Ok::<(), SkbError>(())
-    }
-    .await;
-    match result {
-        Ok(()) => {
-            tx.commit()
-                .await
-                .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex meta commit: {e}")))?;
-            Ok(())
+            tx.set_meta("schema_version", "1").await?;
+            let source = crate::tokenizer_source_for(config);
+            let meta = crate::tokenizer_fingerprint(&source, &tokenizer.config_json()?)?;
+            crate::save_tokenizer_meta(&tx, config, &source, &meta).await?;
+            Ok::<(), SkbError>(())
         }
-        Err(e) => {
-            let _ = tx.cancel().await;
-            Err(e)
+        .await;
+        match result {
+            Ok(()) => match tx.commit().await {
+                Ok(_) => return Ok(()),
+                Err(e) if e.to_string().contains("Transaction write conflict") => {
+                    last = Some(e);
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                }
+                Err(e) => {
+                    // commit consumed the transaction; nothing to cancel.
+                    return Err(SkbError::new(
+                        ErrorCode::Db,
+                        format!("reindex meta commit: {e}"),
+                    ));
+                }
+            },
+            Err(e) => {
+                let _ = tx.cancel().await;
+                return Err(e);
+            }
         }
     }
+    Err(SkbError::new(
+        ErrorCode::Db,
+        format!(
+            "reindex meta commit: {}",
+            last.map(|e| e.to_string()).unwrap_or_default()
+        ),
+    ))
 }
 
 /// Replace one document's chunks and mentions within the supplied transaction.
+/// Rebuild one document's chunks within a transaction, retrying the whole
+/// begin -> rebuild -> commit sequence on retryable write conflicts (embedded
+/// SurrealKV; a transaction cannot be re-committed, so a fresh one is started
+/// per attempt; rebuild_document is idempotent for a given (did, chunks)).
+async fn rebuild_document_retrying(
+    db: &Db,
+    did: &str,
+    content: &str,
+    chunks: &[crate::tokenize::Chunk],
+    embeddings: &[Vec<f32>],
+) -> Result<Vec<String>, SkbError> {
+    const ATTEMPTS: usize = 8;
+    let mut last = None;
+    for _ in 0..ATTEMPTS {
+        let tx = db
+            .db
+            .clone()
+            .begin()
+            .await
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex begin: {e}")))?;
+        match rebuild_document(&tx, did, content, chunks, embeddings).await {
+            Ok(names) => match tx.commit().await {
+                Ok(_) => return Ok(names),
+                Err(e) if e.to_string().contains("Transaction write conflict") => {
+                    last = Some(e);
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                }
+                Err(e) => {
+                    // commit consumed the transaction; nothing to cancel.
+                    return Err(SkbError::new(ErrorCode::Db, format!("reindex commit: {e}")));
+                }
+            },
+            Err(e) => {
+                let _ = tx.cancel().await;
+                return Err(e);
+            }
+        }
+    }
+    Err(SkbError::new(
+        ErrorCode::Db,
+        format!(
+            "reindex commit: {}",
+            last.map(|e| e.to_string()).unwrap_or_default()
+        ),
+    ))
+}
+
 async fn rebuild_document(
     tx: &LocalTransaction,
     did: &str,

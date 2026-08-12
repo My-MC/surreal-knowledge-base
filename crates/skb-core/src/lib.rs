@@ -194,10 +194,13 @@ impl KnowledgeBase {
         if !allow_mismatch {
             sync_tokenizer_meta(&db, &config, &tokenizer_source, &tokenizer_meta).await?;
         }
-        // In allow_mismatch mode (open_for_reindex) the stored metadata is left
-        // untouched: only a successful reindex may write the new fingerprint,
-        // so a store that is opened for reindex but never rebuilt still fails
-        // the normal `open` with E_MODEL_MISMATCH (spec §9-5).
+        // In allow_mismatch mode (open_for_reindex) the mismatch-detection
+        // metadata — embedding_model, embedding_dimension and the tokenizer
+        // fingerprint — is left unchanged: only a successful reindex may write
+        // the new fingerprint, so a store that is opened for reindex but never
+        // rebuilt still fails the normal `open` with E_MODEL_MISMATCH
+        // (spec §9-5). db.migrate and the max_input_tokens backfill above may
+        // still write schema/backfill metadata.
 
         tracing::info!(model=%config.embedding.model, dim=dimension, "KnowledgeBase opened");
 
@@ -1717,6 +1720,41 @@ mod tests {
             }),
             "expected Beta ->part-of-> Alpha, got {:?}",
             result.edges
+        );
+
+        // Re-uploading the same document with force must not duplicate the
+        // part-of edge: exactly one edge remains between the same pair.
+        kb.upload(UploadRequest {
+            path: None,
+            url: None,
+            content: Some("# Alpha\n\nbody\n\n## Beta\n\nmore body\n".into()),
+            content_base64: None,
+            title: Some("hierarchy".into()),
+            tags: None,
+            metadata: None,
+            force: Some(true),
+        })
+        .await
+        .unwrap();
+        let result = kb
+            .graph_query(&GraphQueryRequest {
+                from: "Beta".into(),
+                relation: Some("part-of".into()),
+                depth: Some(1),
+                limit: Some(10),
+            })
+            .await
+            .unwrap();
+        let beta_alpha_edges = result
+            .edges
+            .iter()
+            .filter(|e| {
+                e.from == "entity:⟨Beta⟩" && e.to == "entity:⟨Alpha⟩" && e.relation == "part-of"
+            })
+            .count();
+        assert_eq!(
+            beta_alpha_edges, 1,
+            "force re-upload must not duplicate the part-of edge, got {beta_alpha_edges}"
         );
 
         let _ = std::fs::remove_dir_all(&path);
