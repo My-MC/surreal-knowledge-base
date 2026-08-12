@@ -88,7 +88,12 @@ impl KnowledgeBase {
             config.resolve_embedding_settings(embedder.dimension(), embedder.max_input_tokens())?;
 
         let dimension = embedder.dimension();
-        db.migrate(dimension).await?;
+        let is_new = db.is_new_database().await?;
+        if is_new && !allow_mismatch {
+            // Fresh store: the schema must exist before any meta read (the
+            // meta table is created by migrate).
+            db.migrate(dimension).await?;
+        }
 
         // A reindex interrupted before completion leaves the marker; refuse
         // normal opens so the store is never used half-rebuilt. The reindex
@@ -115,6 +120,7 @@ impl KnowledgeBase {
             )
             .await?;
             db.set_meta("schema_version", "1").await?;
+            db.migrate(dimension).await?;
         } else if !allow_mismatch {
             if stored_model.as_deref() != Some(config.embedding.model.as_str()) {
                 return Err(SkbError::new(
@@ -122,6 +128,23 @@ impl KnowledgeBase {
                     format!(
                         "config: '{}', stored: '{:?}'. Run reindex to switch models.",
                         config.embedding.model, stored_model
+                    ),
+                ));
+            }
+            // Stored dimension must match the configured/embedder dimension;
+            // a mismatch means a reindex is required (migrate would redefine
+            // the schema, so it must not run on a mismatched store).
+            let stored_dim = db.get_meta("embedding_dimension").await?;
+            if stored_dim
+                .as_deref()
+                .map(|s| s != dimension.to_string().as_str())
+                .unwrap_or(false)
+            {
+                return Err(SkbError::new(
+                    ErrorCode::ModelMismatch,
+                    format!(
+                        "config dimension: '{dimension}', stored: '{:?}'. Run reindex to rebuild.",
+                        stored_dim
                     ),
                 ));
             }
@@ -134,6 +157,8 @@ impl KnowledgeBase {
                 )
                 .await?;
             }
+            // All §5.4 store checks passed; only now apply the schema.
+            db.migrate(dimension).await?;
         } else {
             // open_for_reindex: never write model/dimension metadata; the
             // successful reindex records them. Only backfill max_input_tokens

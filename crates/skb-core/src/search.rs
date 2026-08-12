@@ -324,7 +324,6 @@ fn rows_to_hits(
     Ok(hits)
 }
 
-/// Escape a string literal for embedding in SurrealQL: backslashes first (so
 /// The query terms that a keyword search can highlight: whitespace/punctuation
 /// separated words of at least two characters (Unicode chars, not bytes).
 fn match_terms(query: &str) -> Vec<String> {

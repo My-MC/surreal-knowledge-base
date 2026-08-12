@@ -270,6 +270,7 @@ Phase 0〜8 で確定した方針（`tokenizers`、SurrealKV 組込み、ORT 静
 - 検索結果に`title`、`source`、keywordの`highlights`、graph拡張時の`matched_entities`を追加する。
 - chunk → entity → related entity → chunk のN-hop探索と、元スコア・距離による再ランクを実装する。
 - **完了条件**: 抽出、heading、N-hop、再ランク、検索レスポンスの契約テストが緑。
+- **不変条件**: `related_to("part-of")` の見出し階層は、再取り込み（force 再アップロード）後も重複エッジが発生せず、各セクション（child）が持つ親は最大 1 件である（single-parent invariant）。契約テストで検証する。
 
 ✅ 実装済み: `EntityExtractor`トレイト + `RuleBasedExtractor`（WikiLink `[[target|alias]]`、frontmatter tags/aliases、Markdownリンク、inline tag、見出し、重複排除）。見出し境界優先のチャンキング（窓内の次見出し直前で分割、`Chunk.heading`を保存・永続化）、見出し階層の`related_to("part-of")`リンク（stack 方式で祖先と接続）。`SearchHit`に`title`/`source`/`highlights`(keyword)/`matched_entities`(graph拡張)を追加。N-hop拡張（`related_to`をホップ数分追跡）と再ランク（元スコア×ホップ減衰で統合ソート）。あわせて hybrid RRF の既存バグ（`row["id"]`参照で全行が空キーに集約）を修正。
 

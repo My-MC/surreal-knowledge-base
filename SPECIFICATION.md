@@ -250,7 +250,7 @@ v1 では LLM 非依存のルールベースで行う:
 |---|---|---|
 | Markdown の `[[WikiLink]]` / `[text](link)` | リンク先を `entity` 化 | `chunk ->mentions-> entity`、リンク先が他ドキュメントならエンティティ経由で関連 |
 | YAML frontmatter の `tags`, `aliases` | タグを `entity(kind="tag")` 化 | `mentions` |
-| 見出し階層 | 章題を `entity(kind="section")` 化 | `related_to(relation="part-of")` |
+| 見出し階層 | 章題を `entity(kind="section")` 化 | `related_to(relation="part-of")`。**不変条件**: 再取り込み後も重複エッジが発生せず、各セクション（child）の親は最大 1 件（single-parent invariant） |
 | 手動操作 | `skb graph link` / MCP `skb_graph_link` | `related_to` |
 
 LLM 抽出は `EntityExtractor` トレイトの差し替え実装として将来追加する。

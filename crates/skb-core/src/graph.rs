@@ -765,10 +765,10 @@ pub fn extract_entities(content: &str) -> Vec<EntityInfo> {
     // Headings: ^#{1,6}\s+(.+)
     let heading_re = &HEADING_RE;
     for cap in heading_re.captures_iter(content) {
-        let heading = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+        let heading = cap.get(1).map(|m| m.as_str()).unwrap_or("").trim();
         if heading.chars().count() > 2 {
             entities.push(EntityInfo {
-                name: heading.trim().to_string(),
+                name: heading.to_string(),
                 kind: "section".into(),
                 description: None,
             });

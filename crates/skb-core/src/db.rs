@@ -106,6 +106,21 @@ impl Db {
         Ok(())
     }
 
+    /// Whether the database has no tables yet (a brand-new store).
+    pub async fn is_new_database(&self) -> Result<bool, SkbError> {
+        let mut r = self
+            .db
+            .query("INFO FOR DB")
+            .await
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("info db: {e}")))?;
+        let rows: Vec<serde_json::Value> = r
+            .take(0)
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("info db take: {e}")))?;
+        let tables = rows.first().and_then(|v| v["tables"].as_object());
+        // Fail closed: an unexpected shape is treated as an existing store.
+        Ok(tables.is_some_and(|t| t.is_empty()))
+    }
+
     pub async fn get_meta(&self, key: &str) -> Result<Option<String>, SkbError> {
         let mut r = self
             .db

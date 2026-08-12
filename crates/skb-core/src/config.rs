@@ -234,11 +234,19 @@ impl Config {
             self.upload.max_file_mb = v;
         }
         if let Some(v) = env_opt("SKB_UPLOAD_ALLOWED_DIRS")? {
-            self.upload.allowed_dirs = v
+            let dirs: Vec<PathBuf> = v
                 .split(',')
                 .map(|part| PathBuf::from(part.trim()))
                 .filter(|p| !p.as_os_str().is_empty())
                 .collect();
+            if dirs.is_empty() {
+                // Present but all entries empty would silently disable the
+                // allowed-directories restriction; reject the configuration.
+                anyhow::bail!(
+                    "SKB_UPLOAD_ALLOWED_DIRS must list at least one directory, got '{v}'"
+                );
+            }
+            self.upload.allowed_dirs = dirs;
         }
         Ok(())
     }

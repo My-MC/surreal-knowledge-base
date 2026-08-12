@@ -83,6 +83,14 @@ impl Tokenize for TokenizersImpl {
         if ids.is_empty() {
             return Ok(vec![]);
         }
+        // Reject zero before the loop: window_end == start would never
+        // advance, so a direct public-API call cannot spin forever.
+        if max_tokens == 0 {
+            return Err(SkbError::new(
+                ErrorCode::Validation,
+                "max_tokens must be at least 1",
+            ));
+        }
 
         // Byte offsets of markdown heading lines; chunk boundaries prefer to
         // break right before a heading so sections stay intact (spec §5.1).

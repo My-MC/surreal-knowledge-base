@@ -163,13 +163,16 @@ fn contract_upload_url_with_recursive() {
         .expect("failed to run skb upload --url --recursive");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         !stderr.contains("--recursive requires --path"),
         "URL must take precedence over the recursive path requirement: {stderr}"
     );
+    // The multi-input envelope would be emitted on stdout; the URL branch
+    // must not produce it.
     assert!(
-        !stderr.contains("results"),
-        "URL upload must not enter the multi-input loop: {stderr}"
+        !stdout.contains("results"),
+        "URL upload must not enter the multi-input loop: stdout={stdout}"
     );
 }
 

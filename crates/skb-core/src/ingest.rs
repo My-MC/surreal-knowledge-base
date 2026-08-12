@@ -679,7 +679,7 @@ fn fetch_url_with_validator(
         let body = resp
             .body_mut()
             .with_config()
-            .limit(max_bytes + 1)
+            .limit(max_bytes.saturating_add(1))
             .read_to_vec()
             .map_err(|e| match e {
                 ureq::Error::BodyExceedsLimit(_) => {
@@ -858,6 +858,10 @@ fn is_teredo_v6(v6: std::net::Ipv6Addr) -> bool {
 
 fn base64_decode_checked(b64: &str, config: &Config) -> Result<Vec<u8>, SkbError> {
     use base64::Engine;
+    // Check the raw input length before allocating the whitespace-stripped
+    // copy (whitespace only shrinks the payload, so the estimate from the
+    // original length is a safe upper bound).
+    check_size(base64::decoded_len_estimate(b64.len()) as u64, config)?;
     let compact: String = b64.chars().filter(|c| !c.is_whitespace()).collect();
     let estimated = base64::decoded_len_estimate(compact.len());
     check_size(estimated as u64, config)?;

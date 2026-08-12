@@ -306,6 +306,21 @@ async fn run(cli: &Cli) -> Result<u8> {
                     paths.push(p.display().to_string());
                 }
             } else if let Some(p) = path {
+                // A single explicit path that is a directory requires
+                // --recursive; reject with a Validation error instead of
+                // attempting to read it as a file.
+                if !*recursive
+                    && std::path::Path::new(p)
+                        .metadata()
+                        .map(|m| m.is_dir())
+                        .unwrap_or(false)
+                {
+                    return Err(skb_core::error::SkbError::new(
+                        skb_core::error::ErrorCode::Validation,
+                        "no files to upload: input is a directory; use --recursive",
+                    )
+                    .into());
+                }
                 paths.push(p.clone());
             }
             // `--url --recursive` (no --path) reaches the URL branch below;
@@ -327,30 +342,27 @@ async fn run(cli: &Cli) -> Result<u8> {
 
             if *stdin {
                 // Bound stdin reads by upload.max_file_mb (spec §12.3).
+                // Shared raw-byte read + size validation + UTF-8 conversion
+                // for both branches; the size failure is a Validation error
+                // so emit_error produces E_VALIDATION.
                 let max = kb.config().upload.max_file_mb.saturating_mul(1024 * 1024);
                 let read_cap = max.saturating_add(1);
-                if *base64 {
-                    let mut raw = Vec::new();
-                    std::io::stdin().take(read_cap).read_to_end(&mut raw)?;
-                    if raw.len() as u64 > max {
-                        anyhow::bail!("stdin exceeds upload.max_file_mb");
-                    }
-                    let content = String::from_utf8(raw)?;
-                    let result = kb.upload(build(None, None, Some(content))).await?;
-                    output(&result, &fmt)?;
-                } else {
-                    // Read raw bytes (byte-length check before UTF-8 decode,
-                    // matching the base64 branch), so a multibyte character
-                    // split by read_cap still yields E_VALIDATION.
-                    let mut raw = Vec::new();
-                    std::io::stdin().take(read_cap).read_to_end(&mut raw)?;
-                    if raw.len() as u64 > max {
-                        anyhow::bail!("stdin exceeds upload.max_file_mb");
-                    }
-                    let content = String::from_utf8(raw)?;
-                    let result = kb.upload(build(None, Some(content), None)).await?;
-                    output(&result, &fmt)?;
+                let mut raw = Vec::new();
+                std::io::stdin().take(read_cap).read_to_end(&mut raw)?;
+                if raw.len() as u64 > max {
+                    return Err(skb_core::error::SkbError::new(
+                        skb_core::error::ErrorCode::Validation,
+                        "stdin exceeds upload.max_file_mb",
+                    )
+                    .into());
                 }
+                let content = String::from_utf8(raw)?;
+                let result = if *base64 {
+                    kb.upload(build(None, None, Some(content))).await?
+                } else {
+                    kb.upload(build(None, Some(content), None)).await?
+                };
+                output(&result, &fmt)?;
             } else if url.is_some() {
                 // URL-only upload keeps the direct UploadResult shape; the
                 // URL is injected by build (url.clone()). This branch also
