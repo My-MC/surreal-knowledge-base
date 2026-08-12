@@ -9,13 +9,17 @@ use std::collections::HashMap;
 /// Practical upper bound for `top_k`; also keeps `fetch_k = top_k * 3` small.
 pub const MAX_TOP_K: usize = 1000;
 
+/// Maximum graph-expansion hop depth. Shared by the request validation and
+/// the JSON Schema so the two cannot drift.
+pub const MAX_GRAPH_EXPAND: usize = 5;
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SearchRequest {
     pub query: String,
     pub mode: Option<SearchMode>,
-    #[schemars(range(min = 1, max = 1000))]
+    #[schemars(range(min = 1, max = MAX_TOP_K))]
     pub top_k: Option<usize>,
-    #[schemars(range(min = 0, max = 5))]
+    #[schemars(range(min = 0, max = MAX_GRAPH_EXPAND))]
     pub graph_expand: Option<usize>,
     pub filter: Option<HashMap<String, String>>,
 }
@@ -43,10 +47,10 @@ impl SearchRequest {
             }
         }
         if let Some(depth) = self.graph_expand {
-            if depth > 5 {
+            if depth > MAX_GRAPH_EXPAND {
                 return Err(SkbError::new(
                     ErrorCode::Validation,
-                    "graph_expand must be at most 5",
+                    format!("graph_expand must be at most {MAX_GRAPH_EXPAND}"),
                 ));
             }
         }

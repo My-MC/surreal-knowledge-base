@@ -326,28 +326,23 @@ async fn run(cli: &Cli) -> Result<u8> {
 
             if *stdin {
                 // Bound stdin reads by upload.max_file_mb (spec §12.3).
+                // take(read_cap) caps the read; the explicit length check
+                // afterwards is a second gate for the same limit (defense in
+                // depth, symmetric with the base64 branch).
                 let max = kb.config().upload.max_file_mb.saturating_mul(1024 * 1024);
                 let read_cap = max.saturating_add(1);
-                if *base64 {
-                    let mut raw = Vec::new();
-                    std::io::stdin().take(read_cap).read_to_end(&mut raw)?;
-                    if raw.len() as u64 > max {
-                        anyhow::bail!("stdin exceeds upload.max_file_mb");
-                    }
-                    let content = String::from_utf8(raw)?;
-                    let result = kb.upload(build(None, None, Some(content))).await?;
-                    output(&result, &fmt)?;
-                } else {
-                    let mut content = String::new();
-                    std::io::stdin()
-                        .take(read_cap)
-                        .read_to_string(&mut content)?;
-                    if content.len() as u64 > max {
-                        anyhow::bail!("stdin exceeds upload.max_file_mb");
-                    }
-                    let result = kb.upload(build(None, Some(content), None)).await?;
-                    output(&result, &fmt)?;
+                let mut raw = Vec::new();
+                std::io::stdin().take(read_cap).read_to_end(&mut raw)?;
+                if raw.len() as u64 > max {
+                    anyhow::bail!("stdin exceeds upload.max_file_mb");
                 }
+                let content = String::from_utf8(raw)?;
+                let result = if *base64 {
+                    kb.upload(build(None, None, Some(content))).await?
+                } else {
+                    kb.upload(build(None, Some(content), None)).await?
+                };
+                output(&result, &fmt)?;
             } else if paths.len() > 1 {
                 // Multi-input uploads: successful uploads are committed and
                 // returned in `results`, failures are aggregated in `errors`
@@ -382,6 +377,11 @@ async fn run(cli: &Cli) -> Result<u8> {
                     let _ = std::io::stdout().flush();
                     return Ok(1);
                 }
+            } else if url.is_some() {
+                // URL-only upload keeps the direct UploadResult shape; the
+                // URL is injected by build (url.clone()).
+                let result = kb.upload(build(None, None, None)).await?;
+                output(&result, &fmt)?;
             } else if let Some(p) = paths.first() {
                 // Single collected input: use the discovered file (--recursive
                 // directories with exactly one file, or the plain positional

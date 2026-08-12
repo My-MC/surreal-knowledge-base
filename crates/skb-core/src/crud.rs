@@ -275,21 +275,46 @@ pub async fn delete_document(
 ) -> Result<DeleteResult, SkbError> {
     req.validate()?;
     let record_id = document_record_id(&req.id)?;
+    // Existence check, chunk deletion and document deletion share one
+    // transaction; every failure cancels, commit only on full success.
+    let tx = db
+        .db
+        .clone()
+        .begin()
+        .await
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete begin: {e}")))?;
     // RETURN BEFORE makes the deleted chunk records available as the query
     // result so chunks_deleted reflects the actual deletion count (SurrealDB
     // DELETE without RETURN returns an empty array).
     let query = "DELETE FROM chunk WHERE document = $id RETURN BEFORE; DELETE $id;";
-    let r = db
-        .db
+    let r = tx
         .query(query)
         .bind(("id", record_id))
         .await
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete: {e}")))?;
-    let deleted: Vec<serde_json::Value> = r
-        .check()
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete check: {e}")))?
-        .take(0)
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete take: {e}")))?;
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete: {e}")));
+    let r = match r {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = tx.cancel().await;
+            return Err(e);
+        }
+    };
+    let deleted: Vec<serde_json::Value> = match r.check() {
+        Ok(mut r) => match r.take(0) {
+            Ok(rows) => rows,
+            Err(e) => {
+                let _ = tx.cancel().await;
+                return Err(SkbError::new(ErrorCode::Db, format!("delete take: {e}")));
+            }
+        },
+        Err(e) => {
+            let _ = tx.cancel().await;
+            return Err(SkbError::new(ErrorCode::Db, format!("delete check: {e}")));
+        }
+    };
+    tx.commit()
+        .await
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete commit: {e}")))?;
 
     Ok(DeleteResult {
         document_id: req.id.clone(),

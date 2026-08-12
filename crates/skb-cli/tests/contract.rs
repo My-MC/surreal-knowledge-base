@@ -273,6 +273,29 @@ fn contract_upload_partial_failure() {
 }
 
 #[test]
+fn contract_upload_url_reaches_url_branch() {
+    setup_config();
+    // An unreachable URL must reach the URL upload flow (and fail with a
+    // fetch error) instead of the "no files to upload" usage error.
+    let output = Command::new(skb_binary())
+        .args(["upload", "--url", "http://127.0.0.1:1/x"])
+        .current_dir(test_dir())
+        .output()
+        .expect("failed to run skb upload --url");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stderr.contains("no files to upload"),
+        "URL must not fall through to the no-files error: {stderr}"
+    );
+    assert!(
+        stderr.contains("E_IO") || stdout.contains("E_IO") || !output.stdout.is_empty(),
+        "URL branch must produce a fetch result: stderr={stderr} stdout={stdout}"
+    );
+}
+
+#[test]
 fn contract_pipeline() {
     setup_config();
 

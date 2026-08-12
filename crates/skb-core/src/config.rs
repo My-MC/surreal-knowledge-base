@@ -232,7 +232,9 @@ impl Config {
             })?;
         }
         if let Some(v) = env_opt("SKB_SEARCH_DEFAULT_MODE")? {
-            self.search.default_mode = v.parse::<SearchMode>()?;
+            self.search.default_mode = v
+                .parse::<SearchMode>()
+                .with_context(|| format!("SKB_SEARCH_DEFAULT_MODE invalid, got '{v}'"))?;
         }
         if let Some(v) = env_opt("SKB_SEARCH_TOP_K")? {
             self.search.top_k = v
@@ -287,12 +289,8 @@ impl Config {
                 "chunking.max_tokens must be at least 1",
             ));
         }
-        if self.chunking.overlap_tokens == 0 {
-            return Err(SkbError::new(
-                ErrorCode::Validation,
-                "chunking.overlap_tokens must be at least 1",
-            ));
-        }
+        // overlap_tokens == 0 (no overlap) is valid; only overlap >= max is
+        // rejected below.
         if self.chunking.overlap_tokens >= self.chunking.max_tokens {
             return Err(SkbError::new(
                 ErrorCode::Validation,
@@ -423,7 +421,10 @@ mod tests {
 
     fn resolved_default() -> Config {
         Config::default()
-            .resolve_embedding_settings(crate::embed::MOCK_EMBEDDER_DIMENSION, 8192)
+            .resolve_embedding_settings(
+                crate::embed::MOCK_EMBEDDER_DIMENSION,
+                crate::embed::MOCK_EMBEDDER_MAX_INPUT_TOKENS,
+            )
             .unwrap()
     }
 
@@ -433,16 +434,11 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_zero_overlap() {
+    fn validate_accepts_zero_overlap() {
         let mut c = resolved_default();
         c.chunking.overlap_tokens = 0;
-        assert!(matches!(
-            c.validate(),
-            Err(SkbError {
-                code: ErrorCode::Validation,
-                ..
-            })
-        ));
+        // No-overlap chunking is valid (0 <= overlap < max).
+        c.validate().unwrap();
     }
 
     #[test]
@@ -477,7 +473,10 @@ mod tests {
         let mut c = Config::default();
         c.embedding.dimension = 16; // explicit value disagrees with detected 8
         assert!(matches!(
-            c.resolve_embedding_settings(8, 8192),
+            c.resolve_embedding_settings(
+                crate::embed::MOCK_EMBEDDER_DIMENSION,
+                crate::embed::MOCK_EMBEDDER_MAX_INPUT_TOKENS
+            ),
             Err(SkbError {
                 code: ErrorCode::Validation,
                 ..
@@ -490,7 +489,10 @@ mod tests {
         let mut c = Config::default();
         c.embedding.max_input_tokens = 4096;
         assert!(matches!(
-            c.resolve_embedding_settings(8, 8192),
+            c.resolve_embedding_settings(
+                crate::embed::MOCK_EMBEDDER_DIMENSION,
+                crate::embed::MOCK_EMBEDDER_MAX_INPUT_TOKENS
+            ),
             Err(SkbError {
                 code: ErrorCode::Validation,
                 ..
@@ -501,20 +503,34 @@ mod tests {
     #[test]
     fn resolve_fills_detected_values() {
         let c = Config::default()
-            .resolve_embedding_settings(8, 8192)
+            .resolve_embedding_settings(
+                crate::embed::MOCK_EMBEDDER_DIMENSION,
+                crate::embed::MOCK_EMBEDDER_MAX_INPUT_TOKENS,
+            )
             .unwrap();
         assert_eq!(c.embedding.dimension, 8);
-        assert_eq!(c.embedding.max_input_tokens, 8192);
+        assert_eq!(
+            c.embedding.max_input_tokens,
+            crate::embed::MOCK_EMBEDDER_MAX_INPUT_TOKENS
+        );
     }
 
     #[test]
     fn resolve_accepts_matching_explicit_values() {
         let mut c = Config::default();
         c.embedding.dimension = 8;
-        c.embedding.max_input_tokens = 8192;
-        let resolved = c.resolve_embedding_settings(8, 8192).unwrap();
+        c.embedding.max_input_tokens = crate::embed::MOCK_EMBEDDER_MAX_INPUT_TOKENS;
+        let resolved = c
+            .resolve_embedding_settings(
+                crate::embed::MOCK_EMBEDDER_DIMENSION,
+                crate::embed::MOCK_EMBEDDER_MAX_INPUT_TOKENS,
+            )
+            .unwrap();
         assert_eq!(resolved.embedding.dimension, 8);
-        assert_eq!(resolved.embedding.max_input_tokens, 8192);
+        assert_eq!(
+            resolved.embedding.max_input_tokens,
+            crate::embed::MOCK_EMBEDDER_MAX_INPUT_TOKENS
+        );
     }
 
     struct EnvGuard(Vec<(&'static str, Option<String>)>);
@@ -572,9 +588,16 @@ mod tests {
     fn load_works_without_config_file_when_env_set() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let _model = EnvGuard::set("SKB_EMBEDDING_MODEL", "env-only-model");
-        // No config file exists for this process cwd in CI; load() must fall
-        // back to defaults + env instead of failing.
+        // Run from an isolated cwd so ./skb.toml and the user config cannot
+        // be discovered; load() must fall back to defaults + env.
+        let original = std::env::current_dir().unwrap();
+        let isolated =
+            std::path::PathBuf::from(format!("./target/skb-config-test-{}", std::process::id()));
+        std::fs::create_dir_all(&isolated).unwrap();
+        std::env::set_current_dir(&isolated).unwrap();
         let config = Config::load().unwrap();
+        let _ = std::fs::remove_dir_all(&isolated);
+        std::env::set_current_dir(&original).unwrap();
         assert_eq!(config.embedding.model, "env-only-model");
     }
 }

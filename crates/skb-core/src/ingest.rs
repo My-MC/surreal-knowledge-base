@@ -354,11 +354,13 @@ async fn extract_document_data(
             .to_string();
         let config = config.clone();
         let raw = tokio::task::spawn_blocking(move || -> Result<RawInput, SkbError> {
-            validate_path(&path, &config)?;
-            let meta = std::fs::metadata(&path)
+            // The canonicalized path returned by validate_path is the one
+            // used for metadata, size validation and the read.
+            let canonical = validate_path(&path, &config)?;
+            let meta = std::fs::metadata(&canonical)
                 .map_err(|e| SkbError::new(ErrorCode::Io, format!("stat file: {e}")))?;
             check_size(meta.len(), &config)?;
-            let bytes = read_file_bytes(&path)?;
+            let bytes = read_file_bytes(&canonical)?;
             Ok(RawInput::Bytes(bytes))
         })
         .await
@@ -760,6 +762,7 @@ pub fn is_blocked_ip(ip: IpAddr) -> bool {
                 || v6.is_unique_local()
                 || v6.is_unicast_link_local()
                 || is_documentation_v6(v6)
+                || is_site_local_v6(v6)
                 || is_nat64_v6(v6)
                 || is_6to4_v6(v6)
                 || is_teredo_v6(v6)
@@ -808,9 +811,20 @@ fn is_reserved_v4(v4: std::net::Ipv4Addr) -> bool {
     v4.octets()[0] >= 240
 }
 
-/// 2001:db8::/32 — documentation range.
+/// 2001:db8::/32 — documentation range; 3ff0::/12 — documentation (RFC 9637
+/// assigns 3fff::/20; the broader /12 covers 3ff0::1 too, which documentation
+/// tooling commonly uses).
 fn is_documentation_v6(v6: std::net::Ipv6Addr) -> bool {
-    v6.segments()[0] == 0x2001 && v6.segments()[1] == 0x0db8
+    let s = v6.segments();
+    if s[0] == 0x2001 && s[1] == 0x0db8 {
+        return true;
+    }
+    s[0] & 0xfff0 == 0x3ff0
+}
+
+/// fec0::/10 — site-local (deprecated, still must be blocked).
+fn is_site_local_v6(v6: std::net::Ipv6Addr) -> bool {
+    v6.segments()[0] & 0xffc0 == 0xfec0
 }
 
 /// 64:ff9b::/96 — NAT64 well-known prefix (maps to IPv4 destinations).
@@ -842,20 +856,22 @@ fn base64_decode_checked(b64: &str, config: &Config) -> Result<Vec<u8>, SkbError
     Ok(bytes)
 }
 
-fn validate_path(path: &std::path::Path, config: &Config) -> Result<(), SkbError> {
-    let allowed = &config.upload.allowed_dirs;
-    if allowed.is_empty() {
-        return Ok(());
-    }
+fn validate_path(path: &std::path::Path, config: &Config) -> Result<std::path::PathBuf, SkbError> {
+    // Always canonicalize so the returned path is the one used for the
+    // subsequent metadata / read operations (no re-resolution window).
     let canonical = path
         .canonicalize()
         .map_err(|e| SkbError::new(ErrorCode::Io, format!("resolve path: {e}")))?;
+    let allowed = &config.upload.allowed_dirs;
+    if allowed.is_empty() {
+        return Ok(canonical);
+    }
     for dir in allowed {
         let can_dir = dir
             .canonicalize()
             .map_err(|e| SkbError::new(ErrorCode::Io, format!("resolve allowed dir: {e}")))?;
         if canonical.starts_with(&can_dir) {
-            return Ok(());
+            return Ok(canonical);
         }
     }
     Err(SkbError::new(
@@ -979,6 +995,9 @@ mod tests {
             "64:ff9b::7f00:1",
             "2002:7f00:0001::",
             "2001:0000:0:0:0:0:0101:0101",
+            "3ff0::1",
+            "3fff:1::1",
+            "fec0::1",
         ];
         for ip in extra_v6 {
             let ip: IpAddr = ip.parse().unwrap();
@@ -1086,13 +1105,12 @@ mod tests {
             MAX_REDIRECTS + 1,
         );
         let config = Config::default();
-        assert!(matches!(
-            fetch_url_with_validator(&url, &config, |_| Ok(())),
-            Err(SkbError {
-                code: ErrorCode::Io,
-                ..
-            })
-        ));
+        let err = fetch_url_with_validator(&url, &config, |_| Ok(())).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Io);
+        assert!(
+            err.to_string().contains("redirect"),
+            "must report the redirect cap, got: {err}"
+        );
     }
 
     #[test]
