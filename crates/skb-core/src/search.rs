@@ -296,7 +296,7 @@ async fn hybrid_search(
                 let content_lower = content.to_lowercase();
                 let filtered: Vec<String> = highlights
                     .iter()
-                    .filter(|t| content_lower.contains(&t.to_lowercase()))
+                    .filter(|t| content_lower.contains(t.as_str()))
                     .cloned()
                     .collect();
                 Some(filtered)
@@ -330,7 +330,7 @@ fn rows_to_hits(
             let content_lower = content.to_lowercase();
             terms
                 .iter()
-                .filter(|t| content_lower.contains(&t.to_lowercase()))
+                .filter(|t| content_lower.contains(t.as_str()))
                 .cloned()
                 .collect()
         });

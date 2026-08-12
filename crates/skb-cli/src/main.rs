@@ -157,7 +157,16 @@ fn output(val: &impl serde::Serialize, format: &str) -> Result<()> {
 fn collect_files(dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
+    // Canonicalized visited directories: a symlink pointing at an ancestor
+    // would otherwise loop forever. Directories are recorded (and skipped if
+    // already seen) before being pushed onto the stack.
+    let mut visited: std::collections::HashSet<std::path::PathBuf> =
+        std::collections::HashSet::new();
     while let Some(cur) = stack.pop() {
+        let canonical = cur.canonicalize().unwrap_or_else(|_| cur.clone());
+        if !visited.insert(canonical) {
+            continue;
+        }
         for entry in std::fs::read_dir(&cur)? {
             let entry = entry?;
             let path = entry.path();
@@ -244,6 +253,7 @@ async fn run(cli: &Cli) -> Result<u8> {
                     limit: Some(*limit),
                     offset: Some(*offset),
                     order,
+                    after: None,
                 })
                 .await?;
             output(&docs, &fmt)?;

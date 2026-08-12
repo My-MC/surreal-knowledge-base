@@ -361,7 +361,7 @@ impl KnowledgeBase {
     ) -> Result<reindex::ReindexResult, SkbError> {
         reindex::reindex(
             &self.db,
-            self.embedder.as_ref(),
+            self.embedder.clone(),
             self.tokenizer.as_ref(),
             &self.config,
             req,
@@ -785,6 +785,7 @@ mod tests {
                 limit: Some(10),
                 offset: Some(0),
                 order: None,
+                after: None,
             })
             .await
             .unwrap();
@@ -980,7 +981,7 @@ mod tests {
         let dim16 = MockEmbedder { dimension: 16 };
         let result = reindex::reindex(
             kb.db(),
-            &dim16,
+            std::sync::Arc::new(dim16),
             kb.tokenizer().as_ref(),
             kb.config(),
             &reindex::ReindexRequest::default(),
@@ -1052,7 +1053,7 @@ mod tests {
         };
         let err = reindex::reindex(
             kb.db(),
-            &broken,
+            std::sync::Arc::new(broken),
             kb.tokenizer().as_ref(),
             kb.config(),
             &reindex::ReindexRequest::default(),
@@ -1482,6 +1483,7 @@ mod tests {
                 limit: Some(10),
                 offset: Some(0),
                 order: None,
+                after: None,
             })
             .await
             .unwrap();
@@ -1523,6 +1525,7 @@ mod tests {
                 limit: Some(10),
                 offset: Some(0),
                 order: None,
+                after: None,
             })
             .await
             .unwrap();
@@ -1561,6 +1564,7 @@ mod tests {
                 limit: Some(10),
                 offset: Some(0),
                 order: None,
+                after: None,
             })
             .await
             .unwrap();
@@ -1779,6 +1783,7 @@ mod tests {
                 limit: Some(10),
                 offset: Some(0),
                 order: None,
+                after: None,
             })
             .await
             .unwrap();

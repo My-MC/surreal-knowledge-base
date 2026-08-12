@@ -603,11 +603,33 @@ mod tests {
     fn load_works_without_config_file_when_env_set() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let _model = EnvGuard::set("SKB_EMBEDDING_MODEL", "env-only-model");
-        // Construct from defaults and apply the environment overrides
-        // directly: independent of any ./skb.toml / find_config_path in the
-        // caller's cwd. The env value must win over the default config.
-        let mut config = Config::default();
-        config.apply_env_overrides().unwrap();
+        // Run Config::load() from an isolated cwd with no config file: it must
+        // fall back to defaults and apply the environment override.
+        let original = std::env::current_dir().unwrap();
+        let isolated =
+            std::path::PathBuf::from(format!("./target/skb-config-test-{}", std::process::id()));
+        std::fs::create_dir_all(&isolated).unwrap();
+        std::env::set_current_dir(&isolated).unwrap();
+        let _cwd_guard = CwdGuard::new(original);
+        let config = Config::load().unwrap();
+        let _ = std::fs::remove_dir_all(&isolated);
         assert_eq!(config.embedding.model, "env-only-model");
+    }
+
+    /// Restores the original current directory on drop, including on panic.
+    struct CwdGuard {
+        original: std::path::PathBuf,
+    }
+
+    impl CwdGuard {
+        fn new(original: std::path::PathBuf) -> Self {
+            Self { original }
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.original);
+        }
     }
 }

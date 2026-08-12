@@ -39,7 +39,8 @@ impl McpClient {
             .current_dir(dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            // Keep stderr visible so diagnostics survive test failures.
+            .stderr(Stdio::inherit())
             .spawn()
             .expect("failed to spawn skb-mcp (build with: cargo build -p skb-mcp)");
         let stdin = child.stdin.take().unwrap();
@@ -107,9 +108,13 @@ impl McpClient {
                         return msg;
                     }
                 }
-                Err(_) => {
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     let _ = self.child.kill();
                     panic!("timed out waiting for id {id}");
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    let _ = self.child.kill();
+                    panic!("MCP child stopped responding while waiting for id {id}");
                 }
             }
         }

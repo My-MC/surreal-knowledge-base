@@ -826,7 +826,7 @@ pub fn extract_entities(content: &str) -> Vec<EntityInfo> {
         let line = rest.split('\n').next().unwrap_or(rest);
         if let Some(cap) = heading_re.captures(line.trim_start()) {
             let heading = cap.get(1).map(|m| m.as_str()).unwrap_or("");
-            if heading.len() > 2 {
+            if heading.chars().count() > 2 {
                 entities.push(EntityInfo {
                     name: heading.trim().to_string(),
                     kind: "section".into(),
@@ -931,7 +931,7 @@ pub fn extract_sections(content: &str) -> Vec<Section> {
         if let Some(cap) = heading_re.captures(line.trim_start()) {
             let level = cap.get(1).map(|m| m.as_str().len()).unwrap_or(1) as u32;
             let name = cap.get(2).map(|m| m.as_str().trim()).unwrap_or("");
-            if name.len() > 2 {
+            if name.chars().count() > 2 {
                 sections.push(Section {
                     name: name.to_string(),
                     level,

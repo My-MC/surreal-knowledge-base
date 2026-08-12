@@ -28,6 +28,15 @@ pub struct SkbServer {
     reindexing: Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// Resets the reindexing flag on drop (including on panic/cancellation).
+struct ReindexGuard(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for ReindexGuard {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 impl SkbServer {
     pub fn new(kb: KnowledgeBase) -> Self {
         Self {
@@ -101,24 +110,30 @@ impl ServerHandler for SkbServer {
             // so it is never held across the paginated await calls.
             const MAX_DOCUMENTS_RESOURCE: usize = 10_000;
             let mut docs: Vec<skb_core::crud::DocumentSummary> = Vec::new();
-            let mut offset = 0;
+            // Keyset cursor: resume strictly after the last document of the
+            // previous page (created_at + unique id ordering) so pages never
+            // duplicate or skip rows while the store changes.
+            let mut after: Option<(String, String)> = None;
             loop {
                 let page = {
                     let kb = self.kb.lock().await;
                     kb.list_documents(&ListQuery {
                         limit: Some(100),
-                        offset: Some(offset),
-                        order: None,
+                        offset: None,
+                        order: Some(skb_core::crud::OrderBy::CreatedAsc),
+                        after: after.clone(),
                     })
                     .await
                     .map_err(err_data)?
                 };
+                if let Some(last) = page.last() {
+                    after = Some((last.created_at.clone(), last.id.clone()));
+                }
                 let page_len = page.len();
                 docs.extend(page);
                 if page_len < 100 || docs.len() > MAX_DOCUMENTS_RESOURCE {
                     break;
                 }
-                offset += 100;
             }
             let truncated = docs.len() > MAX_DOCUMENTS_RESOURCE;
             docs.truncate(MAX_DOCUMENTS_RESOURCE);
@@ -315,7 +330,7 @@ impl SkbServer {
         let args = req.arguments.unwrap_or_default();
         // While a reindex is running, other tools would block on the kb lock
         // for the whole operation; reject them immediately instead.
-        if req.name != "skb_reindex" && self.reindexing.load(std::sync::atomic::Ordering::Relaxed) {
+        if req.name != "skb_reindex" && self.reindexing.load(std::sync::atomic::Ordering::Acquire) {
             return Err("a reindex is in progress; retry after it completes".to_string());
         }
         let kb = self.kb.lock().await;
@@ -391,16 +406,27 @@ impl SkbServer {
                     .map_err(|e| format!("{e}"))
             }
             "skb_reindex" => {
-                self.reindexing
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                // Atomically claim the reindexing flag: a second concurrent
+                // skb_reindex is rejected. The guard resets the flag on drop,
+                // so cancellation or a panic cannot leave it set.
+                if self
+                    .reindexing
+                    .compare_exchange(
+                        false,
+                        true,
+                        std::sync::atomic::Ordering::AcqRel,
+                        std::sync::atomic::Ordering::Acquire,
+                    )
+                    .is_err()
+                {
+                    return Err("a reindex is already in progress".to_string());
+                }
+                let _guard = ReindexGuard(self.reindexing.clone());
                 // Release the kb guard before handle_reindex so that method
                 // reacquires it (and the reindexing flag is not held across
                 // the lock).
                 drop(kb);
-                let out = self.handle_reindex(Value::Object(args), context).await;
-                self.reindexing
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
-                out
+                self.handle_reindex(Value::Object(args), context).await
             }
             name => Err(format!("unknown tool: {name}")),
         }

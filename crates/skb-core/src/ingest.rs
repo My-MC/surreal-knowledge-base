@@ -831,9 +831,9 @@ fn fetch_url_with_validator(
 }
 
 /// Validate scheme and that the host resolves only to public addresses.
-/// Resolution happens immediately before the request so the validated answer
-/// is as fresh as possible (residual DNS-rebinding window is inherent to the
-/// transport; the resolver/connector pinning is not exposed by ureq).
+/// This is a pre-request, defense-in-depth check; the actual connection goes
+/// through the `SafeResolver` + `ureq::Agent::with_parts` path, which pins the
+/// request to the validated addresses so the DNS-rebinding window is closed.
 pub fn validate_url_host(url: &Url) -> Result<(), SkbError> {
     match url.scheme() {
         "http" | "https" => {}

@@ -33,13 +33,18 @@ pub struct ReindexRequest {
 /// - Model or dimension change: the schema (embedding field + HNSW index) is
 ///   redefined and every document rebuilt. The transition is split into
 ///   atomic steps because SurrealDB's `DEFINE INDEX` rebuild cannot see
-///   uncommitted deletes inside the same transaction; each step is idempotent
-///   and the stored `meta` is only updated at the end, so any interruption
-///   leaves a detectable `E_MODEL_MISMATCH` state that a re-run of `reindex`
-///   completes (spec §9-5).
+///   uncommitted deletes inside the same transaction; each step is idempotent.
+/// - Interruption/recovery is tracked via the `reindex_in_progress` marker:
+///   "dim" means a dimension transition was interrupted and the next run
+///   re-executes the dimension-change path (transition + redefine_index);
+///   "meta" means a metadata/tokenizer interruption, recovered by
+///   rebuild_all + update_metas without wiping chunks/indexes/fields.
+///   Metadata may be updated before rebuild_all (the transition writes the
+///   new dimension immediately); recovery is determined by the marker, not
+///   by "metadata updated only at the end".
 pub async fn reindex(
     db: &Db,
-    embedder: &dyn Embed,
+    embedder: std::sync::Arc<dyn Embed>,
     tokenizer: &dyn Tokenize,
     config: &Config,
     req: &ReindexRequest,
@@ -160,7 +165,7 @@ pub async fn reindex(
             .await?;
         db.set_meta("embedding_model", &config.embedding.model)
             .await?;
-        result = rebuild_all(db, embedder, tokenizer, config, &docs, progress).await?;
+        result = rebuild_all(db, embedder.clone(), tokenizer, config, &docs, progress).await?;
         // 2. Rebuild the HNSW index over the fresh new-dimension chunks.
         let tx = db
             .db
@@ -180,12 +185,12 @@ pub async fn reindex(
                 return Err(e);
             }
         }
-        update_metas(db, embedder, tokenizer, config).await?;
+        update_metas(db, embedder.as_ref(), tokenizer, config).await?;
     } else {
-        result = rebuild_all(db, embedder, tokenizer, config, &docs, progress).await?;
+        result = rebuild_all(db, embedder.clone(), tokenizer, config, &docs, progress).await?;
         // Always refresh metadata after a successful rebuild: even a
         // tokenizer-only change must record the new fingerprint (§5.4).
-        update_metas(db, embedder, tokenizer, config).await?;
+        update_metas(db, embedder.as_ref(), tokenizer, config).await?;
     }
 
     // Reindex completed: delete the in-progress marker (set above), then
@@ -243,7 +248,7 @@ async fn redefine_index(tx: &LocalTransaction, dimension: usize) -> Result<(), S
 /// (spec §5.4).
 async fn rebuild_all(
     db: &Db,
-    embedder: &dyn Embed,
+    embedder: std::sync::Arc<dyn Embed>,
     tokenizer: &dyn Tokenize,
     config: &Config,
     docs: &[serde_json::Value],
@@ -280,7 +285,13 @@ async fn rebuild_all(
             continue;
         }
         let texts: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
-        let embeddings = embed_in_batches(embedder, &texts, config.embedding.batch_size)?;
+        let batch_size = config.embedding.batch_size;
+        let embedder = embedder.clone();
+        let embeddings = tokio::task::spawn_blocking(move || {
+            embed_in_batches(embedder.as_ref(), &texts, batch_size)
+        })
+        .await
+        .map_err(|e| SkbError::new(ErrorCode::Io, format!("embed join: {e}")))??;
 
         // begin -> rebuild_document -> commit retried as a whole on retryable
         // write conflicts (embedded SurrealKV; a transaction cannot be
@@ -350,7 +361,6 @@ async fn update_metas(
     }
 }
 
-/// Replace one document's chunks and mentions within the supplied transaction.
 /// Rebuild one document's chunks within a transaction, retrying the whole
 /// begin -> rebuild -> commit sequence on retryable write conflicts (embedded
 /// SurrealKV; a transaction cannot be re-committed, so a fresh one is started

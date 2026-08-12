@@ -9,6 +9,7 @@ import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
+import { rmSync } from "node:fs";
 
 const bin = process.argv[2];
 if (!bin) {
@@ -33,23 +34,46 @@ let nextId = 1;
 // Every failure path must terminate the child before exiting so its
 // SurrealKV file handles are released (the smoke DB is under ./target).
 let shuttingDown = false;
+
+// Remove the per-process database directory; called only after the child has
+// exited so its file handles are already released.
+function cleanupDb() {
+  try {
+    rmSync(dbPath, { recursive: true, force: true });
+  } catch {}
+}
+
 function fail(message) {
   console.error("FAIL: " + message);
   shuttingDown = true;
   try {
     child.kill();
   } catch {}
-  process.exit(1);
+  child.once("exit", () => {
+    cleanupDb();
+    process.exit(1);
+  });
+  setTimeout(() => {
+    cleanupDb();
+    process.exit(1);
+  }, 5000).unref();
 }
 
 child.on("exit", () => {
   shuttingDown = true;
+  cleanupDb();
 });
 
 // A spawn failure (missing binary, permission denied) must fail the smoke
 // run with a clear message instead of hanging on the response wait.
 child.on("error", (err) => {
   fail(`cannot start MCP binary '${bin}': ${err.message}`);
+});
+
+// EPIPE / early server termination while writing requests must fail the run
+// instead of surfacing as an uncaught exception.
+child.stdin.on("error", (err) => {
+  fail(`MCP stdin error: ${err.message}`);
 });
 
 rl.on("line", (line) => {
@@ -136,5 +160,12 @@ assert(searchText.includes("smoke-doc"), "skb_search must find the uploaded docu
 
 console.log("SMOKE OK");
 shuttingDown = true;
+child.once("exit", () => {
+  cleanupDb();
+  process.exit(0);
+});
 child.kill();
-process.exit(0);
+setTimeout(() => {
+  cleanupDb();
+  process.exit(0);
+}, 5000).unref();

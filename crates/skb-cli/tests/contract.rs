@@ -111,6 +111,7 @@ fn core_list() -> Value {
                 limit: Some(10),
                 offset: Some(0),
                 order: None,
+                after: None,
             })
             .await
             .unwrap();

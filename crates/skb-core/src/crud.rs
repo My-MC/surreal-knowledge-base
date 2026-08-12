@@ -98,13 +98,29 @@ const MAX_LIST_LIMIT: usize = 10_000;
 /// records before returning, so cap it to bound per-request CPU/IO.
 const MAX_LIST_OFFSET: usize = 1_000_000;
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ListQuery {
     #[schemars(range(min = 1, max = MAX_LIST_LIMIT))]
     pub limit: Option<usize>,
     #[schemars(range(min = 0, max = MAX_LIST_OFFSET))]
     pub offset: Option<usize>,
     pub order: Option<OrderBy>,
+    /// Keyset cursor: resume strictly after the document with this
+    /// `created_at` / `id` pair (deterministic pagination). Ignored when
+    /// `None`.
+    #[serde(default)]
+    pub after: Option<(String, String)>,
+}
+
+impl Default for ListQuery {
+    fn default() -> Self {
+        Self {
+            limit: None,
+            offset: None,
+            order: Some(OrderBy::CreatedDesc),
+            after: None,
+        }
+    }
 }
 
 impl ListQuery {
@@ -199,24 +215,52 @@ pub async fn list_documents(db: &Db, q: &ListQuery) -> Result<Vec<DocumentSummar
     q.validate()?;
     let limit = q.limit.unwrap_or(50);
     let offset = q.offset.unwrap_or(0);
-    let order_by = q.order.map_or("created_at DESC", OrderBy::to_surql);
+    // Deterministic ordering with the record id as tie-breaker; the keyset
+    // cursor below relies on it.
+    let order_by = match q.order {
+        Some(o) => format!("{}, id", OrderBy::to_surql(o)),
+        None => "created_at DESC, id".to_string(),
+    };
+    // Keyset cursor: resume strictly after the given document key. The
+    // cursor value is bound (never interpolated), so it is safe.
+    let cursor_clause = match &q.after {
+        Some(_) => " AND meta::id(id) > $after".to_string(),
+        None => String::new(),
+    };
     let query = format!(
         "SELECT string::concat('document:', meta::id(id)) AS id, \
          title, source, sha256, created_at \
-         FROM document ORDER BY {order_by} LIMIT {limit} START {offset}"
+         FROM document WHERE true{cursor_clause} ORDER BY {order_by} LIMIT {limit} START {offset}"
     );
-    let mut r = db
-        .db
-        .query(&query)
-        .await
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("list: {e}")))?;
+    let mut r = if q.after.is_some() {
+        let after_key = q
+            .after
+            .as_ref()
+            .map(|(_, id)| id.clone())
+            .unwrap_or_default();
+        db.db
+            .query(&query)
+            .bind(("after", after_key))
+            .await
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("list: {e}")))?
+    } else {
+        db.db
+            .query(&query)
+            .await
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("list: {e}")))?
+    };
     let rows: Vec<serde_json::Value> = r
         .take(0)
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("list take: {e}")))?;
 
     // Per-document chunk counts restricted to the documents on this page
     // (the count query reuses the fetched ids instead of grouping every chunk
-    // row in the table). Direct RecordId comparison: the page ids are
+    // row in the table). An empty page exits before id parsing or the
+    // aggregation query.
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Direct RecordId comparison: the page ids are
     // `document:<key>` strings parsed back into record ids via the shared
     // document_record_id helper (validate_document_id + RecordId::new), so
     // escaped keys are handled the same way as every other document id path.
@@ -235,10 +279,6 @@ pub async fn list_documents(db: &Db, q: &ListQuery) -> Result<Vec<DocumentSummar
             }
         })
         .collect();
-    // Skip the aggregation entirely for an empty page (no rows to count).
-    if rows.is_empty() {
-        return Ok(Vec::new());
-    }
     let mut r = db
         .db
         .query(
