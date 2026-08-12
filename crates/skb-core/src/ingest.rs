@@ -354,8 +354,8 @@ async fn store_and_index(
         tx.query(
             "DELETE FROM related_to WHERE relation = 'part-of' \
              AND in = $child \
-             AND $child IN (SELECT VALUE ->mentions->entity FROM chunk \
-                            WHERE document = $document)",
+             AND $child IN array::flatten(SELECT VALUE ->mentions->entity \
+                                          FROM chunk WHERE document = $document)",
         )
         .bind(("child", graph::entity_record_id(&section.name)?))
         .bind(("document", document.clone()))
@@ -565,8 +565,18 @@ async fn extract_pdf_checked(bytes: &[u8]) -> Result<String, SkbError> {
         .acquire()
         .await
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("pdf semaphore: {e}")))?;
+    // The permit wait consumed part of the shared wall-clock budget; the
+    // remaining time bounds the parse itself. If nothing is left, do not
+    // launch the blocking job at all.
+    let remaining = Duration::from_secs(MAX_PROCESS_SECONDS).saturating_sub(start.elapsed());
+    if remaining.is_zero() {
+        return Err(SkbError::new(
+            ErrorCode::Validation,
+            "pdf semaphore wait exceeded time limit",
+        ));
+    }
     let doc = tokio::time::timeout(
-        Duration::from_secs(MAX_PROCESS_SECONDS),
+        remaining,
         tokio::task::spawn_blocking({
             let shared = shared.clone();
             move || {

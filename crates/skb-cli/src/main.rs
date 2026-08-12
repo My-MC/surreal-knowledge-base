@@ -486,13 +486,22 @@ async fn run(cli: &Cli) -> Result<u8> {
             let config = cfg()?;
             let kb = skb_core::KnowledgeBase::open_or_for_reindex(config).await?;
             let req = skb_core::reindex::ReindexRequest { dry_run: *dry_run };
-            let progress = |done: usize, total: usize| {
-                eprint!("\rreindexed {done}/{total}");
-                let _ = std::io::Write::flush(&mut std::io::stderr());
+            // Live \r-based progress only on a terminal; for piped stderr
+            // (CI logs) suppress intermediate updates.
+            let stderr_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
+            let progress = move |done: usize, total: usize| {
+                if stderr_tty {
+                    eprint!("\rreindexed {done}/{total}");
+                    let _ = std::io::Write::flush(&mut std::io::stderr());
+                }
             };
             let result = kb.reindex(&req, Some(&progress)).await?;
             if !*dry_run {
-                eprintln!();
+                if stderr_tty {
+                    eprintln!();
+                } else {
+                    eprintln!("reindexed {} documents", result.documents_processed);
+                }
             }
             output(&result, &fmt)?;
         }

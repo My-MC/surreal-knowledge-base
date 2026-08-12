@@ -237,6 +237,7 @@ async fn hybrid_search(
         document: String,
         title: Option<String>,
         source: Option<String>,
+        keyword_matched: bool,
     }
     let rrf_k = rrf_k.max(1) as f64;
     let mut scores: HashMap<String, RankedHit> = HashMap::new();
@@ -251,6 +252,7 @@ async fn hybrid_search(
             document: row["document"].as_str().unwrap_or("").to_string(),
             title: row["title"].as_str().map(|s| s.to_string()),
             source: row["source"].as_str().map(|s| s.to_string()),
+            keyword_matched: false,
         });
     }
 
@@ -260,6 +262,7 @@ async fn hybrid_search(
         let rrf = 1.0 / (rrf_k + (rank as f64 + 1.0));
         if let Some(e) = scores.get_mut(&id) {
             e.score += rrf;
+            e.keyword_matched = true;
         } else {
             scores.insert(
                 id,
@@ -270,6 +273,7 @@ async fn hybrid_search(
                     document: row["document"].as_str().unwrap_or("").to_string(),
                     title: row["title"].as_str().map(|s| s.to_string()),
                     source: row["source"].as_str().map(|s| s.to_string()),
+                    keyword_matched: true,
                 },
             );
         }
@@ -292,7 +296,13 @@ async fn hybrid_search(
             score: hit.score,
             title: hit.title,
             source: hit.source,
-            highlights: Some(highlights.clone()),
+            // Only keyword-matched chunks get highlights; vector-only hits
+            // keep None (spec §6).
+            highlights: if hit.keyword_matched {
+                Some(highlights.clone())
+            } else {
+                None
+            },
             matched_entities: None,
         })
         .collect())
@@ -304,14 +314,25 @@ fn rows_to_hits(
 ) -> Result<Vec<SearchHit>, SkbError> {
     let mut hits = Vec::new();
     for row in rows {
+        let content = row["content"].as_str().unwrap_or("").to_string();
+        // Only terms actually present in this chunk's content are highlighted
+        // (the query terms were computed globally, not per hit).
+        let hit_highlights: Option<Vec<String>> = highlights.map(|terms| {
+            let content_lower = content.to_lowercase();
+            terms
+                .iter()
+                .filter(|t| content_lower.contains(&t.to_lowercase()))
+                .cloned()
+                .collect()
+        });
         hits.push(SearchHit {
             document_id: row["document"].as_str().unwrap_or("").to_string(),
             chunk_idx: row["idx"].as_u64().unwrap_or(0) as usize,
-            content: row["content"].as_str().unwrap_or("").to_string(),
+            content,
             score: row["score"].as_f64().unwrap_or(0.0),
             title: row["title"].as_str().map(|s| s.to_string()),
             source: row["source"].as_str().map(|s| s.to_string()),
-            highlights: highlights.cloned(),
+            highlights: hit_highlights,
             matched_entities: None,
         });
     }
@@ -319,11 +340,11 @@ fn rows_to_hits(
 }
 
 /// The query terms that a keyword search can highlight: whitespace/punctuation
-/// separated words of at least two characters.
+/// separated words of at least two characters (Unicode chars, not bytes).
 fn match_terms(query: &str) -> Vec<String> {
     let mut terms: Vec<String> = query
         .split(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
-        .filter(|t| t.len() >= 2)
+        .filter(|t| t.chars().count() >= 2)
         .map(|t| t.to_lowercase())
         .collect();
     terms.sort();

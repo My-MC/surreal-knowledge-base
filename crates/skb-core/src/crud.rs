@@ -308,21 +308,36 @@ pub async fn delete_document(
         .bind(("id", record_id.clone()))
         .await
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete count: {e}")))?;
-    let count_rows: Vec<serde_json::Value> = c
-        .take(0)
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete count take: {e}")))?;
+    let count_rows: Vec<serde_json::Value> = match c.take(0) {
+        Ok(rows) => rows,
+        Err(e) => {
+            let _ = tx.cancel().await;
+            return Err(SkbError::new(
+                ErrorCode::Db,
+                format!("delete count take: {e}"),
+            ));
+        }
+    };
     let chunks_deleted = count_rows
         .first()
         .and_then(|r| r["c"].as_u64())
         .unwrap_or(0) as usize;
 
     let query = "DELETE FROM chunk WHERE document = $id; DELETE $id;";
-    tx.query(query)
+    let r = tx
+        .query(query)
         .bind(("id", record_id))
         .await
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete: {e}")))?
-        .check()
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete check: {e}")))?;
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete: {e}")));
+    if let Err(e) = r {
+        let _ = tx.cancel().await;
+        return Err(e);
+    }
+    let r = r.unwrap();
+    if let Err(e) = r.check() {
+        let _ = tx.cancel().await;
+        return Err(SkbError::new(ErrorCode::Db, format!("delete check: {e}")));
+    }
     tx.commit()
         .await
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete commit: {e}")))?;

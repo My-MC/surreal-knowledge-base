@@ -418,6 +418,11 @@ impl SkbServer {
                         });
                         // The latest (done, total) is retained separately so the
                         // final value can be re-enqueued with an awaited send.
+                        // Regular notifications are throttled to every
+                        // PROGRESS_EVERY-th item; the retained final value
+                        // always delivers the completion even when total is
+                        // not divisible by 10.
+                        const PROGRESS_EVERY: usize = 10;
                         let latest = std::sync::Arc::new(std::sync::Mutex::new(None));
                         let latest_cb = latest.clone();
                         let tx_cb = tx.clone();
@@ -425,6 +430,9 @@ impl SkbServer {
                             Box::new(move |done: usize, total: usize| {
                                 if let Ok(mut guard) = latest_cb.lock() {
                                     *guard = Some((done, total));
+                                }
+                                if done != total && !done.is_multiple_of(PROGRESS_EVERY) {
+                                    return;
                                 }
                                 let _ = tx_cb.try_send((done, total));
                             });
@@ -452,7 +460,11 @@ impl SkbServer {
                             let _ = tx.send((done, total)).await;
                         }
                         drop(tx);
-                        let _ = forwarder.await;
+                        // Await the forwarder with a bounded timeout so a
+                        // stalled peer cannot hang the tool indefinitely;
+                        // on expiry the forwarder task is aborted.
+                        let _ = tokio::time::timeout(std::time::Duration::from_secs(30), forwarder)
+                            .await;
                         r
                     }
                     None => kb

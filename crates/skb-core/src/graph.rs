@@ -959,9 +959,12 @@ pub(crate) async fn link_section_hierarchy(
             stack.pop();
         }
         if let Some((parent, _)) = stack.last() {
+            // Insert with the empty description for NEW section entities; an
+            // existing entity (e.g. an LLM-extracted one with a real
+            // description) keeps its current description.
             let upsert_sql = "INSERT INTO entity (id, name, kind, description) \
                               VALUES ($id, $name, $kind, $description) \
-                              ON DUPLICATE KEY UPDATE description = $description";
+                              ON DUPLICATE KEY UPDATE name = $name";
             // Both endpoints of the part-of edge are sections; upsert the
             // parent (ancestor) and the child (current section) so the child
             // exists as an entity even when it is a leaf with no descendants.

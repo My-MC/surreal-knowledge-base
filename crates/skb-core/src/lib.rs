@@ -99,17 +99,22 @@ impl KnowledgeBase {
     }
 
     /// Retry-open the reindex management path, absorbing transient file-lock
-    /// races from a previous in-process connection.
+    /// races from a previous in-process connection. Only `ErrorCode::Db`
+    /// errors are retried (sleeping between attempts, never after the final
+    /// one); all other errors return immediately.
     async fn open_for_reindex_retrying(config: Config) -> Result<Self, SkbError> {
         const ATTEMPTS: usize = 8;
         let mut last = None;
-        for _ in 0..ATTEMPTS {
+        for attempt in 0..ATTEMPTS {
             match Self::open_for_reindex(config.clone()).await {
                 Ok(kb) => return Ok(kb),
-                Err(e) => {
+                Err(e) if e.code == ErrorCode::Db => {
                     last = Some(e);
-                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    if attempt + 1 < ATTEMPTS {
+                        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    }
                 }
+                Err(e) => return Err(e),
             }
         }
         Err(last.expect("ATTEMPTS is non-zero"))

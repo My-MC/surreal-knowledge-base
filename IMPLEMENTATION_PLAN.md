@@ -42,7 +42,7 @@
 | Phase | 内容 | 状態 | 主な不足 |
 |---|---|---|---|
 | 0 | 技術検証スパイク | 部分完了 | 0-2/0-3の検証証跡を成果物として整理する |
-| 1 | `skb-core` 基盤 | 完了 | 設定検証（9-1）、入力安全性・DTO（9-2/9-3）、CRUD件数・検索応答（9-4/9-6）はすべて実装済み |
+| 1 | `skb-core` 基盤 | 完了 | 設定検証（9-1）、入力安全性・DTO（9-2/9-3）は実装済み。CRUD件数（chunk_count）と検索応答は 9-4/9-6 の項を参照 |
 | 2 | グラフ + reindex | 完了 | N-hop、再ランク、dimension/HNSW/meta整合性（9-4/9-5）はすべて実装済み |
 | 3 | CLI | 部分完了 | 仕様上の入力形式、glob、JSON doctor、queryの不足（reindex progressは実装済み） |
 | 4 | MCP | 部分完了 | reindex progress（notifications/progress）は実装済み。upload progressは対象外（文書ごとのサイズ制限により単発完了応答で十分） |
