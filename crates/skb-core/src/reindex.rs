@@ -169,9 +169,9 @@ pub async fn reindex(
         // tokenizer-only change must record the new fingerprint (§5.4).
         update_metas(db, embedder, tokenizer, config).await?;
     }
-    // The rebuild completed successfully: clear the in-progress marker so the
-    // store opens normally with the new config.
-    db.set_meta("reindex_in_progress", "0").await?;
+    // The rebuild completed successfully: delete the in-progress marker so
+    // the store opens normally with the new config.
+    crate::db::delete_meta(&db.db, "reindex_in_progress").await?;
 
     // Guarantee the final progress notification reaches 100% even when the
     // loop skipped documents (e.g. empty content), so clients see completion.
@@ -185,13 +185,33 @@ pub async fn reindex(
 type LocalTransaction = surrealdb::method::Transaction<surrealdb::engine::local::Db>;
 
 /// Wipe old chunks/mentions and redefine the embedding field for a new
-/// dimension. Atomic: on failure nothing is committed.
+/// dimension. Atomic: on failure nothing is committed. The wipe time and
+/// affected chunk count are logged so the operational impact of the full
+/// single-transaction delete can be assessed (batch deletion is a later
+/// follow-up; atomicity is preserved here).
 async fn transition_dimension(tx: &LocalTransaction, dimension: usize) -> Result<(), SkbError> {
+    let start = std::time::Instant::now();
+    let mut count_r = tx
+        .query("SELECT count() AS c FROM chunk GROUP ALL")
+        .await
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex wipe count: {e}")))?;
+    let count_rows: Vec<serde_json::Value> = count_r
+        .take(0)
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex wipe count take: {e}")))?;
+    let chunk_count = count_rows
+        .first()
+        .and_then(|v| v["c"].as_u64())
+        .unwrap_or(0);
     tx.query("DELETE FROM mentions; DELETE FROM chunk;")
         .await
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex wipe: {e}")))?
         .check()
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex wipe check: {e}")))?;
+    tracing::info!(
+        elapsed_ms = start.elapsed().as_millis(),
+        chunks = chunk_count,
+        "reindex dimension wipe completed"
+    );
     let sql = format!(
         "REMOVE INDEX IF EXISTS chunk_embedding_hnsw ON chunk; \
          REMOVE FIELD IF EXISTS embedding ON chunk; \

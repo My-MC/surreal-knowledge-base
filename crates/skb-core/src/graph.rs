@@ -623,7 +623,7 @@ pub async fn expand_search_hits(
                     document.title AS title, document.source AS source, \
                     ->mentions->entity.name AS e \
                     FROM chunk WHERE ->mentions->entity.name IN $names \
-                    LIMIT 200";
+                    ORDER BY document, idx LIMIT 200";
         let mut r = db
             .db
             .query(esql)
@@ -642,11 +642,17 @@ pub async fn expand_search_hits(
             }
             // The entity used for decay must be one present in decay_map, so
             // matched_entities stays consistent with the score applied.
+            // Equal decays break ties by entity name so the selection is
+            // independent of matched iteration order.
             let matched = to_string_vec(&erow["e"]);
             let (decay, entity) = matched
                 .iter()
                 .filter_map(|e| decay_map.get(e).map(|d| (d, e.clone())))
-                .max_by(|a, b| a.0.partial_cmp(b.0).unwrap_or(std::cmp::Ordering::Equal))
+                .max_by(|a, b| {
+                    a.0.partial_cmp(b.0)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| b.1.cmp(&a.1))
+                })
                 .unwrap_or((&1.0, matched.into_iter().next().unwrap_or_default()));
             expanded.push(SearchHit {
                 document_id,

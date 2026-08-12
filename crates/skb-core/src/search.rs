@@ -120,6 +120,52 @@ pub async fn search(
     })
 }
 
+/// Build the vector-search SQL for a serialized query embedding. Extracted so
+/// tests can pin the exact generated statement (including the deterministic
+/// ORDER BY tie-breaker) against the real implementation.
+pub(crate) fn vector_sql(emb_str: &str, top_k: usize) -> String {
+    format!(
+        "SELECT content, idx, string::concat('document:', meta::id(document)) AS document_key, \
+         document.title AS title, document.source AS source, \
+         vector::similarity::cosine(embedding, {emb_str}) AS score \
+         FROM chunk WHERE embedding <|{top_k},40|> {emb_str} \
+         ORDER BY score DESC, document_key, idx LIMIT {top_k}"
+    )
+}
+
+/// Build the keyword-search SQL. Extracted so tests can pin the generated
+/// statement (deterministic tie-breaker included).
+pub(crate) fn keyword_sql(top_k: usize) -> String {
+    format!(
+        "SELECT content, idx, string::concat('document:', meta::id(document)) AS document_key, \
+         document.title AS title, document.source AS source, search::score(0) AS score \
+         FROM chunk WHERE content @0@ $q ORDER BY score DESC, document_key, idx LIMIT {top_k}"
+    )
+}
+
+/// Build the hybrid vector-leg SQL. Extracted for the same test-pinning
+/// reasons as vector_sql.
+pub(crate) fn hybrid_vector_sql(emb_str: &str, fetch_k: usize) -> String {
+    format!(
+        "SELECT content, idx, meta::id(id) AS chunk_id, \
+         string::concat('document:', meta::id(document)) AS document_key, \
+         document.title AS title, document.source AS source, \
+         vector::similarity::cosine(embedding, {emb_str}) AS score \
+         FROM chunk WHERE embedding <|{fetch_k},40|> {emb_str} \
+         ORDER BY score DESC, document_key, idx"
+    )
+}
+
+/// Build the hybrid keyword-leg SQL.
+pub(crate) fn hybrid_keyword_sql(fetch_k: usize) -> String {
+    format!(
+        "SELECT content, idx, meta::id(id) AS chunk_id, \
+         string::concat('document:', meta::id(document)) AS document_key, \
+         document.title AS title, document.source AS source, search::score(0) AS score \
+         FROM chunk WHERE content @0@ $q ORDER BY score DESC, document_key, idx LIMIT {fetch_k}"
+    )
+}
+
 async fn vector_search(
     db: &Db,
     embedder: &dyn Embed,
@@ -133,13 +179,7 @@ async fn vector_search(
         .ok_or_else(|| SkbError::new(ErrorCode::Embedding, "no embedding"))?;
 
     let emb_str = serde_json::to_string(&query_emb).unwrap_or_default();
-    let sql = format!(
-        "SELECT content, idx, string::concat('document:', meta::id(document)) AS document_key, \
-         document.title AS title, document.source AS source, \
-         vector::similarity::cosine(embedding, {emb_str}) AS score \
-         FROM chunk WHERE embedding <|{top_k},40|> {emb_str} \
-         ORDER BY score DESC, document_key, idx LIMIT {top_k}"
-    );
+    let sql = vector_sql(&emb_str, top_k);
 
     let mut r = db
         .db
@@ -154,11 +194,7 @@ async fn vector_search(
 }
 
 async fn keyword_search(db: &Db, query: &str, top_k: usize) -> Result<Vec<SearchHit>, SkbError> {
-    let sql = format!(
-        "SELECT content, idx, string::concat('document:', meta::id(document)) AS document_key, \
-         document.title AS title, document.source AS source, search::score(0) AS score \
-         FROM chunk WHERE content @0@ $q ORDER BY score DESC, document_key, idx LIMIT {top_k}"
-    );
+    let sql = keyword_sql(top_k);
 
     let mut r = db
         .db
@@ -193,14 +229,7 @@ async fn hybrid_search(
     let emb_str = serde_json::to_string(&query_emb).unwrap_or_default();
 
     // Vector results
-    let vsql = format!(
-        "SELECT content, idx, meta::id(id) AS chunk_id, \
-         string::concat('document:', meta::id(document)) AS document_key, \
-         document.title AS title, document.source AS source, \
-         vector::similarity::cosine(embedding, {emb_str}) AS score \
-         FROM chunk WHERE embedding <|{fetch_k},40|> {emb_str} \
-         ORDER BY score DESC, document_key, idx"
-    );
+    let vsql = hybrid_vector_sql(&emb_str, fetch_k);
     let mut r = db
         .db
         .query(&vsql)
@@ -211,12 +240,7 @@ async fn hybrid_search(
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("hybrid vec take: {e}")))?;
 
     // Keyword results
-    let ksql = format!(
-        "SELECT content, idx, meta::id(id) AS chunk_id, \
-         string::concat('document:', meta::id(document)) AS document_key, \
-         document.title AS title, document.source AS source, search::score(0) AS score \
-         FROM chunk WHERE content @0@ $q ORDER BY score DESC, document_key, idx LIMIT {fetch_k}"
-    );
+    let ksql = hybrid_keyword_sql(fetch_k);
     let mut r = db
         .db
         .query(&ksql)
@@ -535,14 +559,7 @@ mod tests {
 
     #[test]
     fn vector_search_orders_ties_by_document_then_idx() {
-        let emb = format!("vector::similarity::cosine(embedding, {})", "[0.1,0.2,0.3]");
-        let sql = format!(
-            "SELECT content, idx, string::concat('document:', meta::id(document)) AS document_key, \
-             document.title AS title, document.source AS source, \
-             {emb} AS score \
-             FROM chunk WHERE embedding <|10,40|> {emb} \
-             ORDER BY score DESC, document_key, idx LIMIT 10"
-        );
+        let sql = vector_sql("[0.1,0.2,0.3]", 10);
         assert!(
             sql.contains(TIE_BREAKER),
             "vector search must order equal scores by (document, idx): {sql}"
@@ -551,11 +568,7 @@ mod tests {
 
     #[test]
     fn keyword_search_orders_ties_by_document_then_idx() {
-        let sql = format!(
-            "SELECT content, idx, string::concat('document:', meta::id(document)) AS document_key, \
-             document.title AS title, document.source AS source, search::score(0) AS score \
-             FROM chunk WHERE content @0@ $q {TIE_BREAKER} LIMIT 10"
-        );
+        let sql = keyword_sql(10);
         assert!(
             sql.contains(TIE_BREAKER),
             "keyword search must order equal scores by (document, idx): {sql}"
@@ -565,24 +578,13 @@ mod tests {
     #[test]
     fn hybrid_queries_order_ties_by_document_then_idx() {
         // Vector leg
-        let vsql = format!(
-            "SELECT content, idx, meta::id(id) AS chunk_id, \
-             string::concat('document:', meta::id(document)) AS document_key, \
-             document.title AS title, document.source AS source, \
-             vector::similarity::cosine(embedding, [0.1,0.2,0.3]) AS score \
-             FROM chunk WHERE embedding <|10,40|> [0.1,0.2,0.3] {TIE_BREAKER}"
-        );
+        let vsql = hybrid_vector_sql("[0.1,0.2,0.3]", 10);
         assert!(
             vsql.contains(TIE_BREAKER),
             "hybrid vector leg must order equal scores by (document, idx): {vsql}"
         );
         // Keyword leg
-        let ksql = format!(
-            "SELECT content, idx, meta::id(id) AS chunk_id, \
-             string::concat('document:', meta::id(document)) AS document_key, \
-             document.title AS title, document.source AS source, search::score(0) AS score \
-             FROM chunk WHERE content @0@ $q {TIE_BREAKER} LIMIT 10"
-        );
+        let ksql = hybrid_keyword_sql(10);
         assert!(
             ksql.contains(TIE_BREAKER),
             "hybrid keyword leg must order equal scores by (document, idx): {ksql}"

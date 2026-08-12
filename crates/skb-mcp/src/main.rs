@@ -418,14 +418,24 @@ impl SkbServer {
                         > = std::sync::Arc::new(std::sync::Mutex::new(None));
                         let worker_final = pending_final.clone();
                         let handle = tokio::spawn(async move {
+                            // Only strictly increasing progress is forwarded:
+                            // duplicate or lower values (retry paths, re-sent
+                            // finals) are discarded.
+                            let mut last_sent: Option<usize> = None;
                             while let Some((done, total)) = rx.recv().await {
+                                if last_sent.is_some_and(|last| done <= last) {
+                                    continue;
+                                }
+                                last_sent = Some(done);
                                 send_progress(peer.clone(), worker_token.clone(), done, total)
                                     .await;
                             }
                             let last = worker_final.lock().ok().and_then(|mut g| g.take());
                             if let Some((done, total)) = last {
-                                send_progress(peer.clone(), worker_token.clone(), done, total)
-                                    .await;
+                                if last_sent.is_none_or(|last| done > last) {
+                                    send_progress(peer.clone(), worker_token.clone(), done, total)
+                                        .await;
+                                }
                             }
                         });
                         let callback: Box<skb_core::reindex::ProgressFn> =

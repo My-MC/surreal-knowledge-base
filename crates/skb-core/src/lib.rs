@@ -104,7 +104,12 @@ impl KnowledgeBase {
             // dimension/fingerprint comparisons cannot detect once the meta has
             // been updated to the new values. Refuse to operate until the
             // rebuild is re-run to completion (spec §9-5).
-            if db.get_meta("reindex_in_progress").await?.as_deref() == Some("1") {
+            if db
+                .get_meta("reindex_in_progress")
+                .await?
+                .as_deref()
+                .is_some_and(|v| !v.is_empty())
+            {
                 return Err(SkbError::new(
                     ErrorCode::ModelMismatch,
                     "an interrupted reindex left the database incomplete. Run reindex to rebuild.",
