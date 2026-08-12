@@ -28,12 +28,15 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sha2 = "0.11"
 anyhow = "1"
 ureq = "3"
+url = "2"
 base64 = "0.23"
 regex = "1"
 pdf-extract = "0.12"
+lopdf = "0.42"
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["async_tokio"] }
+ahash = "0.8"
 
 [[bench]]
 name = "skb"

@@ -6,6 +6,11 @@ pub trait Tokenize: Send + Sync {
     fn decode(&self, ids: &[u32]) -> Result<String, SkbError>;
     fn vocab_size(&self) -> usize;
     fn chunk(&self, text: &str, max_tokens: usize, overlap: usize) -> Result<Vec<Chunk>, SkbError>;
+    /// Canonical JSON serialization of the tokenizer configuration: model
+    /// (vocabulary), normalizer, pre-tokenizer, post-processor, decoder and
+    /// other fields as loaded from `tokenizer.json`. Deterministic for a given
+    /// file; used for fingerprinting (§5.4).
+    fn config_json(&self) -> Result<serde_json::Value, SkbError>;
 }
 
 #[derive(Debug, Clone)]
@@ -55,6 +60,15 @@ impl Tokenize for TokenizersImpl {
         self.tokenizer.get_vocab_size(true)
     }
 
+    fn config_json(&self) -> Result<serde_json::Value, SkbError> {
+        serde_json::to_value(&self.tokenizer).map_err(|e| {
+            SkbError::new(
+                ErrorCode::Tokenize,
+                format!("serialize tokenizer config: {e}"),
+            )
+        })
+    }
+
     fn chunk(&self, text: &str, max_tokens: usize, overlap: usize) -> Result<Vec<Chunk>, SkbError> {
         let encoding = self
             .tokenizer
@@ -66,13 +80,64 @@ impl Tokenize for TokenizersImpl {
         if ids.is_empty() {
             return Ok(vec![]);
         }
+        // Guard regardless of caller configuration validation: max_tokens == 0
+        // would make the loop below make no progress (window_end == start).
+        if max_tokens == 0 {
+            return Err(SkbError::new(
+                ErrorCode::Validation,
+                "max_tokens must be at least 1",
+            ));
+        }
+
+        // Byte offsets of markdown heading lines; chunk boundaries prefer to
+        // break right before a heading so sections stay intact (spec §5.1).
+        let headings = heading_starts(text);
 
         let mut chunks = Vec::new();
         let mut start = 0;
+        // Track the previous end position: heading-boundary breaks can
+        // push end below the previous chunk's end when combined with
+        // overlap, which would duplicate content in an endless loop.
+        // Such a range is skipped (start advances to end).
+        let mut prev_end = 0usize;
 
         while start < ids.len() {
-            let end = (start + max_tokens).min(ids.len());
-            let chunk_ids = &ids[start..end];
+            let window_end = (start + max_tokens).min(ids.len());
+            let mut end = window_end;
+
+            // Break before the first token that ENDS after the next heading
+            // inside the window: the token containing the heading start goes
+            // to the next chunk, keeping the heading line intact even when no
+            // token starts exactly on the heading byte offset. A heading that
+            // falls inside the chunk's FIRST token (e.g. a "##" merged with
+            // the preceding newline) is the chunk's own heading and never
+            // triggers a break.
+            let first_token_end = offsets.get(start).map(|o| o.1).unwrap_or(0);
+            let first_heading = headings.partition_point(|&h| h <= first_token_end);
+            if let Some(&heading_off) = headings.get(first_heading) {
+                if let Some(i) = (start + 1..window_end)
+                    .find(|&i| offsets.get(i).map(|o| o.1).unwrap_or(0) > heading_off)
+                {
+                    end = i;
+                }
+            }
+
+            if end <= prev_end {
+                // The heading break would produce a range no further than
+                // the previous chunk. First try the FULL window: when
+                // window_end > prev_end the overlap after a heading boundary
+                // is preserved and a real chunk is emitted. Only when the
+                // full window also fails to advance is the range skipped.
+                if window_end > prev_end {
+                    end = window_end;
+                    prev_end = end;
+                } else {
+                    start = end.max(start + 1);
+                    continue;
+                }
+            } else {
+                prev_end = end;
+            }
 
             let (chunk_offsets_start, chunk_offsets_end) = if let (Some(first), Some(last)) = (
                 offsets.get(start),
@@ -82,22 +147,219 @@ impl Tokenize for TokenizersImpl {
             } else {
                 (0, text.len())
             };
-
             let content = &text[chunk_offsets_start..chunk_offsets_end.min(text.len())];
 
+            let heading = heading_at(text, &headings, chunk_offsets_start, chunk_offsets_end);
             chunks.push(Chunk {
                 content: content.to_string(),
-                token_count: chunk_ids.len(),
+                token_count: end - start,
                 idx: chunks.len(),
-                heading: None,
+                heading,
             });
 
             if end >= ids.len() {
                 break;
             }
-            start = end.saturating_sub(overlap.min(end - start));
+            let size = end - start;
+            start = if overlap >= size { end } else { end - overlap };
         }
 
         Ok(chunks)
+    }
+}
+
+/// Byte offsets of markdown heading lines (`^#{1,6}\s`), for boundary-aware
+/// chunking. Scanning is byte-oriented and cheap enough for large inputs.
+/// Fence-aware: heading-like lines inside ``` or ~~~ blocks are ignored
+/// (shared with graph entity/section extraction).
+pub(crate) fn heading_starts(text: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut line_start = 0usize;
+    // Track the opening fence marker (``` or ~~~); a fence closes only on a
+    // line starting with the SAME marker, so `# heading`-like lines inside
+    // either fence are never treated as headings (CommonMark).
+    let mut fence_marker: Option<&str> = None;
+    for (i, b) in text.bytes().enumerate() {
+        if b == b'\n' {
+            let line = &text[line_start..i];
+            let trimmed = line.trim_start();
+            if let Some(open) = fence_marker {
+                if trimmed.starts_with(open) {
+                    fence_marker = None;
+                }
+            } else if trimmed.starts_with("```") {
+                fence_marker = Some("```");
+            } else if trimmed.starts_with("~~~") {
+                fence_marker = Some("~~~");
+            } else if is_heading_line(trimmed) {
+                out.push(line_start);
+            }
+            line_start = i + 1;
+        }
+    }
+    if line_start < text.len() {
+        let line = &text[line_start..];
+        let trimmed = line.trim_start();
+        if !(trimmed.starts_with("```") || trimmed.starts_with("~~~"))
+            && fence_marker.is_none()
+            && is_heading_line(trimmed)
+        {
+            out.push(line_start);
+        }
+    }
+    out
+}
+
+fn is_heading_line(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    let mut hashes = 0;
+    for &b in bytes.iter().take(7) {
+        if b == b'#' {
+            hashes += 1;
+        } else {
+            break;
+        }
+    }
+    (1..=6).contains(&hashes) && bytes.get(hashes) == Some(&b' ')
+}
+
+/// The heading that owns a chunk spanning `[start, end)`: the first heading
+/// inside the chunk, or the nearest heading before it.
+fn heading_at(text: &str, headings: &[usize], start: usize, end: usize) -> Option<String> {
+    let start_idx = headings.partition_point(|&h| h < start);
+    if let Some(&h) = headings.get(start_idx) {
+        if h < end {
+            return heading_text(text, h);
+        }
+    }
+    if start_idx == 0 {
+        return None;
+    }
+    heading_text(text, headings[start_idx - 1])
+}
+
+fn heading_text(text: &str, start: usize) -> Option<String> {
+    let end = text[start..]
+        .find('\n')
+        .map(|e| start + e)
+        .unwrap_or(text.len());
+    let line = &text[start..end];
+    // trim_start FIRST so indented headings ("  ## Topic") have their
+    // Markdown markers removed consistently with heading_starts.
+    let trimmed = line.trim_start().trim_start_matches('#').trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_heading_lines() {
+        assert!(is_heading_line("# Title"));
+        assert!(is_heading_line("## Sub"));
+        assert!(is_heading_line("###### Deep"));
+        assert!(!is_heading_line("####### Too deep"));
+        assert!(!is_heading_line("#NoSpace"));
+        assert!(!is_heading_line("text # not heading"));
+        assert!(!is_heading_line(""));
+    }
+
+    #[test]
+    fn collects_heading_offsets() {
+        let text = "# A\nbody\n## B\nmore\n";
+        assert_eq!(heading_starts(text), vec![0, 9]);
+    }
+
+    #[test]
+    fn heading_starts_skips_fenced_heading_like_lines() {
+        // Heading-like lines inside ``` and ~~~ fences must not be detected;
+        // a fence closes only on its own marker.
+        let text = "# Real\n```\n# Fake\n~~~\nstill inside\n```\n## Real2\n~~~\n# Fake2\n~~~\n";
+        let starts = heading_starts(text);
+        assert_eq!(starts, vec![0, 39], "got {starts:?}");
+    }
+
+    #[test]
+    fn heading_at_returns_owning_or_preceding_heading() {
+        let text = "# A\nbody\n## B\nmore\n";
+        let headings = heading_starts(text);
+        assert_eq!(heading_at(text, &headings, 0, 20), Some("A".into()));
+        assert_eq!(heading_at(text, &headings, 2, 8), Some("A".into()));
+        assert_eq!(heading_at(text, &headings, 9, 20), Some("B".into()));
+        assert_eq!(heading_at(text, &headings, 20, 40), Some("B".into()));
+        // A chunk spanning the boundary into ## B belongs to B.
+        assert_eq!(heading_at(text, &headings, 5, 14), Some("B".into()));
+    }
+
+    #[test]
+    fn heading_at_returns_none_before_first_heading() {
+        let text = "intro\n# A\n";
+        let headings = heading_starts(text);
+        assert_eq!(heading_at(text, &headings, 0, 2), None);
+        assert_eq!(heading_at(text, &headings, 6, 20), Some("A".into()));
+    }
+
+    fn fixture_tokenizer(path: &std::path::Path, word: &str) {
+        use tokenizers::models::bpe::BPE;
+        use tokenizers::pre_tokenizers::whitespace::WhitespaceSplit;
+        use tokenizers::Tokenizer;
+        let mut vocab = ahash::AHashMap::default();
+        vocab.insert("<unk>".to_string(), 0);
+        vocab.insert(word.to_string(), 1);
+        let bpe = BPE::builder()
+            .vocab_and_merges(vocab, vec![])
+            .unk_token("<unk>".to_string())
+            .build()
+            .unwrap();
+        let mut tok = Tokenizer::new(bpe);
+        // Word-based splitting keeps "## Beta" in one token run, like a real
+        // subword tokenizer would (per-char fallback tokens would split the
+        // heading line across chunks).
+        tok.with_pre_tokenizer(Some(WhitespaceSplit));
+        std::fs::write(path, serde_json::to_string(&tok).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn chunk_breaks_at_headings_and_records_heading() {
+        let dir = std::path::PathBuf::from("./target/skb-test-tok-chunk");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tok_path = dir.join("tokenizer.json");
+        fixture_tokenizer(&tok_path, "alpha");
+        let tok = TokenizersImpl::from_path(&tok_path).unwrap();
+
+        // max_tokens=20: the "## Second" heading falls inside the first
+        // window, so the chunk must break right before it and each section
+        // keeps its own heading instead of being merged together.
+        let text = "# First\nalpha alpha alpha alpha\n## Second\nalpha alpha\n";
+        let chunks = tok.chunk(text, 20, 0).unwrap();
+        assert!(chunks.len() >= 2, "expected at least two sections");
+        assert_eq!(chunks[0].heading.as_deref(), Some("First"));
+        assert!(chunks[0].content.contains("# First"));
+        let second = chunks
+            .iter()
+            .find(|c| c.heading.as_deref() == Some("Second"));
+        let second = second.expect("## Second section must form its own chunk");
+        assert!(second.content.starts_with("## Second"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chunk_makes_progress_with_tiny_max_tokens() {
+        let dir = std::path::PathBuf::from("./target/skb-test-tok-progress");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tok_path = dir.join("tokenizer.json");
+        fixture_tokenizer(&tok_path, "alpha");
+        let tok = TokenizersImpl::from_path(&tok_path).unwrap();
+
+        let text = "alpha alpha alpha alpha alpha alpha";
+        let chunks = tok.chunk(text, 2, 1).unwrap();
+        assert!(chunks.len() >= 3);
+        assert!(chunks.iter().all(|c| c.token_count <= 2));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

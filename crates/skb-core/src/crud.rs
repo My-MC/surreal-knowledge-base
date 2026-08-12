@@ -4,6 +4,7 @@ use crate::error::{ErrorCode, SkbError};
 use crate::tokenize::Tokenize;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DocumentSummary {
@@ -32,6 +33,9 @@ pub struct ChunkInfo {
     pub idx: usize,
     pub content: String,
     pub token_count: usize,
+    // Defaulted so legacy JSON without the field deserializes cleanly.
+    #[serde(default)]
+    pub heading: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -86,12 +90,37 @@ impl OrderBy {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+/// Upper bound for list_documents / list_chunks limits: results are materialized
+/// in memory, so unbounded limits would let a single request exhaust memory.
+const MAX_LIST_LIMIT: usize = 10_000;
+
+/// Upper bound for list offset: a huge offset makes SurrealDB scan that many
+/// records before returning, so cap it to bound per-request CPU/IO.
+const MAX_LIST_OFFSET: usize = 1_000_000;
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ListQuery {
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1, max = MAX_LIST_LIMIT))]
     pub limit: Option<usize>,
+    #[schemars(range(min = 0, max = MAX_LIST_OFFSET))]
     pub offset: Option<usize>,
     pub order: Option<OrderBy>,
+    /// Keyset cursor: resume strictly after the document with this
+    /// `created_at` / `id` pair (deterministic pagination). Ignored when
+    /// `None`.
+    #[serde(default)]
+    pub after: Option<(String, String)>,
+}
+
+impl Default for ListQuery {
+    fn default() -> Self {
+        Self {
+            limit: None,
+            offset: None,
+            order: Some(OrderBy::CreatedDesc),
+            after: None,
+        }
+    }
 }
 
 impl ListQuery {
@@ -103,6 +132,34 @@ impl ListQuery {
                     "limit must be at least 1",
                 ));
             }
+            if limit > MAX_LIST_LIMIT {
+                return Err(SkbError::new(
+                    ErrorCode::Validation,
+                    format!("limit must be at most {MAX_LIST_LIMIT}"),
+                ));
+            }
+        }
+        if let Some(offset) = self.offset {
+            if offset > MAX_LIST_OFFSET {
+                return Err(SkbError::new(
+                    ErrorCode::Validation,
+                    format!("offset must be at most {MAX_LIST_OFFSET}"),
+                ));
+            }
+        }
+        if self.after.is_some() && self.offset.is_some() {
+            return Err(SkbError::new(
+                ErrorCode::Validation,
+                "after (keyset cursor) and offset cannot be combined",
+            ));
+        }
+        if self.after.is_some()
+            && matches!(self.order, Some(OrderBy::TitleAsc | OrderBy::TitleDesc))
+        {
+            return Err(SkbError::new(
+                ErrorCode::Validation,
+                "after (keyset cursor) is only supported with created_at ordering",
+            ));
         }
         Ok(())
     }
@@ -172,30 +229,109 @@ pub async fn list_documents(db: &Db, q: &ListQuery) -> Result<Vec<DocumentSummar
     q.validate()?;
     let limit = q.limit.unwrap_or(50);
     let offset = q.offset.unwrap_or(0);
-    let order_by = q.order.map_or("created_at DESC", OrderBy::to_surql);
+    // Deterministic ordering with the record id as tie-breaker; the keyset
+    // cursor below relies on it.
+    let order_by = match q.order {
+        Some(o) => format!("{}, id", OrderBy::to_surql(o)),
+        None => "created_at DESC, id".to_string(),
+    };
+    // Keyset cursor: resume strictly after the given (created_at, id) pair.
+    // Only the created_at orderings are supported (title ordering has no
+    // created_at cursor); the predicate direction matches the ordering.
+    // Cursor values are bound (never interpolated), so they are safe.
+    let cursor_clause = match &q.after {
+        Some(_) => {
+            let op = if q.order == Some(OrderBy::CreatedDesc) || q.order.is_none() {
+                "<"
+            } else {
+                ">"
+            };
+            format!(" AND (created_at, meta::id(id)) {op} ($after_created, $after_id)")
+        }
+        None => String::new(),
+    };
     let query = format!(
         "SELECT string::concat('document:', meta::id(id)) AS id, \
          title, source, sha256, created_at \
-         FROM document ORDER BY {order_by} LIMIT {limit} START {offset}"
+         FROM document WHERE true{cursor_clause} ORDER BY {order_by} LIMIT {limit} START {offset}"
     );
-    let mut r = db
-        .db
-        .query(&query)
-        .await
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("list: {e}")))?;
+    let mut r = if q.after.is_some() {
+        let after = q.after.clone().unwrap_or_default();
+        db.db
+            .query(&query)
+            .bind(("after_created", after.0))
+            .bind(("after_id", after.1))
+            .await
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("list: {e}")))?
+    } else {
+        db.db
+            .query(&query)
+            .await
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("list: {e}")))?
+    };
     let rows: Vec<serde_json::Value> = r
         .take(0)
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("list take: {e}")))?;
 
+    // Per-document chunk counts restricted to the documents on this page
+    // (the count query reuses the fetched ids instead of grouping every chunk
+    // row in the table). An empty page exits before id parsing or the
+    // aggregation query.
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Direct RecordId comparison: the page ids are
+    // `document:<key>` strings parsed back into record ids via the shared
+    // document_record_id helper (validate_document_id + RecordId::new), so
+    // escaped keys are handled the same way as every other document id path.
+    // A document whose id fails to parse cannot match any chunk; log a
+    // diagnostic instead of silently reporting a zero chunk_count.
+    let page_ids: Vec<surrealdb::types::RecordId> = rows
+        .iter()
+        .filter_map(|row| {
+            let s = row["id"].as_str()?;
+            match document_record_id(s) {
+                Ok(id) => Some(id),
+                Err(e) => {
+                    tracing::warn!(id = %s, error = %e, "document id is not a valid record id");
+                    None
+                }
+            }
+        })
+        .collect();
+    let mut r = db
+        .db
+        .query(
+            "SELECT string::concat('document:', meta::id(document)) AS document, \
+             count() AS c FROM chunk WHERE document IN $ids GROUP BY document",
+        )
+        .bind(("ids", page_ids))
+        .await
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("list chunks: {e}")))?;
+    let count_rows: Vec<serde_json::Value> = r
+        .take(0)
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("list chunks take: {e}")))?;
+    let counts: HashMap<String, usize> = count_rows
+        .iter()
+        .filter_map(|row| {
+            let doc = row["document"].as_str()?;
+            let count = row["c"].as_u64()? as usize;
+            Some((doc.to_string(), count))
+        })
+        .collect();
+
     Ok(rows
         .iter()
-        .map(|row| DocumentSummary {
-            id: val_str(row, "id"),
-            title: val_str(row, "title"),
-            source: val_str(row, "source"),
-            sha256: val_str(row, "sha256"),
-            chunk_count: 0,
-            created_at: val_str(row, "created_at"),
+        .map(|row| {
+            let id = val_str(row, "id");
+            DocumentSummary {
+                chunk_count: counts.get(&id).copied().unwrap_or(0),
+                id: id.clone(),
+                title: val_str(row, "title"),
+                source: val_str(row, "source"),
+                sha256: val_str(row, "sha256"),
+                created_at: val_str(row, "created_at"),
+            }
         })
         .collect())
 }
@@ -223,7 +359,7 @@ pub async fn get_document(db: &Db, req: &GetDocumentRequest) -> Result<DocumentD
     let row = &rows[0];
 
     let chunks = if req.include_chunks.unwrap_or(false) {
-        let cq = "SELECT idx, content, token_count FROM chunk WHERE document = $id ORDER BY idx";
+        let cq = "SELECT idx, content, token_count, heading FROM chunk WHERE document = $id ORDER BY idx";
         let mut r = db
             .db
             .query(cq)
@@ -240,6 +376,7 @@ pub async fn get_document(db: &Db, req: &GetDocumentRequest) -> Result<DocumentD
                     idx: val_u64(c, "idx") as usize,
                     content: val_str(c, "content"),
                     token_count: val_u64(c, "token_count") as usize,
+                    heading: c["heading"].as_str().map(|s| s.to_string()),
                 })
                 .collect(),
         )
@@ -265,18 +402,58 @@ pub async fn delete_document(
 ) -> Result<DeleteResult, SkbError> {
     req.validate()?;
     let record_id = document_record_id(&req.id)?;
-    let query = "DELETE FROM chunk WHERE document = $id; DELETE $id;";
-    db.db
-        .query(query)
+    // Everything runs inside one transaction so the existence check, chunk
+    // count and all deletes are transaction-consistent: commit on success,
+    // cancel on any failure.
+    let tx = db
+        .db
+        .clone()
+        .begin()
+        .await
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete begin: {e}")))?;
+
+    // A missing document is an explicit error (spec §9-6).
+    let mut r = tx
+        .query("SELECT id FROM $id LIMIT 1")
+        .bind(("id", record_id.clone()))
+        .await
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete lookup: {e}")))?;
+    let rows: Vec<serde_json::Value> = r
+        .take(0)
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete lookup take: {e}")))?;
+    if rows.is_empty() {
+        let _ = tx.cancel().await;
+        return Err(SkbError::new(
+            ErrorCode::DocumentNotFound,
+            format!("not found: {}", req.id),
+        ));
+    }
+
+    // Count the chunks that will be removed (spec §9-6).
+    let mut r = tx
+        .query("SELECT count() AS c FROM chunk WHERE document = $id GROUP ALL")
+        .bind(("id", record_id.clone()))
+        .await
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete count: {e}")))?;
+    let rows: Vec<serde_json::Value> = r
+        .take(0)
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete count take: {e}")))?;
+    let chunks_deleted = rows.first().and_then(|v| v["c"].as_u64()).unwrap_or(0) as usize;
+
+    let query = "DELETE FROM mentions WHERE in.document = $id; DELETE FROM chunk WHERE document = $id; DELETE $id;";
+    tx.query(query)
         .bind(("id", record_id))
         .await
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete: {e}")))?
         .check()
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete check: {e}")))?;
+    tx.commit()
+        .await
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete commit: {e}")))?;
 
     Ok(DeleteResult {
         document_id: req.id.clone(),
-        chunks_deleted: 0,
+        chunks_deleted,
     })
 }
 
@@ -322,26 +499,106 @@ pub async fn stats(db: &Db, embedder: &dyn Embed) -> Result<Stats, SkbError> {
     })
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DoctorReport {
+    /// SurrealDB connectivity check.
+    pub db_connected: bool,
+    pub embedding_dimension: usize,
+    pub tokenizer_vocab: usize,
+    pub model: String,
+    pub schema_version: String,
+    /// `tokenizers` crate version recorded in `meta` at open/reindex time
+    /// (spec §5.4 rule 3; visible via `skb doctor`).
+    pub tokenizer_version: String,
+    /// Fingerprint schema version recorded in `meta` (spec §5.4 rule 3).
+    pub tokenizer_fingerprint_schema: String,
+    /// Environment/connectivity problems detected (empty when healthy).
+    pub errors: Vec<String>,
+}
+
+impl DoctorReport {
+    pub fn is_healthy(&self) -> bool {
+        self.errors.is_empty()
+    }
+}
+
 pub async fn doctor(
     db: &Db,
     embedder: &dyn Embed,
     tokenizer: &dyn Tokenize,
-) -> Result<String, SkbError> {
-    let mut lines = vec!["=== SKB Doctor ===".to_string(), String::new()];
-    match db.db.query("SELECT 1").await {
-        Ok(_) => lines.push("[OK] SurrealDB connection".into()),
-        Err(e) => lines.push(format!("[FAIL] DB: {e}")),
+) -> Result<DoctorReport, SkbError> {
+    let mut report = DoctorReport {
+        db_connected: false,
+        embedding_dimension: embedder.dimension(),
+        tokenizer_vocab: tokenizer.vocab_size(),
+        model: String::new(),
+        schema_version: String::new(),
+        tokenizer_version: String::new(),
+        tokenizer_fingerprint_schema: String::new(),
+        errors: Vec::new(),
+    };
+    // Connectivity first: the point of doctor is to report problems, so a
+    // broken database must never make the report itself fail. The query AND
+    // its statement-level check must both succeed; meta reads only run then
+    // (a dead store would fail every read; one recorded error is enough).
+    match db.db.query("RETURN 1").await {
+        Ok(r) => match r.check() {
+            Ok(_) => {
+                report.db_connected = true;
+                // Meta reads can also fail; record instead of propagating.
+                match db.get_meta("embedding_model").await {
+                    Ok(model) => report.model = model.unwrap_or_default(),
+                    Err(e) => report
+                        .errors
+                        .push(format!("read embedding_model meta: {e}")),
+                }
+                match db.get_meta("schema_version").await {
+                    Ok(version) => report.schema_version = version.unwrap_or_default(),
+                    Err(e) => report.errors.push(format!("read schema_version meta: {e}")),
+                }
+                match db.get_meta("tokenizer_version").await {
+                    Ok(v) => report.tokenizer_version = v.unwrap_or_default(),
+                    Err(e) => report
+                        .errors
+                        .push(format!("read tokenizer_version meta: {e}")),
+                }
+                match db.get_meta("tokenizer_fingerprint_schema").await {
+                    Ok(v) => report.tokenizer_fingerprint_schema = v.unwrap_or_default(),
+                    Err(e) => report
+                        .errors
+                        .push(format!("read tokenizer_fingerprint_schema meta: {e}")),
+                }
+            }
+            Err(e) => report.errors.push(format!("SurrealDB connection: {e}")),
+        },
+        Err(e) => report.errors.push(format!("SurrealDB connection: {e}")),
     }
-    lines.push(format!("[INFO] Embedding dim: {}", embedder.dimension()));
-    lines.push(format!(
-        "[INFO] Tokenizer vocab: {}",
-        tokenizer.vocab_size()
-    ));
-    let m = db.get_meta("embedding_model").await?;
-    lines.push(format!("[INFO] Model: {}", m.unwrap_or_default()));
-    let v = db.get_meta("schema_version").await?;
-    lines.push(format!("[INFO] Schema ver: {}", v.unwrap_or_default()));
-    Ok(lines.join("\n"))
+    if report.embedding_dimension == 0 {
+        report
+            .errors
+            .push("embedding dimension is 0 (model not loaded?)".to_string());
+    }
+    if report.tokenizer_vocab == 0 {
+        report
+            .errors
+            .push("tokenizer vocab is 0 (tokenizer not loaded?)".to_string());
+    }
+    if report.model.is_empty() {
+        report
+            .errors
+            .push("embedding model is not recorded in meta".to_string());
+    }
+    if report.tokenizer_version.is_empty() {
+        report
+            .errors
+            .push("tokenizer_version is not recorded in meta".to_string());
+    }
+    if report.tokenizer_fingerprint_schema.is_empty() {
+        report
+            .errors
+            .push("tokenizer_fingerprint_schema is not recorded in meta".to_string());
+    }
+    Ok(report)
 }
 
 fn val_str(row: &serde_json::Value, key: &str) -> String {
@@ -402,6 +659,27 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn list_query_rejects_limit_above_max() {
+        let q = ListQuery {
+            limit: Some(MAX_LIST_LIMIT + 1),
+            ..Default::default()
+        };
+        assert!(matches!(
+            q.validate(),
+            Err(SkbError {
+                code: ErrorCode::Validation,
+                ..
+            })
+        ));
+
+        let ok = ListQuery {
+            limit: Some(MAX_LIST_LIMIT),
+            ..Default::default()
+        };
+        assert!(ok.validate().is_ok());
     }
 
     #[test]
@@ -480,5 +758,9 @@ mod tests {
             "no field may be required in ListQuery"
         );
         assert_eq!(value["properties"]["limit"]["minimum"], 1);
+        assert_eq!(
+            value["properties"]["limit"]["maximum"],
+            MAX_LIST_LIMIT as u64
+        );
     }
 }
