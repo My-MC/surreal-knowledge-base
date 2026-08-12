@@ -610,12 +610,15 @@ pub async fn expand_search_hits(
             }
             // Cap the frontier at the end of each hop so a dense graph
             // cannot grow it unboundedly across hops (request-level bound).
-            // Sort by decay descending first so truncation keeps the closest
-            // (highest-decay) entities, independent of insertion/HashMap
-            // order.
+            // Sort by decay descending, then entity name ascending, so
+            // truncation keeps the closest entities deterministically.
             frontier.extend(next);
             if frontier.len() > FRONTIER_MAX {
-                frontier.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                frontier.sort_by(|a, b| {
+                    b.1.partial_cmp(&a.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.0.cmp(&b.0))
+                });
                 frontier.truncate(FRONTIER_MAX);
             }
         }
@@ -633,10 +636,15 @@ pub async fn expand_search_hits(
                 .or_insert(decay);
         }
         // Same request-level fan-out bound: the chunk-query loop below must
-        // not exceed the cap either. Sort by decay descending so truncation
-        // keeps the closest entities regardless of HashMap iteration order.
+        // not exceed the cap either. Sort by decay descending, then entity
+        // name ascending, so truncation keeps the closest entities regardless
+        // of HashMap iteration order.
         let mut frontier: Vec<(String, f64)> = best.into_iter().collect();
-        frontier.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        frontier.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
         frontier.truncate(FRONTIER_MAX);
 
         // Chunks mentioning any frontier entity; scores are the origin hit's
@@ -797,16 +805,21 @@ pub fn extract_entities(content: &str) -> Vec<EntityInfo> {
         });
     }
 
-    // Headings: ^#{1,6}\s+(.+)
-    let heading_re = regex::Regex::new(r"(?m)^#{1,6}\s+(.+)").unwrap();
-    for cap in heading_re.captures_iter(content) {
-        let heading = cap.get(1).map(|m| m.as_str()).unwrap_or("");
-        if heading.len() > 2 {
-            entities.push(EntityInfo {
-                name: heading.trim().to_string(),
-                kind: "section".into(),
-                description: None,
-            });
+    // Headings: ^#{1,6}\s+(.+) outside fenced code blocks (shared fence-aware
+    // detection with the chunking logic in tokenize.rs).
+    let heading_re = regex::Regex::new(r"^#{1,6}\s+(.+)").unwrap();
+    for off in crate::tokenize::heading_starts(content) {
+        let rest = &content[off..];
+        let line = rest.split('\n').next().unwrap_or(rest);
+        if let Some(cap) = heading_re.captures(line.trim_start()) {
+            let heading = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+            if heading.len() > 2 {
+                entities.push(EntityInfo {
+                    name: heading.trim().to_string(),
+                    kind: "section".into(),
+                    description: None,
+                });
+            }
         }
     }
 
@@ -896,15 +909,21 @@ pub struct Section {
 /// Extract heading sections with levels for hierarchy linking.
 pub fn extract_sections(content: &str) -> Vec<Section> {
     let mut sections = Vec::new();
-    let heading_re = regex::Regex::new(r"(?m)^(#{1,6})\s+(.+)").unwrap();
-    for cap in heading_re.captures_iter(content) {
-        let level = cap.get(1).map(|m| m.as_str().len()).unwrap_or(1) as u32;
-        let name = cap.get(2).map(|m| m.as_str().trim()).unwrap_or("");
-        if name.len() > 2 {
-            sections.push(Section {
-                name: name.to_string(),
-                level,
-            });
+    let heading_re = regex::Regex::new(r"^(#{1,6})\s+(.+)").unwrap();
+    // Fence-aware detection shared with the chunking logic in tokenize.rs:
+    // heading-like lines inside ``` / ~~~ blocks are ignored.
+    for off in crate::tokenize::heading_starts(content) {
+        let rest = &content[off..];
+        let line = rest.split('\n').next().unwrap_or(rest);
+        if let Some(cap) = heading_re.captures(line.trim_start()) {
+            let level = cap.get(1).map(|m| m.as_str().len()).unwrap_or(1) as u32;
+            let name = cap.get(2).map(|m| m.as_str().trim()).unwrap_or("");
+            if name.len() > 2 {
+                sections.push(Section {
+                    name: name.to_string(),
+                    level,
+                });
+            }
         }
     }
     sections
@@ -949,14 +968,16 @@ pub(crate) async fn link_section_hierarchy(
                     })?;
             }
             // Idempotent edge: `RELATE` always creates a new edge, so remove
-            // an existing part-of edge between the same pair first. Section
-            // entities are global (shared across documents), so the dedup is
-            // per pair — repeated uploads never accumulate duplicates.
+            // EVERY existing part-of edge where this child is the `in`
+            // endpoint first — a child that changed its nearest parent (e.g.
+            // a restructured document) must not keep a stale edge to the old
+            // ancestor. Section entities are global (shared across
+            // documents), so the dedup is per child.
             // Direction: the child section is part of its ancestor, so the
             // edge points child -> part-of -> parent.
             tx.query(
                 "DELETE FROM related_to WHERE relation = 'part-of' \
-                 AND in = $child AND out = $parent; \
+                 AND in = $child; \
                  RELATE $child->related_to->$parent SET relation = 'part-of', weight = 1.0",
             )
             .bind(("child", entity_record_id(&section.name)?))

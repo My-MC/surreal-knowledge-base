@@ -408,29 +408,23 @@ async fn run(cli: &Cli) -> Result<u8> {
 
             if *stdin {
                 // Bound stdin reads by upload.max_file_mb (spec §12.3).
+                // Both branches share one read + byte-size validation + UTF-8
+                // conversion; only the build argument differs (base64 vs
+                // content).
                 let max = kb.config().upload.max_file_mb.saturating_mul(1024 * 1024);
                 let read_cap = max.saturating_add(1);
-                if *base64 {
-                    let mut raw = Vec::new();
-                    std::io::stdin().take(read_cap).read_to_end(&mut raw)?;
-                    if raw.len() as u64 > max {
-                        anyhow::bail!("stdin exceeds upload.max_file_mb");
-                    }
-                    let content = String::from_utf8(raw)?;
-                    let result = kb.upload(build(None, None, None, Some(content))).await?;
-                    output(&result, &fmt)?;
-                } else {
-                    // Read stdin as bytes, size-check the byte length, then
-                    // decode UTF-8 — same order as the base64 path.
-                    let mut raw = Vec::new();
-                    std::io::stdin().take(read_cap).read_to_end(&mut raw)?;
-                    if raw.len() as u64 > max {
-                        anyhow::bail!("stdin exceeds upload.max_file_mb");
-                    }
-                    let content = String::from_utf8(raw)?;
-                    let result = kb.upload(build(None, None, Some(content), None)).await?;
-                    output(&result, &fmt)?;
+                let mut raw = Vec::new();
+                std::io::stdin().take(read_cap).read_to_end(&mut raw)?;
+                if raw.len() as u64 > max {
+                    anyhow::bail!("stdin exceeds upload.max_file_mb");
                 }
+                let content = String::from_utf8(raw)?;
+                let result = if *base64 {
+                    kb.upload(build(None, None, None, Some(content))).await?
+                } else {
+                    kb.upload(build(None, None, Some(content), None)).await?
+                };
+                output(&result, &fmt)?;
             } else if expanded.len() > 1 || multi_input {
                 // Multi-input uploads: successful uploads are committed and
                 // returned in `results`, failures are aggregated in `errors`

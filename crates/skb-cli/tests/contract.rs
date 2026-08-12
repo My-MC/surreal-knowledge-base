@@ -241,17 +241,17 @@ fn contract_upload_partial_failure() {
     )
     .unwrap();
 
-    // Partial failure must exit non-zero while still reporting the committed
-    // results and the aggregated errors on stdout.
+    // Partial failure must exit with the explicit code 1 while still
+    // reporting the committed results and the aggregated errors on stdout.
     let output = Command::new(skb_binary())
         .args(["upload", docs_dir.to_str().unwrap(), "--recursive"])
         .current_dir(test_dir())
         .output()
         .expect("failed to run skb upload");
-    assert_ne!(
+    assert_eq!(
         output.status.code(),
-        Some(0),
-        "partial failure must exit non-zero"
+        Some(1),
+        "partial failure must exit with code 1"
     );
     let val: Value = serde_json::from_slice(&output.stdout).unwrap();
 

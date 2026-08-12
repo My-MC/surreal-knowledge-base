@@ -148,11 +148,13 @@ impl KnowledgeBase {
             )
             .await?;
             db.set_meta("schema_version", "1").await?;
-        } else {
+        } else if !allow_mismatch {
             // Backfill metadata for stores created before the keys existed;
             // read by doctor and dimension/mismatch checks. Existing values
             // are preserved (the mismatch check above already refuses to
-            // operate when they disagree with the config).
+            // operate when they disagree with the config). In allow_mismatch
+            // mode (open_for_reindex) nothing is written: model/dimension/
+            // max_input are recorded only after a successful reindex.
             if db.get_meta("embedding_model").await?.is_none() {
                 db.set_meta("embedding_model", &config.embedding.model)
                     .await?;

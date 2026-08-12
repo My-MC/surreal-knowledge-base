@@ -96,11 +96,15 @@ pub async fn reindex(
             if chunks.is_empty() {
                 continue;
             }
-            dry_entity_names.extend(
-                crate::graph::extract_entities(content)
-                    .into_iter()
-                    .map(|e| e.name),
-            );
+            // Match the execution path: extract entities PER CHUNK, not from
+            // the full document content.
+            for chunk in chunks.iter() {
+                dry_entity_names.extend(
+                    crate::graph::extract_entities(&chunk.content)
+                        .into_iter()
+                        .map(|e| e.name),
+                );
+            }
             result.entities_extracted = dry_entity_names.len();
             result.documents_processed += 1;
             result.chunks_created += chunks.len();
@@ -274,25 +278,12 @@ async fn rebuild_all(
         let texts: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
         let embeddings = embed_in_batches(embedder, &texts, config.embedding.batch_size)?;
 
-        let tx = db
-            .db
-            .clone()
-            .begin()
-            .await
-            .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex begin: {e}")))?;
-        let rebuilt = rebuild_document(&tx, did, content, &chunks, &embeddings).await;
-        let entity_names = match rebuilt {
-            Ok(names) => {
-                tx.commit()
-                    .await
-                    .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex commit: {e}")))?;
-                names
-            }
-            Err(e) => {
-                let _ = tx.cancel().await;
-                return Err(e);
-            }
-        };
+        // begin -> rebuild_document -> commit retried as a whole on retryable
+        // write conflicts (embedded SurrealKV; a transaction cannot be
+        // re-committed, so a fresh one is started per attempt;
+        // rebuild_document is idempotent for a given (did, chunks)).
+        let entity_names =
+            rebuild_document_retrying(db, did, content, &chunks, &embeddings).await?;
         entity_names.into_iter().for_each(|n| {
             all_entity_names.insert(n);
         });
@@ -356,6 +347,59 @@ async fn update_metas(
 }
 
 /// Replace one document's chunks and mentions within the supplied transaction.
+/// Rebuild one document's chunks within a transaction, retrying the whole
+/// begin -> rebuild -> commit sequence on retryable write conflicts (embedded
+/// SurrealKV; a transaction cannot be re-committed, so a fresh one is started
+/// per attempt; rebuild_document is idempotent for a given (did, chunks)).
+async fn rebuild_document_retrying(
+    db: &Db,
+    did: &str,
+    content: &str,
+    chunks: &[crate::tokenize::Chunk],
+    embeddings: &[Vec<f32>],
+) -> Result<Vec<String>, SkbError> {
+    const ATTEMPTS: usize = 8;
+    let mut last = None;
+    let mut delay = std::time::Duration::from_millis(50);
+    for attempt in 0..ATTEMPTS {
+        let tx = db
+            .db
+            .clone()
+            .begin()
+            .await
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex begin: {e}")))?;
+        match rebuild_document(&tx, did, content, chunks, embeddings).await {
+            Ok(names) => match tx.commit().await {
+                Ok(_) => return Ok(names),
+                Err(e) if e.to_string().contains("Transaction write conflict") => {
+                    last = Some(e);
+                    if attempt + 1 < ATTEMPTS {
+                        tokio::time::sleep(delay).await;
+                        delay = delay
+                            .saturating_mul(2)
+                            .min(std::time::Duration::from_millis(800));
+                    }
+                }
+                Err(e) => {
+                    // commit consumed the transaction; nothing to cancel.
+                    return Err(SkbError::new(ErrorCode::Db, format!("reindex commit: {e}")));
+                }
+            },
+            Err(e) => {
+                let _ = tx.cancel().await;
+                return Err(e);
+            }
+        }
+    }
+    Err(SkbError::new(
+        ErrorCode::Db,
+        format!(
+            "reindex commit: {}",
+            last.map(|e| e.to_string()).unwrap_or_default()
+        ),
+    ))
+}
+
 async fn rebuild_document(
     tx: &LocalTransaction,
     did: &str,

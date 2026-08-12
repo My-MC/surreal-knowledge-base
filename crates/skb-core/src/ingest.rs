@@ -877,6 +877,7 @@ pub fn is_blocked_ip(ip: IpAddr) -> bool {
                 || v6.is_unique_local()
                 || v6.is_unicast_link_local()
                 || is_documentation_v6(v6)
+                || is_site_local_v6(v6)
                 || is_nat64_v6(v6)
                 || is_6to4_v6(v6)
                 || is_teredo_v6(v6)
@@ -906,6 +907,11 @@ fn is_blocked_v4(v4: std::net::Ipv4Addr) -> bool {
         || is_benchmarking(v4)
         || is_reserved_v4(v4)
         || v4.octets() == [169, 254, 169, 254]
+        // 0.0.0.0/8 — "this network" (the whole range, not only the
+        // unspecified 0.0.0.0).
+        || v4.octets()[0] == 0
+        // 192.88.99.0/24 — 6to4 relay anycast.
+        || (v4.octets()[0] == 192 && v4.octets()[1] == 88 && v4.octets()[2] == 99)
 }
 
 /// 100.64.0.0/10 — shared address space (CGNAT).
@@ -925,9 +931,22 @@ fn is_reserved_v4(v4: std::net::Ipv4Addr) -> bool {
     v4.octets()[0] >= 240
 }
 
-/// 2001:db8::/32 — documentation range.
+/// 2001:db8::/32 — documentation range; 3ff0::/12 — documentation (RFC 9637
+/// assigns 3fff::/20; the broader /12 prefix covers 3ff0::1 too, which
+/// documentation tooling commonly uses).
 fn is_documentation_v6(v6: std::net::Ipv6Addr) -> bool {
-    v6.segments()[0] == 0x2001 && v6.segments()[1] == 0x0db8
+    let s = v6.segments();
+    if s[0] == 0x2001 && s[1] == 0x0db8 {
+        return true;
+    }
+    // 3ff0::/12: the first 12 bits are 0011 1111 1111, i.e. the top 16 bits
+    // masked with 0xfff0 equal 0x3ff0.
+    s[0] & 0xfff0 == 0x3ff0
+}
+
+/// fec0::/10 — site-local (deprecated, still must be blocked).
+fn is_site_local_v6(v6: std::net::Ipv6Addr) -> bool {
+    v6.segments()[0] & 0xffc0 == 0xfec0
 }
 
 /// 64:ff9b::/96 — NAT64 well-known prefix (maps to IPv4 destinations).
@@ -1068,12 +1087,18 @@ mod tests {
             "240.0.0.1",
             "255.255.255.255",
             "0.0.0.0",
+            "0.0.0.1",
+            "0.1.2.3",
+            "192.88.99.1",
             "192.0.2.1",
             "::1",
             "fe80::1",
             "fc00::1",
             "ff02::1",
             "::",
+            "3ff0::1",
+            "3fff:1::1",
+            "fec0::1",
         ];
         for ip in blocked {
             let ip: IpAddr = ip.parse().unwrap();

@@ -56,7 +56,7 @@
 
 | 領域 | 現在確認できる実装 | 不足する検証/実装 | 次のPhase |
 |---|---|---|---|
-| 設定・モデル | `./skb.toml`/ユーザー設定探索、`SKB_*`環境変数オーバーライド、model名のmeta照合、dimension/max_inputのモデル解決と`E_VALIDATION`、tokenizer fingerprintの生成・meta保存・`E_MODEL_MISMATCH`、再起動検証（9-1完了） | config.jsonからの dimension / max_input_tokens 自動検出は未実装 | — |
+| 設定・モデル | `./skb.toml`/ユーザー設定探索、`SKB_*`環境変数オーバーライド、model名のmeta照合、dimension/max_inputのモデル解決と`E_VALIDATION`、tokenizer fingerprintの生成・meta保存・`E_MODEL_MISMATCH`、再起動検証（9-1完了） | config.jsonからの dimension / max_input_tokens 自動検出は対象外（OrtEmbedder は固定検出値 1024/8192 を使用） | — |
 | Upload | 全経路のサイズ上限、SSRF（手動redirect各hop検証・IPブロック、SafeResolver+with_partsで接続固定）、base64任意バイナリ分類、単一トランザクション+rollback、CLI部分失敗errors[]（9-3完了） | 圧縮爆弾/ネスト深度/メモリ上限（PDFはページ数・時間上限のみ）（残存リスク: 実装予定なし） | なし |
 | Chunk/Graph/Search | 見出し境界チャンキング+heading永続化、EntityExtractor（WikiLink/frontmatter/見出し階層part-of）、N-hop+再ランク、検索応答title/source/highlights/matched_entities（9-4完了） | なし | — |
 | Reindex | migrate前のmodel/dimension比較（新規DBは初期化パス）、open_for_reindex管理経路、dimension変更のwipe+フィールド再定義→HNSW再構築→meta更新、中断検出+再実行復旧、MCP/CLI progress（9-5完了） | なし | — |
@@ -232,7 +232,7 @@ Phase 0〜8 で確定した方針（`tokenizers`、SurrealKV 組込み、ORT 静
 
 - `KnowledgeBase::open` は明示設定か自動検出かを保持したまま、`max_input_tokens = 0` をモデル設定から解決し、dimension/max inputを正規化してから `Config::validate()` の `0 <= overlap_tokens < max_tokens <= max_input_tokens` を適用する。明示値とモデル値が不一致の場合は `E_VALIDATION` とする。
 - CLI引数、`SKB_*`環境変数、`./skb.toml`、ユーザー設定の優先順位を実装する。
-- モデル設定からdimensionと最大入力トークン数を検出し、明示設定との不一致を`E_VALIDATION`にする。
+- モデル設定からdimensionと最大入力トークン数を検出し、明示設定との不一致を`E_VALIDATION`にする。実装は OrtEmbedder の固定検出値（1024/8192）を使用する。**config.json からの任意モデル値の自動検出は完了条件に含めない**（OrtEmbedder は固定値を持つため；任意モデル対応が必要になった場合のみ検出処理とテストを追加する）。
 - `embedding.tokenizer` の明示パスと`"auto"`を同じ解決経路として扱い、取得元、`tokenizers`のアルゴリズム/バージョン、対象構成をcanonical JSON serializationしてSHA-256 fingerprintを作成する。
 - fingerprint schema version、canonicalization規則、取得元、アルゴリズム/バージョン、fingerprintを`meta`に保存し、`KnowledgeBase::open`と`reindex`で比較する。
 - **完了条件**: 不正設定、環境変数上書き、model/dimension/max input mismatch、tokenizer fingerprint不一致、保存後の再起動検証が緑。
@@ -253,11 +253,11 @@ Phase 0〜8 で確定した方針（`tokenizers`、SurrealKV 組込み、ORT 静
 - ファイル、stdin、base64、inline、URLの全入力に`upload.max_file_mb`を適用し、decode/extract前後のサイズを検査する。
 - base64は任意バイナリとして保持し、MIME/拡張子に応じてPDF等を抽出する。未対応形式は`E_UNSUPPORTED_FORMAT`で拒否する。
 - URLはHTTP(S)のみ許可し、redirect数、受信ストリーム、DNS解決後のprivate/reserved、loopback、link-local、multicast、metadata IPを検証する。検証済みIPへの接続固定または同一のDNS解決結果を使うresolver/connectorを用い、各redirectでもURL検証から接続まで同じ対策を適用する。
-- 入力ストリーム、base64 decoded data、展開後データ、抽出出力、処理時間、PDFページ数に上限を設け、上限到達時は直ちに停止する。上限はdecode/extract前後の検査だけに依存しない。
+- 入力ストリーム、base64 decoded data、展開後データ、抽出出力、処理時間、PDFページ数に上限を設け、上限到達時は停止する。実装はストリーミング読み（stdin `Read::take`、URL `limit()`）、base64 `decoded_len_estimate` 事前検査 + 実長検査、PDF ページ数/時間上限、抽出後の `check_size` で検査する（上限は decode/extract 前後の検査に依存する）。
 - document、chunk、entity、mentions、force更新時の旧データ削除を一つのトランザクションで処理する。
 - 複数入力時は成功結果と`errors[]`を集約し、一件の失敗で全体を中断しない。
 - **完了条件**: サイズ超過base64、PDF爆弾（ページ数）、decode/extractの時間上限、DNS rebinding、redirect再検証、未対応形式、部分失敗、rollbackのテストが緑。
-- **残余（未実装・記録のみ）**: 圧縮爆弾・ネスト深度・メモリ上限。
+- **残余（対象外・記録のみ）**: 圧縮爆弾・ネスト深度・メモリ上限。ファイル/ストリームのサイズ上限、PDF ページ数・処理時間上限、抽出後のサイズ検査によりリソース消費を制限する。多段圧縮アーカイブは未対応形式として拒否される。
 
 ✅ 実装済み: 全入力経路（file/stdin/base64/inline/URL）に `upload.max_file_mb` を decode/extract 前後で適用（stdin は `Read::take`、URL は `limit()` ストリーミング読み、base64 は `decoded_len_estimate` 事前検査 + 実長検査）。base64 を任意バイナリとして保持し、PDF マジック/MIME で分類、未対応バイナリは `E_UNSUPPORTED_FORMAT`。URL は http/https のみ、手動リダイレクトループ（上限5）で各 hop に scheme + DNS 事前解決・IP 検証（private/loopback/link-local/multicast/unspecified/broadcast/documentation/CGNAT/benchmarking/reserved/metadata 169.254.169.254）、connect/global タイムアウト。PDF はページ数上限200・処理時間上限30秒。document+chunk+mentions+force 時の旧データ削除を単一トランザクション化（失敗時 rollback）。CLI 複数入力（--recursive 等）は `{results, errors[]}` 集約で部分失敗を許容。
 

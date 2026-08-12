@@ -124,12 +124,20 @@ impl Tokenize for TokenizersImpl {
 
             if end <= prev_end {
                 // The heading break would produce a range no further than
-                // the previous chunk: skip it and advance, never emitting
-                // a duplicate chunk.
-                start = end.max(start + 1);
-                continue;
+                // the previous chunk. First try the FULL window: when
+                // window_end > prev_end the overlap after a heading boundary
+                // is preserved and a real chunk is emitted. Only when the
+                // full window also fails to advance is the range skipped.
+                if window_end > prev_end {
+                    end = window_end;
+                    prev_end = end;
+                } else {
+                    start = end.max(start + 1);
+                    continue;
+                }
+            } else {
+                prev_end = end;
             }
-            prev_end = end;
 
             let (chunk_offsets_start, chunk_offsets_end) = if let (Some(first), Some(last)) = (
                 offsets.get(start),
@@ -162,7 +170,9 @@ impl Tokenize for TokenizersImpl {
 
 /// Byte offsets of markdown heading lines (`^#{1,6}\s`), for boundary-aware
 /// chunking. Scanning is byte-oriented and cheap enough for large inputs.
-fn heading_starts(text: &str) -> Vec<usize> {
+/// Fence-aware: heading-like lines inside ``` or ~~~ blocks are ignored
+/// (shared with graph entity/section extraction).
+pub(crate) fn heading_starts(text: &str) -> Vec<usize> {
     let mut out = Vec::new();
     let mut line_start = 0usize;
     // Track the opening fence marker (``` or ~~~); a fence closes only on a
@@ -234,7 +244,9 @@ fn heading_text(text: &str, start: usize) -> Option<String> {
         .map(|e| start + e)
         .unwrap_or(text.len());
     let line = &text[start..end];
-    let trimmed = line.trim_start_matches('#').trim();
+    // trim_start FIRST so indented headings ("  ## Topic") have their
+    // Markdown markers removed consistently with heading_starts.
+    let trimmed = line.trim_start().trim_start_matches('#').trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 

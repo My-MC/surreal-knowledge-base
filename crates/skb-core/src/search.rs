@@ -194,7 +194,8 @@ async fn hybrid_search(
          meta::id(document) AS document, \
          document.title AS title, document.source AS source, \
          vector::similarity::cosine(embedding, {emb_str}) AS score \
-         FROM chunk WHERE embedding <|{fetch_k},40|> {emb_str}"
+         FROM chunk WHERE embedding <|{fetch_k},40|> {emb_str} \
+         ORDER BY score DESC LIMIT {fetch_k}"
     );
     let mut r = db
         .db
