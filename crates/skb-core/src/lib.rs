@@ -102,10 +102,11 @@ impl KnowledgeBase {
         let is_new = db.is_new_database().await?;
         if !is_new && !allow_mismatch {
             // A reindex interrupted between the transition and update_metas
-            // leaves the in-progress marker (value "1"); refuse normal opens
-            // so the store is never used half-rebuilt (spec §9-5).
+            // leaves the in-progress marker ("dim" = dimension transition,
+            // "meta" = metadata/tokenizer rebuild); refuse normal opens so
+            // the store is never used half-rebuilt (spec §9-5).
             let in_progress = db.get_meta("reindex_in_progress").await?;
-            if in_progress.as_deref() == Some("1") {
+            if matches!(in_progress.as_deref(), Some("dim") | Some("meta")) {
                 return Err(SkbError::new(
                     ErrorCode::ModelMismatch,
                     "a reindex is in progress or was interrupted; run `skb reindex` to complete it",
@@ -294,16 +295,17 @@ impl KnowledgeBase {
         let mut r = r
             .check()
             .map_err(|e| SkbError::new(ErrorCode::Db, format!("query check: {e}")))?;
+        // Iterate the fixed statement count: Value::None is a valid statement
+        // result (e.g. a RETURN-less statement), not a loop terminator.
         let mut statements: Vec<serde_json::Value> = Vec::new();
-        let mut idx = 0usize;
-        loop {
+        let count = r.num_statements();
+        for idx in 0..count {
             match r.take::<surrealdb::types::Value>(idx) {
                 Ok(value) if value != surrealdb::types::Value::None => {
                     statements.push(value.into_json_value());
                 }
-                Ok(_) | Err(_) => break,
+                _ => {}
             }
-            idx += 1;
         }
         Ok(serde_json::json!({ "statements": statements }))
     }

@@ -53,10 +53,14 @@ pub async fn reindex(
         .and_then(|v| v.parse::<usize>().ok());
     let dimension_changed = stored_dim.is_some_and(|d| d != dimension);
     // An active reindex-in-progress marker means a previous run was
-    // interrupted; even when stored_dim matches dimension, the recovery path
-    // (including redefine_index) must run to complete the rebuild.
-    let interrupted = db.get_meta("reindex_in_progress").await?.as_deref() == Some("1");
-    let dimension_changed = dimension_changed || interrupted;
+    // interrupted. "dim" requires the full dimension-change recovery path
+    // (including the transition and redefine_index) even when stored_dim
+    // already matches; "meta" interruptions resume through rebuild_all +
+    // update_metas without wiping chunks/indexes/fields (dimension_changed
+    // stays false, so the else branch below is taken).
+    let marker = db.get_meta("reindex_in_progress").await?;
+    let interrupted_dim = marker.as_deref() == Some("dim");
+    let dimension_changed = dimension_changed || interrupted_dim;
 
     // Get all documents
     let find =
@@ -108,11 +112,15 @@ pub async fn reindex(
 
     // Reindex-in-progress marker: set before the transition begins so an
     // interrupted reindex (crash, kill) is detected on the next normal open;
-    // deleted only after update_metas completes. `open_inner` treats the
-    // value "1" as active. Covers both the dimension-change and the
-    // tokenizer-only path (a failure after rebuild_all, including
-    // update_metas failures, stays detectable).
-    db.set_meta("reindex_in_progress", "1").await?;
+    // deleted only after update_metas completes. The value records WHAT was
+    // interrupted: "dim" requires the full dimension transition (wipe +
+    // field redefinition + redefine_index) on rerun, "meta" only the
+    // rebuild_all + metadata path. `open_inner` treats both as active.
+    db.set_meta(
+        "reindex_in_progress",
+        if dimension_changed { "dim" } else { "meta" },
+    )
+    .await?;
 
     if dimension_changed {
         // 1. Atomic transition: wipe old chunks/mentions and redefine the

@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, GetPromptRequestParams,
@@ -399,13 +399,35 @@ impl SkbServer {
                     let peer2 = context.peer.clone();
                     let token2 = token.clone();
                     let forwarder = tokio::spawn(async move {
+                        // Track the highest total seen; when the channel
+                        // closes, a final done == total notification is
+                        // completed on the forwarder side so it can never be
+                        // lost to a full channel.
+                        let mut last_total = 0usize;
                         while let Some((done, total)) = rx.recv().await {
+                            last_total = last_total.max(total);
                             let notification = rmcp::model::Notification::new(
                                 rmcp::model::ProgressNotificationParam::new(
                                     token2.clone(),
                                     done as f64,
                                 )
                                 .with_total(total as f64),
+                            );
+                            let _ = peer2
+                                .send_notification(
+                                    rmcp::model::ServerNotification::ProgressNotification(
+                                        notification,
+                                    ),
+                                )
+                                .await;
+                        }
+                        if last_total > 0 {
+                            let notification = rmcp::model::Notification::new(
+                                rmcp::model::ProgressNotificationParam::new(
+                                    token2,
+                                    last_total as f64,
+                                )
+                                .with_total(last_total as f64),
                             );
                             let _ = peer2
                                 .send_notification(
@@ -459,13 +481,10 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let config = Config::load().map_err(|e| {
-        let err = skb_core::error::SkbError::new(
-            skb_core::error::ErrorCode::Config,
-            format!("failed to load config: {e}"),
-        );
-        rmcp::ErrorData::invalid_params(err.to_string(), None)
-    })?;
+    // Match the CLI: Config::load() returning a default for a missing config
+    // file is fine, but parse errors and invalid SKB_* environment values must
+    // stop startup. Propagate the anyhow error with its file-path context.
+    let config = Config::load().context("failed to load config")?;
     // In a model/tokenizer mismatch state, start anyway so `skb_reindex`
     // can rebuild the database (spec §9-5).
     let kb = match KnowledgeBase::open(config.clone()).await {

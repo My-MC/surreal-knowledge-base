@@ -289,8 +289,10 @@ fn golden_upload_search_list_stats_get_delete() {
     assert_eq!(a[0]["chunk_count"], 1, "chunk_count must be populated");
 
     // stats
-    let mcp_stats = mcp.call_tool("skb_stats", json!({})).unwrap();
-    let cli_stats = run_cli(&cli_dir, &["stats"], None).unwrap();
+    let mut mcp_stats = mcp.call_tool("skb_stats", json!({})).unwrap();
+    let mut cli_stats = run_cli(&cli_dir, &["stats"], None).unwrap();
+    normalize(&mut mcp_stats);
+    normalize(&mut cli_stats);
     assert_eq!(mcp_stats, cli_stats, "stats: {mcp_stats} vs {cli_stats}");
 
     // get

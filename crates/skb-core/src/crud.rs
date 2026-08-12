@@ -202,14 +202,16 @@ pub async fn list_documents(db: &Db, q: &ListQuery) -> Result<Vec<DocumentSummar
     // Per-document chunk counts restricted to the documents on this page
     // (the count query reuses the fetched ids instead of grouping every chunk
     // row in the table). Direct RecordId comparison: the page ids are
-    // `document:<key>` strings parsed back into record ids. A document whose
-    // id fails to parse cannot match any chunk; log a diagnostic instead of
-    // silently reporting a zero chunk_count.
+    // `document:<key>` strings parsed back into record ids via the shared
+    // document_record_id helper (validate_document_id + RecordId::new), so
+    // escaped keys are handled the same way as every other document id path.
+    // A document whose id fails to parse cannot match any chunk; log a
+    // diagnostic instead of silently reporting a zero chunk_count.
     let page_ids: Vec<surrealdb::types::RecordId> = rows
         .iter()
         .filter_map(|row| {
             let s = row["id"].as_str()?;
-            match surrealdb::types::RecordId::parse_simple(s) {
+            match document_record_id(s) {
                 Ok(id) => Some(id),
                 Err(e) => {
                     tracing::warn!(id = %s, error = %e, "document id is not a valid record id");

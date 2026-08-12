@@ -7,6 +7,8 @@
 // Usage: node smoke-mcp.mjs <path-to-skb-mcp-binary>
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
+import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 
 const bin = process.argv[2];
 if (!bin) {
@@ -16,9 +18,10 @@ if (!bin) {
 
 // Dedicated store under the repository's target directory (absolute path, so
 // it is independent of the process working directory; SKB_STORAGE_PATH is the
-// env override handled by Config::load).
-const repoRoot = new URL("..", import.meta.url).pathname;
-const dbPath = `${repoRoot}target/skb-smoke-db-${process.pid}`;
+// env override handled by Config::load). fileURLToPath + join handle spaces,
+// non-ASCII characters and Windows paths correctly.
+const repoRoot = fileURLToPath(new URL("..", import.meta.url));
+const dbPath = join(repoRoot, "target", `skb-smoke-db-${process.pid}`);
 const child = spawn(bin, [], {
   stdio: ["pipe", "pipe", "inherit"],
   env: { ...process.env, SKB_STORAGE_PATH: dbPath },
@@ -41,6 +44,12 @@ function fail(message) {
 
 child.on("exit", () => {
   shuttingDown = true;
+});
+
+// A spawn failure (missing binary, permission denied) must fail the smoke
+// run with a clear message instead of hanging on the response wait.
+child.on("error", (err) => {
+  fail(`cannot start MCP binary '${bin}': ${err.message}`);
 });
 
 rl.on("line", (line) => {

@@ -279,9 +279,8 @@ Phase 0〜8 で確定した方針（`tokenizers`、SurrealKV 組込み、ORT 静
 - reindexを起動時のmodel mismatch状態から実行できる管理経路を用意する。
 - dimension変更時に`chunk.embedding`フィールドとHNSWインデックスを再定義し、旧chunk/mentions削除、新chunk/entity索引、model metadata更新を同一transaction境界で処理する。
 - 中断・失敗時は `E_MODEL_MISMATCH` と `reindex_in_progress` マーカーで検出し、`reindex` 再実行が次元変更経路（`redefine_index` を含む）を強制して復旧する。完全 rollback は遷移トランザクション内のみで、wipe/HNSW 再構築分割後の中間状態は再実行で修復する。
-- 中断の検出と復旧は `E_MODEL_MISMATCH` + `reindex_in_progress` マーカーで行い、`reindex` 再実行が次元変更経路を強制して完了させる（完全 rollback は遷移トランザクション内のみ）。
 - MCP progress notificationとCLI progress barを実装する。
-- **完了条件**: dimension変更、HNSW再構築、metadata更新、途中失敗rollback、再起動復旧、progressのテストが緑。
+- **完了条件**: dimension変更、HNSW再構築、metadata更新、遷移transaction内の途中失敗rollback、再起動復旧（`E_MODEL_MISMATCH` + マーカー検出 + reindex再実行）、progressのテストが緑。
 
 ✅ 実装済み: `open` を `migrate` 前にモデル/次元比較（新規DBは `INFO FOR DB` で判定し初期化パス）、`open_for_reindex`（mismatch 状態から開く管理経路、CLI/MCP の reindex は `E_MODEL_MISMATCH` 時に自動フォールバック）。dimension 変更は (1) 単一トランザクションで旧chunk/mentions削除 + embeddingフィールド再定義 → (2) ドキュメント単位再構築 → (3) HNSWインデックス再定義 → (4) meta更新 の順で実行し、遷移直後に次元metaを更新して中断状態を常に検出可能に（再実行で完了）。`reindex_in_progress` マーカーを遷移前に set し、`update_metas` 成功後に delete する（`open_inner` はマーカー値"1"を検出して通常 open を `E_MODEL_MISMATCH` で拒否、`reindex` はマーカーを読んで次元変更経路を強制）。`reindex` は進捗コールバック `(done, total)` を受け、MCP は progress notification（`notifications/progress`）、CLI は stderr に `reindexed n/total`（キャリッジリターンで同一行更新、完了時は改行）を出力。
 
