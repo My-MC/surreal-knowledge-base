@@ -295,14 +295,25 @@ fn rows_to_hits(
 ) -> Result<Vec<SearchHit>, SkbError> {
     let mut hits = Vec::new();
     for row in rows {
+        let content = row["content"].as_str().unwrap_or("").to_string();
+        // Only terms actually present in this chunk's content are highlighted
+        // (match_terms already returns lowercase terms).
+        let content_lower = content.to_lowercase();
+        let hit_highlights: Option<Vec<String>> = highlights.map(|terms| {
+            terms
+                .iter()
+                .filter(|t| content_lower.contains(t.as_str()))
+                .cloned()
+                .collect()
+        });
         hits.push(SearchHit {
             document_id: row["document"].as_str().unwrap_or("").to_string(),
             chunk_idx: row["idx"].as_u64().unwrap_or(0) as usize,
-            content: row["content"].as_str().unwrap_or("").to_string(),
+            content,
             score: row["score"].as_f64().unwrap_or(0.0),
             title: row["title"].as_str().map(|s| s.to_string()),
             source: row["source"].as_str().map(|s| s.to_string()),
-            highlights: highlights.cloned(),
+            highlights: hit_highlights,
             matched_entities: None,
         });
     }

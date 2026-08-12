@@ -97,7 +97,7 @@ pub async fn reindex(
             .begin()
             .await
             .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex begin: {e}")))?;
-        let rebuilt = rebuild_document(&tx, did, &chunks, &embeddings).await;
+        let rebuilt = rebuild_document(&tx, did, content, &chunks, &embeddings).await;
         let entity_names = match rebuilt {
             Ok(names) => {
                 tx.commit()
@@ -179,6 +179,7 @@ type LocalTransaction = surrealdb::method::Transaction<surrealdb::engine::local:
 async fn rebuild_document(
     tx: &LocalTransaction,
     did: &str,
+    content: &str,
     chunks: &[crate::tokenize::Chunk],
     embeddings: &[Vec<f32>],
 ) -> Result<Vec<String>, SkbError> {
@@ -232,6 +233,10 @@ async fn rebuild_document(
             crate::graph::index_chunk_entities_in_transaction(tx, cid, &chunk.content).await?;
         entity_names.extend(names);
     }
+    // Recreate the heading part-of hierarchy from the original document body,
+    // matching ingest so section links are rebuilt when extraction rules
+    // change.
+    crate::graph::link_section_hierarchy(tx, content).await?;
     Ok(entity_names.into_iter().collect())
 }
 

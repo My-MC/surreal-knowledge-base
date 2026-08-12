@@ -762,6 +762,7 @@ pub fn is_blocked_ip(ip: IpAddr) -> bool {
                 || v6.is_unique_local()
                 || v6.is_unicast_link_local()
                 || is_documentation_v6(v6)
+                || is_site_local_v6(v6)
                 || is_nat64_v6(v6)
                 || is_6to4_v6(v6)
                 || is_teredo_v6(v6)
@@ -791,6 +792,11 @@ fn is_blocked_v4(v4: std::net::Ipv4Addr) -> bool {
         || is_benchmarking(v4)
         || is_reserved_v4(v4)
         || v4.octets() == [169, 254, 169, 254]
+        // 0.0.0.0/8 — "this network" (the whole range, not only the
+        // unspecified address).
+        || v4.octets()[0] == 0
+        // 192.88.99.0/24 — 6to4 relay anycast.
+        || (v4.octets()[0] == 192 && v4.octets()[1] == 88 && v4.octets()[2] == 99)
 }
 
 /// 100.64.0.0/10 — shared address space (CGNAT).
@@ -810,9 +816,19 @@ fn is_reserved_v4(v4: std::net::Ipv4Addr) -> bool {
     v4.octets()[0] >= 240
 }
 
-/// 2001:db8::/32 — documentation range.
+/// 2001:db8::/32 — documentation range; 3ff0::/12 — documentation (RFC 9637
+/// assigns 3fff::/20; the broader /12 covers 3ff0::1 too).
 fn is_documentation_v6(v6: std::net::Ipv6Addr) -> bool {
-    v6.segments()[0] == 0x2001 && v6.segments()[1] == 0x0db8
+    let s = v6.segments();
+    if s[0] == 0x2001 && s[1] == 0x0db8 {
+        return true;
+    }
+    s[0] & 0xfff0 == 0x3ff0
+}
+
+/// fec0::/10 — site-local (deprecated, still must be blocked).
+fn is_site_local_v6(v6: std::net::Ipv6Addr) -> bool {
+    v6.segments()[0] & 0xffc0 == 0xfec0
 }
 
 /// 64:ff9b::/96 — NAT64 well-known prefix (maps to IPv4 destinations).

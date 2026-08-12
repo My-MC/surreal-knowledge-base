@@ -108,7 +108,12 @@ impl Tokenize for TokenizersImpl {
                 if let Some(i) = (start + 1..window_end)
                     .find(|&i| offsets.get(i).map(|o| o.1).unwrap_or(0) > heading_off)
                 {
-                    end = i;
+                    // Only apply the heading split when the resulting chunk
+                    // keeps more than one token; a single-token chunk would
+                    // not advance progress.
+                    if i > start + 1 {
+                        end = i;
+                    }
                 }
             }
 
@@ -146,16 +151,30 @@ impl Tokenize for TokenizersImpl {
 fn heading_starts(text: &str) -> Vec<usize> {
     let mut out = Vec::new();
     let mut line_start = 0usize;
+    // Fence state: a line whose trimmed content starts with ``` or ~~~
+    // toggles the fence; heading-like lines inside either fence are ignored.
+    let mut in_fence = false;
     for (i, b) in text.bytes().enumerate() {
         if b == b'\n' {
-            if is_heading_line(&text[line_start..i]) {
+            let line = &text[line_start..i];
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+                in_fence = !in_fence;
+            } else if !in_fence && is_heading_line(trimmed) {
                 out.push(line_start);
             }
             line_start = i + 1;
         }
     }
-    if line_start < text.len() && is_heading_line(&text[line_start..]) {
-        out.push(line_start);
+    if line_start < text.len() {
+        let line = &text[line_start..];
+        let trimmed = line.trim_start();
+        if !(trimmed.starts_with("```") || trimmed.starts_with("~~~"))
+            && !in_fence
+            && is_heading_line(trimmed)
+        {
+            out.push(line_start);
+        }
     }
     out
 }

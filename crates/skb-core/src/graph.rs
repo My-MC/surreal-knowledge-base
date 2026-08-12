@@ -584,8 +584,11 @@ pub async fn expand_search_hits(
             }
             // Cap the frontier at the end of each hop so a dense graph
             // cannot grow it unboundedly across hops (request-level bound).
+            // Sort by decay descending first so truncation keeps the closest
+            // (highest-decay) entities deterministically.
             frontier.extend(next);
             if frontier.len() > frontier_max {
+                frontier.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                 frontier.truncate(frontier_max);
             }
         }
@@ -902,13 +905,18 @@ pub(crate) async fn link_section_hierarchy(
             }
             // Idempotent edge: `RELATE` always creates a new edge, so remove
             // an existing part-of edge between the same pair first. Section
-            // entities are global (shared across documents), so the dedup is
-            // per pair — repeated uploads never accumulate duplicates.
+            // Idempotent edge with a single-parent invariant: remove EVERY
+            // existing part-of edge where this child is the `in` endpoint
+            // before creating the current parent edge, so a child that
+            // changed its nearest parent keeps no stale edge. Section
+            // entities are global (shared across documents), so the child's
+            // parent is the nearest ancestor in whichever document last
+            // linked it.
             // Direction: the child section is part of its ancestor, so the
             // edge points child -> part-of -> parent.
             tx.query(
                 "DELETE FROM related_to WHERE relation = 'part-of' \
-                 AND in = $child AND out = $parent; \
+                 AND in = $child; \
                  RELATE $child->related_to->$parent SET relation = 'part-of', weight = 1.0",
             )
             .bind(("child", entity_record_id(&section.name)?))

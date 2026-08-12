@@ -91,10 +91,15 @@ impl OrderBy {
 /// in memory, so unbounded limits would let a single request exhaust memory.
 pub(crate) const MAX_LIST_LIMIT: usize = 10_000;
 
+/// Upper bound for list offset: a huge offset makes SurrealDB scan that many
+/// records before returning, so cap it to bound per-request CPU/IO.
+pub(crate) const MAX_LIST_OFFSET: usize = 1_000_000;
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
 pub struct ListQuery {
     #[schemars(range(min = 1, max = MAX_LIST_LIMIT))]
     pub limit: Option<usize>,
+    #[schemars(range(min = 0, max = MAX_LIST_OFFSET))]
     pub offset: Option<usize>,
     pub order: Option<OrderBy>,
 }
@@ -112,6 +117,14 @@ impl ListQuery {
                 return Err(SkbError::new(
                     ErrorCode::Validation,
                     format!("limit must be at most {MAX_LIST_LIMIT}"),
+                ));
+            }
+        }
+        if let Some(offset) = self.offset {
+            if offset > MAX_LIST_OFFSET {
+                return Err(SkbError::new(
+                    ErrorCode::Validation,
+                    format!("offset must be at most {MAX_LIST_OFFSET}"),
                 ));
             }
         }
