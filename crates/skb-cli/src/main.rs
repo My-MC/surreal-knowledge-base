@@ -292,6 +292,11 @@ async fn run(cli: &Cli) -> Result<u8> {
                 println!("Tokenizer vocab: {}", report.tokenizer_vocab);
                 println!("Model: {}", report.model);
                 println!("Schema ver: {}", report.schema_version);
+                println!("Tokenizer ver: {}", report.tokenizer_version);
+                println!(
+                    "Fingerprint schema: {}",
+                    report.tokenizer_fingerprint_schema
+                );
                 for error in &report.errors {
                     println!("[ERROR] {error}");
                 }

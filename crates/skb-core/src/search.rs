@@ -274,9 +274,13 @@ async fn hybrid_search(
 
     let mut sorted: Vec<_> = scores.into_iter().collect();
     sorted.sort_by(|a, b| {
+        // Deterministic ordering: equal RRF scores fall back to the chunk id
+        // so truncate(top_k) keeps the same hits regardless of HashMap
+        // iteration order.
         b.1.score
             .partial_cmp(&a.1.score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
     });
     sorted.truncate(top_k);
 

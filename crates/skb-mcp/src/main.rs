@@ -91,26 +91,26 @@ impl ServerHandler for SkbServer {
         request: ReadResourceRequestParams,
         _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
     ) -> Result<ReadResourceResponse, rmcp::ErrorData> {
-        let kb = self.kb.lock().await;
         let uri = request.uri.clone();
         let contents: Vec<ResourceContents> = if uri == "skb://documents" {
             // Bound the response: accumulate at most MAX_DOCUMENTS_RESOURCE
             // entries so a large store cannot exhaust memory or produce an
-            // unbounded payload (spec §8.3). Fetch one extra page to learn
-            // whether truncation actually occurred; `truncated` is reported
-            // inside a valid JSON payload so clients can parse the resource.
+            // unbounded payload (spec §8.3). The kb lock is acquired per page
+            // so it is never held across the paginated await calls.
             const MAX_DOCUMENTS_RESOURCE: usize = 10_000;
             let mut docs: Vec<skb_core::crud::DocumentSummary> = Vec::new();
             let mut offset = 0;
             loop {
-                let page = kb
-                    .list_documents(&ListQuery {
+                let page = {
+                    let kb = self.kb.lock().await;
+                    kb.list_documents(&ListQuery {
                         limit: Some(100),
                         offset: Some(offset),
                         order: None,
                     })
                     .await
-                    .map_err(err_data)?;
+                    .map_err(err_data)?
+                };
                 let page_len = page.len();
                 docs.extend(page);
                 if page_len < 100 || docs.len() > MAX_DOCUMENTS_RESOURCE {
@@ -128,11 +128,13 @@ impl ServerHandler for SkbServer {
             .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
             vec![ResourceContents::text(body, uri)]
         } else if uri == "skb://stats" {
+            let kb = self.kb.lock().await;
             let stats = kb.stats().await.map_err(err_data)?;
             let body = serde_json::to_string_pretty(&stats)
                 .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
             vec![ResourceContents::text(body, uri)]
         } else if let Some(id) = uri.strip_prefix("skb://documents/") {
+            let kb = self.kb.lock().await;
             let doc = kb
                 .get_document(&GetDocumentRequest {
                     id: id.to_string(),
@@ -399,13 +401,20 @@ impl SkbServer {
                     let peer2 = context.peer.clone();
                     let token2 = token.clone();
                     let forwarder = tokio::spawn(async move {
+                        // Only strictly increasing progress is forwarded:
+                        // duplicate or non-increasing values are discarded.
                         // Track the highest total seen; when the channel
                         // closes, a final done == total notification is
                         // completed on the forwarder side so it can never be
                         // lost to a full channel.
+                        let mut max_sent = 0usize;
                         let mut last_total = 0usize;
                         while let Some((done, total)) = rx.recv().await {
                             last_total = last_total.max(total);
+                            if done <= max_sent {
+                                continue;
+                            }
+                            max_sent = done;
                             let notification = rmcp::model::Notification::new(
                                 rmcp::model::ProgressNotificationParam::new(
                                     token2.clone(),

@@ -165,16 +165,37 @@ impl Tokenize for TokenizersImpl {
 fn heading_starts(text: &str) -> Vec<usize> {
     let mut out = Vec::new();
     let mut line_start = 0usize;
+    // Track the opening fence marker (``` or ~~~); a fence closes only on a
+    // line starting with the SAME marker, so `# heading`-like lines inside
+    // either fence are never treated as headings (CommonMark).
+    let mut fence_marker: Option<&str> = None;
     for (i, b) in text.bytes().enumerate() {
         if b == b'\n' {
-            if is_heading_line(&text[line_start..i]) {
+            let line = &text[line_start..i];
+            let trimmed = line.trim_start();
+            if let Some(open) = fence_marker {
+                if trimmed.starts_with(open) {
+                    fence_marker = None;
+                }
+            } else if trimmed.starts_with("```") {
+                fence_marker = Some("```");
+            } else if trimmed.starts_with("~~~") {
+                fence_marker = Some("~~~");
+            } else if is_heading_line(trimmed) {
                 out.push(line_start);
             }
             line_start = i + 1;
         }
     }
-    if line_start < text.len() && is_heading_line(&text[line_start..]) {
-        out.push(line_start);
+    if line_start < text.len() {
+        let line = &text[line_start..];
+        let trimmed = line.trim_start();
+        if !(trimmed.starts_with("```") || trimmed.starts_with("~~~"))
+            && fence_marker.is_none()
+            && is_heading_line(trimmed)
+        {
+            out.push(line_start);
+        }
     }
     out
 }
@@ -236,6 +257,15 @@ mod tests {
     fn collects_heading_offsets() {
         let text = "# A\nbody\n## B\nmore\n";
         assert_eq!(heading_starts(text), vec![0, 9]);
+    }
+
+    #[test]
+    fn heading_starts_skips_fenced_heading_like_lines() {
+        // Heading-like lines inside ``` and ~~~ fences must not be detected;
+        // a fence closes only on its own marker.
+        let text = "# Real\n```\n# Fake\n~~~\nstill inside\n```\n## Real2\n~~~\n# Fake2\n~~~\n";
+        let starts = heading_starts(text);
+        assert_eq!(starts, vec![0, 39], "got {starts:?}");
     }
 
     #[test]

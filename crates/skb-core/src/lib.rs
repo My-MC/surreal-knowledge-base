@@ -295,8 +295,9 @@ impl KnowledgeBase {
         let mut r = r
             .check()
             .map_err(|e| SkbError::new(ErrorCode::Db, format!("query check: {e}")))?;
-        // Iterate the fixed statement count: Value::None is a valid statement
-        // result (e.g. a RETURN-less statement), not a loop terminator.
+        // Iterate the fixed statement count so statement positions stay
+        // aligned: Value::None is a valid result (e.g. a RETURN-less
+        // statement) and is appended as null; take failures are real errors.
         let mut statements: Vec<serde_json::Value> = Vec::new();
         let count = r.num_statements();
         for idx in 0..count {
@@ -304,7 +305,13 @@ impl KnowledgeBase {
                 Ok(value) if value != surrealdb::types::Value::None => {
                     statements.push(value.into_json_value());
                 }
-                _ => {}
+                Ok(_) => statements.push(serde_json::Value::Null),
+                Err(e) => {
+                    return Err(SkbError::new(
+                        ErrorCode::Db,
+                        format!("query take statement {idx}: {e}"),
+                    ));
+                }
             }
         }
         Ok(serde_json::json!({ "statements": statements }))

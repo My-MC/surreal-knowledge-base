@@ -512,10 +512,12 @@ pub async fn expand_search_hits(
         .iter()
         .map(|h| (h.document_id.clone(), h.chunk_idx))
         .collect();
+    // document_id is the raw key; build each record id with RecordId::new
+    // (like crud::document_record_id) so escaped keys are preserved instead
+    // of being dropped by a parse/filter path.
     let unique_docs: Vec<RecordId> = hits
         .iter()
-        .map(|h| format!("document:{}", h.document_id))
-        .filter_map(|s| RecordId::parse_simple(&s).ok())
+        .map(|h| RecordId::new("document", h.document_id.clone()))
         .collect::<std::collections::HashSet<_>>()
         .into_iter()
         .collect();

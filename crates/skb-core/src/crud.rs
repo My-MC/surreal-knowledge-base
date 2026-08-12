@@ -33,6 +33,8 @@ pub struct ChunkInfo {
     pub idx: usize,
     pub content: String,
     pub token_count: usize,
+    // Defaulted so legacy JSON without the field deserializes cleanly.
+    #[serde(default)]
     pub heading: Option<String>,
 }
 
@@ -92,10 +94,15 @@ impl OrderBy {
 /// in memory, so unbounded limits would let a single request exhaust memory.
 const MAX_LIST_LIMIT: usize = 10_000;
 
+/// Upper bound for list offset: a huge offset makes SurrealDB scan that many
+/// records before returning, so cap it to bound per-request CPU/IO.
+const MAX_LIST_OFFSET: usize = 1_000_000;
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
 pub struct ListQuery {
     #[schemars(range(min = 1, max = MAX_LIST_LIMIT))]
     pub limit: Option<usize>,
+    #[schemars(range(min = 0, max = MAX_LIST_OFFSET))]
     pub offset: Option<usize>,
     pub order: Option<OrderBy>,
 }
@@ -113,6 +120,14 @@ impl ListQuery {
                 return Err(SkbError::new(
                     ErrorCode::Validation,
                     format!("limit must be at most {MAX_LIST_LIMIT}"),
+                ));
+            }
+        }
+        if let Some(offset) = self.offset {
+            if offset > MAX_LIST_OFFSET {
+                return Err(SkbError::new(
+                    ErrorCode::Validation,
+                    format!("offset must be at most {MAX_LIST_OFFSET}"),
                 ));
             }
         }
@@ -459,36 +474,39 @@ pub async fn doctor(
         errors: Vec::new(),
     };
     // Connectivity first: the point of doctor is to report problems, so a
-    // broken database must never make the report itself fail. Meta reads
-    // only run when the connection succeeded (a dead store would fail every
-    // read; one recorded connection error is enough).
+    // broken database must never make the report itself fail. The query AND
+    // its statement-level check must both succeed; meta reads only run then
+    // (a dead store would fail every read; one recorded error is enough).
     match db.db.query("RETURN 1").await {
-        Ok(_) => {
-            report.db_connected = true;
-            // Meta reads can also fail; record instead of propagating.
-            match db.get_meta("embedding_model").await {
-                Ok(model) => report.model = model.unwrap_or_default(),
-                Err(e) => report
-                    .errors
-                    .push(format!("read embedding_model meta: {e}")),
+        Ok(r) => match r.check() {
+            Ok(_) => {
+                report.db_connected = true;
+                // Meta reads can also fail; record instead of propagating.
+                match db.get_meta("embedding_model").await {
+                    Ok(model) => report.model = model.unwrap_or_default(),
+                    Err(e) => report
+                        .errors
+                        .push(format!("read embedding_model meta: {e}")),
+                }
+                match db.get_meta("schema_version").await {
+                    Ok(version) => report.schema_version = version.unwrap_or_default(),
+                    Err(e) => report.errors.push(format!("read schema_version meta: {e}")),
+                }
+                match db.get_meta("tokenizer_version").await {
+                    Ok(v) => report.tokenizer_version = v.unwrap_or_default(),
+                    Err(e) => report
+                        .errors
+                        .push(format!("read tokenizer_version meta: {e}")),
+                }
+                match db.get_meta("tokenizer_fingerprint_schema").await {
+                    Ok(v) => report.tokenizer_fingerprint_schema = v.unwrap_or_default(),
+                    Err(e) => report
+                        .errors
+                        .push(format!("read tokenizer_fingerprint_schema meta: {e}")),
+                }
             }
-            match db.get_meta("schema_version").await {
-                Ok(version) => report.schema_version = version.unwrap_or_default(),
-                Err(e) => report.errors.push(format!("read schema_version meta: {e}")),
-            }
-            match db.get_meta("tokenizer_version").await {
-                Ok(v) => report.tokenizer_version = v.unwrap_or_default(),
-                Err(e) => report
-                    .errors
-                    .push(format!("read tokenizer_version meta: {e}")),
-            }
-            match db.get_meta("tokenizer_fingerprint_schema").await {
-                Ok(v) => report.tokenizer_fingerprint_schema = v.unwrap_or_default(),
-                Err(e) => report
-                    .errors
-                    .push(format!("read tokenizer_fingerprint_schema meta: {e}")),
-            }
-        }
+            Err(e) => report.errors.push(format!("SurrealDB connection: {e}")),
+        },
         Err(e) => report.errors.push(format!("SurrealDB connection: {e}")),
     }
     if report.embedding_dimension == 0 {

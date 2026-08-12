@@ -339,5 +339,8 @@ fn golden_upload_search_list_stats_get_delete() {
         "CLI error: {cli_err}"
     );
 
+    // Release the MCP child process and its file handles before removing the
+    // test directories.
+    drop(mcp);
     let _ = std::fs::remove_dir_all(&root);
 }

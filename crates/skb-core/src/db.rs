@@ -41,7 +41,7 @@ pub(crate) trait MetaStore {
 
 impl MetaStore for Db {
     async fn set_meta(&self, key: &str, val: &str) -> Result<(), SkbError> {
-        Db::set_meta(self, key, val).await
+        set_meta_impl(&self.db, key, val).await
     }
 }
 
@@ -56,6 +56,24 @@ impl MetaStore for surrealdb::method::Transaction<surrealdb::engine::local::Db> 
             .map_err(|e| SkbError::new(ErrorCode::Db, format!("set_meta check: {e}")))?;
         Ok(())
     }
+}
+
+/// Shared upsert implementation for the connection handle; both the inherent
+/// `Db::set_meta` and the `MetaStore for Db` impl delegate here so the SQL and
+/// error mapping cannot diverge.
+async fn set_meta_impl(
+    db: &Surreal<surrealdb::engine::local::Db>,
+    key: &str,
+    val: &str,
+) -> Result<(), SkbError> {
+    db.query(SET_META_SQL)
+        .bind(("key", key))
+        .bind(("val", val))
+        .await
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("set_meta: {e}")))?
+        .check()
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("set_meta check: {e}")))?;
+    Ok(())
 }
 
 impl Db {
@@ -133,15 +151,7 @@ impl Db {
     }
 
     pub async fn set_meta(&self, key: &str, val: &str) -> Result<(), SkbError> {
-        self.db
-            .query(SET_META_SQL)
-            .bind(("key", key))
-            .bind(("val", val))
-            .await
-            .map_err(|e| SkbError::new(ErrorCode::Db, format!("set_meta: {e}")))?
-            .check()
-            .map_err(|e| SkbError::new(ErrorCode::Db, format!("set_meta check: {e}")))?;
-        Ok(())
+        set_meta_impl(&self.db, key, val).await
     }
 }
 

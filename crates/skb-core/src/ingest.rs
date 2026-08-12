@@ -360,11 +360,15 @@ async fn extract_document_data(
             .to_string();
         let config = config.clone();
         let raw = tokio::task::spawn_blocking(move || -> Result<RawInput, SkbError> {
-            validate_path(&path, &config)?;
-            let meta = std::fs::metadata(&path)
+            // The canonicalized path returned by validate_path is the one
+            // used for metadata, size validation and the read, so the
+            // validated path is the path actually opened (no TOCTOU
+            // re-resolution window).
+            let canonical = validate_path(&path, &config)?;
+            let meta = std::fs::metadata(&canonical)
                 .map_err(|e| SkbError::new(ErrorCode::Io, format!("stat file: {e}")))?;
             check_size(meta.len(), &config)?;
-            let bytes = read_file_bytes(&path)?;
+            let bytes = read_file_bytes(&canonical)?;
             Ok(RawInput::Bytes(bytes))
         })
         .await
@@ -955,20 +959,22 @@ fn base64_decode_checked(b64: &str, config: &Config) -> Result<Vec<u8>, SkbError
     Ok(bytes)
 }
 
-fn validate_path(path: &std::path::Path, config: &Config) -> Result<(), SkbError> {
-    let allowed = &config.upload.allowed_dirs;
-    if allowed.is_empty() {
-        return Ok(());
-    }
+fn validate_path(path: &std::path::Path, config: &Config) -> Result<std::path::PathBuf, SkbError> {
+    // Always canonicalize so the returned path is the resolved one used for
+    // the subsequent metadata / read operations (no re-resolution window).
     let canonical = path
         .canonicalize()
         .map_err(|e| SkbError::new(ErrorCode::Io, format!("resolve path: {e}")))?;
+    let allowed = &config.upload.allowed_dirs;
+    if allowed.is_empty() {
+        return Ok(canonical);
+    }
     for dir in allowed {
         let can_dir = dir
             .canonicalize()
             .map_err(|e| SkbError::new(ErrorCode::Io, format!("resolve allowed dir: {e}")))?;
         if canonical.starts_with(&can_dir) {
-            return Ok(());
+            return Ok(canonical);
         }
     }
     Err(SkbError::new(
