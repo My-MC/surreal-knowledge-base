@@ -571,8 +571,11 @@ pub async fn expand_search_hits(
         }
 
         // Cap each hop's frontier so a dense graph cannot issue unbounded
-        // related_to queries (request-level bound on query fan-out).
+        // related_to queries (request-level bound on query fan-out). Sort by
+        // entity name ascending first so the truncation is deterministic,
+        // matching the later frontier truncations.
         if frontier.len() > FRONTIER_MAX {
+            frontier.sort_by(|a, b| a.0.cmp(&b.0));
             frontier.truncate(FRONTIER_MAX);
         }
 
@@ -581,11 +584,14 @@ pub async fn expand_search_hits(
         let mut visited: HashSet<String> = HashSet::new();
         for hop in 2..=max_expand {
             let mut next: Vec<(String, f64)> = Vec::new();
-            let hop_names: Vec<String> = frontier
-                .iter()
-                .filter(|(e, _)| visited.insert(e.clone()))
-                .map(|(e, _)| e.clone())
-                .collect();
+            // First collect the not-yet-visited entities, then register them
+            // — side effects and selection are separate steps.
+            let mut hop_names: Vec<String> = Vec::new();
+            for (e, _) in frontier.iter() {
+                if visited.insert(e.clone()) {
+                    hop_names.push(e.clone());
+                }
+            }
             if hop_names.is_empty() {
                 // No unvisited entities remain: further hops would be
                 // identical, so expansion terminates.
@@ -677,12 +683,19 @@ pub async fn expand_search_hits(
             }
             let matched = to_string_vec(&erow["e"]);
             // Missing-decay fallback stays below 1.0 so an expanded result
-            // can never tie a direct hit in the re-rank (spec §6).
+            // can never tie a direct hit in the re-rank (spec §6). When no
+            // entity is available, matched_entities stays None instead of
+            // fabricating an empty name.
             let (decay, entity) = matched
                 .iter()
                 .filter_map(|e| decay_map.get(e).map(|d| (d, e.clone())))
                 .max_by(|a, b| a.0.partial_cmp(b.0).unwrap_or(std::cmp::Ordering::Equal))
                 .unwrap_or((&0.95, matched.into_iter().next().unwrap_or_default()));
+            let matched_entities = if entity.is_empty() {
+                None
+            } else {
+                Some(vec![entity])
+            };
             expanded.push(SearchHit {
                 document_id,
                 chunk_idx,
@@ -691,7 +704,7 @@ pub async fn expand_search_hits(
                 title: erow["title"].as_str().map(|s| s.to_string()),
                 source: erow["source"].as_str().map(|s| s.to_string()),
                 highlights: None,
-                matched_entities: Some(vec![entity]),
+                matched_entities,
             });
         }
     }

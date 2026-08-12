@@ -235,6 +235,10 @@ pub async fn list_documents(db: &Db, q: &ListQuery) -> Result<Vec<DocumentSummar
             }
         })
         .collect();
+    // Skip the aggregation entirely for an empty page (no rows to count).
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
     let mut r = db
         .db
         .query(
@@ -523,6 +527,16 @@ pub async fn doctor(
         report
             .errors
             .push("embedding model is not recorded in meta".to_string());
+    }
+    if report.tokenizer_version.is_empty() {
+        report
+            .errors
+            .push("tokenizer_version is not recorded in meta".to_string());
+    }
+    if report.tokenizer_fingerprint_schema.is_empty() {
+        report
+            .errors
+            .push("tokenizer_fingerprint_schema is not recorded in meta".to_string());
     }
     Ok(report)
 }

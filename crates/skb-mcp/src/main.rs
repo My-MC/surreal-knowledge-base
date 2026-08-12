@@ -393,6 +393,10 @@ impl SkbServer {
             "skb_reindex" => {
                 self.reindexing
                     .store(true, std::sync::atomic::Ordering::Relaxed);
+                // Release the kb guard before handle_reindex so that method
+                // reacquires it (and the reindexing flag is not held across
+                // the lock).
+                drop(kb);
                 let out = self.handle_reindex(Value::Object(args), context).await;
                 self.reindexing
                     .store(false, std::sync::atomic::Ordering::Relaxed);

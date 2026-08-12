@@ -106,7 +106,7 @@ impl KnowledgeBase {
             // "meta" = metadata/tokenizer rebuild); refuse normal opens so
             // the store is never used half-rebuilt (spec §9-5).
             let in_progress = db.get_meta("reindex_in_progress").await?;
-            if matches!(in_progress.as_deref(), Some("dim") | Some("meta")) {
+            if in_progress.as_deref().is_some_and(|v| !v.is_empty()) {
                 return Err(SkbError::new(
                     ErrorCode::ModelMismatch,
                     "a reindex is in progress or was interrupted; run `skb reindex` to complete it",

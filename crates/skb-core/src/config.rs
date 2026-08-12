@@ -147,6 +147,21 @@ impl std::str::FromStr for SearchMode {
     }
 }
 
+impl std::str::FromStr for StorageMode {
+    type Err = crate::error::SkbError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "embedded" => Ok(StorageMode::Embedded),
+            "remote" => Ok(StorageMode::Remote),
+            other => Err(crate::error::SkbError::new(
+                crate::error::ErrorCode::Validation,
+                format!("unknown storage mode: {other}"),
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UploadConfig {
@@ -187,6 +202,20 @@ impl Config {
     pub fn apply_env_overrides(&mut self) -> anyhow::Result<()> {
         if let Some(v) = env_opt("SKB_STORAGE_PATH")? {
             self.storage.path = PathBuf::from(v);
+        }
+        if let Some(v) = env_opt("SKB_STORAGE_MODE")? {
+            self.storage.mode = v
+                .parse::<StorageMode>()
+                .with_context(|| format!("SKB_STORAGE_MODE invalid, got '{v}'"))?;
+        }
+        if let Some(v) = env_opt("SKB_STORAGE_URL")? {
+            self.storage.url = Some(v);
+        }
+        if let Some(v) = env_opt("SKB_STORAGE_USERNAME")? {
+            self.storage.username = Some(v);
+        }
+        if let Some(v) = env_opt("SKB_STORAGE_PASSWORD")? {
+            self.storage.password = Some(v);
         }
         if let Some(v) = env_opt("SKB_STORAGE_NAMESPACE")? {
             self.storage.namespace = v;
@@ -252,11 +281,20 @@ impl Config {
                 .with_context(|| format!("SKB_UPLOAD_MAX_FILE_MB must be a number, got '{v}'"))?;
         }
         if let Some(v) = env_opt("SKB_UPLOAD_ALLOWED_DIRS")? {
-            self.upload.allowed_dirs = v
+            let dirs: Vec<PathBuf> = v
                 .split(',')
                 .map(|part| PathBuf::from(part.trim()))
                 .filter(|p| !p.as_os_str().is_empty())
                 .collect();
+            if dirs.is_empty() {
+                // Present but all entries empty (empty string, commas,
+                // whitespace) would silently disable the allowed-directories
+                // restriction; reject the configuration.
+                anyhow::bail!(
+                    "SKB_UPLOAD_ALLOWED_DIRS must list at least one directory, got '{v}'"
+                );
+            }
+            self.upload.allowed_dirs = dirs;
         }
         Ok(())
     }

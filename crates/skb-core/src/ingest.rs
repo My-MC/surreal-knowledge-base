@@ -421,7 +421,10 @@ async fn extract_document_data(
     let (content, mime) = match raw {
         RawInput::Text(text) => {
             check_size(text.len() as u64, config)?;
-            (extract_text(&text, &source), mime_hint)
+            (
+                extract_text_with_mime(&text, &source, mime_hint.as_deref()),
+                mime_hint,
+            )
         }
         RawInput::Bytes(bytes) => {
             extract_from_bytes(&bytes, &source, mime_hint.as_deref(), config).await?
@@ -465,7 +468,7 @@ async fn extract_from_bytes(
     }
     match std::str::from_utf8(bytes) {
         Ok(text) => Ok((
-            extract_text(text, source),
+            extract_text_with_mime(text, source, mime_hint),
             mime_hint
                 .map(str::to_string)
                 .or(Some("text/plain".to_string())),
@@ -597,6 +600,19 @@ fn mime_for(name: &str) -> Option<String> {
         _ => "",
     };
     (!mime.is_empty()).then(|| mime.to_string())
+}
+
+/// MIME-aware text extraction: converts HTML when the hint says text/html,
+/// otherwise behaves like extract_text.
+fn extract_text_with_mime(content: &str, source: &str, mime_hint: Option<&str>) -> String {
+    if mime_hint
+        .map(|m| m.to_lowercase() == "text/html")
+        .unwrap_or(false)
+    {
+        html_to_text(content)
+    } else {
+        extract_text(content, source)
+    }
 }
 
 fn extract_text(content: &str, source: &str) -> String {

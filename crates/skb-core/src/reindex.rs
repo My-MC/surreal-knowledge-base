@@ -84,8 +84,11 @@ pub async fn reindex(
     if dry_run {
         let mut dry_entity_names = std::collections::HashSet::new();
         for doc in docs.iter() {
+            let did = doc["did"].as_str().unwrap_or("");
             let content = doc["content"].as_str().unwrap_or("");
-            if content.is_empty() {
+            // Same did/content filter as the execution path so dry-run counts
+            // match rebuild_all.
+            if did.is_empty() || content.is_empty() {
                 continue;
             }
             let chunks = tokenizer.chunk(
@@ -105,11 +108,12 @@ pub async fn reindex(
                         .map(|e| e.name),
                 );
             }
-            result.entities_extracted = dry_entity_names.len();
             result.documents_processed += 1;
             result.chunks_created += chunks.len();
             result.tokens_total += chunks.iter().map(|c| c.token_count).sum::<usize>();
         }
+        // One assignment after the loop: unique entity count across all docs.
+        result.entities_extracted = dry_entity_names.len();
         // Dry runs are side-effect free: no marker, no metadata writes.
         return Ok(result);
     }
