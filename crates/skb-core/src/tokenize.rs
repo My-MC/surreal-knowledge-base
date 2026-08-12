@@ -160,7 +160,7 @@ fn heading_starts(text: &str) -> Vec<usize> {
             let trimmed = line.trim_start();
             if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
                 in_fence = !in_fence;
-            } else if !in_fence && is_heading_line(trimmed) {
+            } else if !in_fence && is_heading_line(line) {
                 out.push(line_start);
             }
             line_start = i + 1;
@@ -171,7 +171,7 @@ fn heading_starts(text: &str) -> Vec<usize> {
         let trimmed = line.trim_start();
         if !(trimmed.starts_with("```") || trimmed.starts_with("~~~"))
             && !in_fence
-            && is_heading_line(trimmed)
+            && is_heading_line(line)
         {
             out.push(line_start);
         }

@@ -57,7 +57,7 @@
 | 領域 | 現在確認できる実装 | 不足する検証/実装 | 次のPhase |
 |---|---|---|---|
 | 設定・モデル | `./skb.toml`/ユーザー設定探索、`SKB_*`環境変数オーバーライド、model名のmeta照合、dimension/max_inputのモデル解決と`E_VALIDATION`、tokenizer fingerprintの生成・meta保存・`E_MODEL_MISMATCH`、再起動検証（9-1完了） | config.jsonからの dimension / max_input_tokens 自動検出は未実装（残存リスク: 実装予定なし、設定ファイルでの明示を推奨） | なし |
-| Upload | 全経路のサイズ上限、SSRF（手動redirect各hop検証・IPブロック）、base64任意バイナリ分類、単一トランザクション+rollback、CLI部分失敗errors[]（9-3完了） | 検証済みIPへの接続固定（DNS rebindingは接続直前の再解決で緩和）、圧縮爆弾/ネスト深度/メモリ上限（PDFはページ数・時間上限のみ）（残存リスク: 実装予定なし） | なし |
+| Upload | 全経路のサイズ上限、SSRF（手動redirect各hop検証・IPブロック）、base64任意バイナリ分類、単一トランザクション+rollback、CLI部分失敗errors[]（9-3部分完了） | 検証済みIPへの接続固定（DNS rebindingは接続直前の再解決で緩和）、圧縮爆弾/ネスト深度/メモリ上限（PDFはページ数・時間上限のみ）（残存リスク: 実装予定なし） | なし |
 | Chunk/Graph/Search | 見出し境界チャンキング+heading永続化、EntityExtractor（WikiLink/frontmatter/見出し階層part-of）、N-hop+再ランク、検索応答title/source/highlights/matched_entities（9-4完了） | なし | — |
 | Reindex | ドキュメント単位のchunk置換transaction | mismatch時の起動、dimension/HNSW/meta、全体rollback、progress | 9-5 |
 | CLI/MCP | stdio MCP、主要CLI/MCP操作、resource-not-found、共通DTO/JSON Schema（9-2完了） | CLI parity、件数、query、JSON、progress、golden test | 9-6 |
@@ -230,14 +230,14 @@ Phase 0〜8 で確定した方針（`tokenizers`、SurrealKV 組込み、ORT 静
 
 ### 9-1: 設定・モデル・tokenizer整合性（完了）
 
-- `KnowledgeBase::open` は明示設定か自動検出かを保持したまま、`max_input_tokens = 0` をモデル設定から解決し、dimension/max inputを正規化してから `Config::validate()` の `0 < overlap_tokens < max_tokens <= max_input_tokens` を適用する。明示値とモデル値が不一致の場合は `E_VALIDATION` とする。
+- `KnowledgeBase::open` は明示設定か自動検出かを保持したまま、`max_input_tokens = 0` をモデル設定から解決し、dimension/max inputを正規化してから `Config::validate()` の `0 <= overlap_tokens < max_tokens <= max_input_tokens` を適用する。明示値とモデル値が不一致の場合は `E_VALIDATION` とする。
 - CLI引数、`SKB_*`環境変数、`./skb.toml`、ユーザー設定の優先順位を実装する。
 - モデル設定からdimensionと最大入力トークン数を検出し、明示設定との不一致を`E_VALIDATION`にする。
 - `embedding.tokenizer` の明示パスと`"auto"`を同じ解決経路として扱い、取得元、`tokenizers`のアルゴリズム/バージョン、対象構成をcanonical JSON serializationしてSHA-256 fingerprintを作成する。
 - fingerprint schema version、canonicalization規則、取得元、アルゴリズム/バージョン、fingerprintを`meta`に保存し、`KnowledgeBase::open`と`reindex`で比較する。
 - **完了条件**: 不正設定、環境変数上書き、model/dimension/max input mismatch、tokenizer fingerprint不一致、保存後の再起動検証が緑。
 
-✅ 実装済み: `Config::validate()`（`0 < overlap < max <= max_input`ほか）と `Config::resolve_embedding_settings()`（dimension/max_input のモデル値解決・不一致は `E_VALIDATION`）、`SKB_*` 環境変数オーバーライド（`Config::load()` がファイルなし時も default+env を返す）、tokenizer fingerprint（canonical JSON + SHA-256、schema v1、meta 保存・`open`/`reindex` で比較、不一致は `E_MODEL_MISMATCH`）、reindex 成功時に model/tokenizer meta を更新、`search` のデフォルト mode/top_k を `config.search` から適用。MockEmbedder は固定 8 次元として検出値とみなす。CLI 引数レイヤは該当する設定キーの引数が存在しないため env が最上位。bge-m3 の自動検出値は 1024/8192（OrtEmbedder 固定、config.json からの検出は将来課題）。
+✅ 実装済み: `Config::validate()`（`0 <= overlap < max <= max_input`ほか）と `Config::resolve_embedding_settings()`（dimension/max_input のモデル値解決・不一致は `E_VALIDATION`）、`SKB_*` 環境変数オーバーライド（`Config::load()` がファイルなし時も default+env を返す）、tokenizer fingerprint（canonical JSON + SHA-256、schema v1、meta 保存・`open`/`reindex` で比較、不一致は `E_MODEL_MISMATCH`）、reindex 成功時に model/tokenizer meta を更新、`search` のデフォルト mode/top_k を `config.search` から適用。MockEmbedder は固定 8 次元として検出値とみなす。CLI 引数レイヤは該当する設定キーの引数が存在しないため env が最上位。bge-m3 の自動検出値は 1024/8192（OrtEmbedder 固定、config.json からの検出は将来課題）。
 
 ### 9-2: 共通DTO・JSON Schema基盤（完了）
 

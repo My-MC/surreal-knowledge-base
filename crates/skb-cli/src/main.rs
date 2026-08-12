@@ -296,21 +296,22 @@ async fn run(cli: &Cli) -> Result<u8> {
 
             // Expand a directory path into individual files when --recursive.
             let mut paths: Vec<String> = Vec::new();
-            if *recursive {
-                if let Some(p) = path {
-                    let p = std::path::Path::new(p);
-                    if p.is_dir() {
-                        for entry in collect_files(p)? {
-                            paths.push(entry.display().to_string());
-                        }
-                    } else {
-                        paths.push(p.display().to_string());
+            if *recursive && path.is_some() {
+                let p = std::path::Path::new(path.as_ref().unwrap());
+                if p.is_dir() {
+                    for entry in collect_files(p)? {
+                        paths.push(entry.display().to_string());
                     }
                 } else {
-                    anyhow::bail!("--recursive requires --path to a directory");
+                    paths.push(p.display().to_string());
                 }
             } else if let Some(p) = path {
                 paths.push(p.clone());
+            }
+            // `--url --recursive` (no --path) reaches the URL branch below;
+            // a bare --recursive without a path or URL is an error.
+            if *recursive && path.is_none() && url.is_none() {
+                anyhow::bail!("--recursive requires --path to a directory");
             }
 
             let build = |p: Option<String>, c: Option<String>, b64: Option<String>| UploadRequest {
@@ -338,13 +339,15 @@ async fn run(cli: &Cli) -> Result<u8> {
                     let result = kb.upload(build(None, None, Some(content))).await?;
                     output(&result, &fmt)?;
                 } else {
-                    let mut content = String::new();
-                    std::io::stdin()
-                        .take(read_cap)
-                        .read_to_string(&mut content)?;
-                    if content.len() as u64 > max {
+                    // Read raw bytes (byte-length check before UTF-8 decode,
+                    // matching the base64 branch), so a multibyte character
+                    // split by read_cap still yields E_VALIDATION.
+                    let mut raw = Vec::new();
+                    std::io::stdin().take(read_cap).read_to_end(&mut raw)?;
+                    if raw.len() as u64 > max {
                         anyhow::bail!("stdin exceeds upload.max_file_mb");
                     }
+                    let content = String::from_utf8(raw)?;
                     let result = kb.upload(build(None, Some(content), None)).await?;
                     output(&result, &fmt)?;
                 }

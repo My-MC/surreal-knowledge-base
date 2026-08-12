@@ -370,6 +370,13 @@ pub async fn doctor(
     lines.push(format!("[INFO] Model: {}", m.unwrap_or_default()));
     let v = db.get_meta("schema_version").await?;
     lines.push(format!("[INFO] Schema ver: {}", v.unwrap_or_default()));
+    let tv = db.get_meta("tokenizer_version").await?;
+    lines.push(format!("[INFO] Tokenizer ver: {}", tv.unwrap_or_default()));
+    let fs = db.get_meta("tokenizer_fingerprint_schema").await?;
+    lines.push(format!(
+        "[INFO] Fingerprint schema: {}",
+        fs.unwrap_or_default()
+    ));
     Ok(lines.join("\n"))
 }
 

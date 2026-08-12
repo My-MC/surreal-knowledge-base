@@ -80,6 +80,16 @@ impl KnowledgeBase {
         let dimension = embedder.dimension();
         db.migrate(dimension).await?;
 
+        // A reindex interrupted before completion leaves the marker; refuse
+        // normal opens so the store is never used half-rebuilt.
+        let in_progress = db.get_meta("reindex_in_progress").await?;
+        if in_progress.as_deref().is_some_and(|v| !v.is_empty()) {
+            return Err(SkbError::new(
+                ErrorCode::ModelMismatch,
+                "a reindex is in progress or was interrupted; run `skb reindex` to complete it",
+            ));
+        }
+
         let stored_model = db.get_meta("embedding_model").await?;
         if let Some(ref stored) = stored_model {
             if stored != &config.embedding.model {
@@ -191,6 +201,38 @@ impl KnowledgeBase {
     // ── CRUD ──
     pub async fn list_documents(&self, q: &ListQuery) -> Result<Vec<DocumentSummary>, SkbError> {
         crud::list_documents(&self.db, q).await
+    }
+
+    /// Paginated snapshot of all documents in `created_at ASC, id` order,
+    /// capped at `max`: returns the documents and whether the cap was hit.
+    /// The MCP `skb://documents` resource uses this so the lock is never held
+    /// across the paginated awaits.
+    pub async fn document_snapshot(
+        &self,
+        max: usize,
+    ) -> Result<(Vec<DocumentSummary>, bool), SkbError> {
+        let mut docs = Vec::new();
+        let mut offset = 0;
+        loop {
+            let page = crud::list_documents(
+                &self.db,
+                &ListQuery {
+                    limit: Some(100),
+                    offset: Some(offset),
+                    order: Some(crate::crud::OrderBy::CreatedAsc),
+                },
+            )
+            .await?;
+            let page_len = page.len();
+            docs.extend(page);
+            if page_len < 100 || docs.len() > max {
+                break;
+            }
+            offset += 100;
+        }
+        let truncated = docs.len() > max;
+        docs.truncate(max);
+        Ok((docs, truncated))
     }
 
     pub async fn get_document(&self, req: &GetDocumentRequest) -> Result<DocumentDetail, SkbError> {

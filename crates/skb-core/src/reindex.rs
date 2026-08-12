@@ -32,6 +32,12 @@ pub async fn reindex(
     req: &ReindexRequest,
 ) -> Result<ReindexResult, SkbError> {
     let dry_run = req.dry_run;
+    // Reindex-in-progress marker: set before any rebuild so an interrupted
+    // reindex is detected on the next normal open; removed only after every
+    // step (rebuild + update_metas) succeeds.
+    if !dry_run {
+        db.set_meta("reindex_in_progress", "1").await?;
+    }
     // Get all documents
     let find =
         "SELECT meta::id(id) AS did, title, source, source_type, content, sha256 FROM document";
@@ -122,6 +128,9 @@ pub async fn reindex(
 
     if !dry_run {
         update_metas(db, embedder, tokenizer, config).await?;
+        // Reindex completed successfully: remove the marker so the store
+        // opens normally again.
+        crate::db::delete_meta(&db.db, "reindex_in_progress").await?;
     }
 
     Ok(result)

@@ -91,39 +91,20 @@ impl ServerHandler for SkbServer {
         request: ReadResourceRequestParams,
         _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
     ) -> Result<ReadResourceResponse, rmcp::ErrorData> {
-        let kb = self.kb.lock().await;
         let uri = request.uri.clone();
         let contents: Vec<ResourceContents> = if uri == "skb://documents" {
             // Bound the response: accumulate at most MAX_DOCUMENTS_RESOURCE
             // entries so a large store cannot exhaust memory or produce an
-            // unbounded payload (spec §8.3). Fetch one extra page to learn
-            // whether truncation actually occurred; `truncated` is reported
-            // inside a valid JSON payload so clients can parse the resource.
+            // unbounded payload (spec §8.3). document_snapshot owns the
+            // pagination (created_at ASC), cap and truncation detection; the
+            // kb lock is only held for the snapshot call itself.
             const MAX_DOCUMENTS_RESOURCE: usize = 10_000;
-            const PAGE_SIZE: usize = 100;
-            let mut docs: Vec<skb_core::crud::DocumentSummary> = Vec::new();
-            let mut offset = 0;
-            loop {
-                let page = kb
-                    .list_documents(&ListQuery {
-                        limit: Some(PAGE_SIZE),
-                        offset: Some(offset),
-                        // Stable pagination order (created_at ascending) so
-                        // pages cannot duplicate/skip rows while the store
-                        // changes between requests.
-                        order: Some(skb_core::crud::OrderBy::CreatedAsc),
-                    })
+            let (docs, truncated) = {
+                let kb = self.kb.lock().await;
+                kb.document_snapshot(MAX_DOCUMENTS_RESOURCE)
                     .await
-                    .map_err(err_data)?;
-                let page_len = page.len();
-                docs.extend(page);
-                if page_len < PAGE_SIZE || docs.len() > MAX_DOCUMENTS_RESOURCE {
-                    break;
-                }
-                offset += PAGE_SIZE;
-            }
-            let truncated = docs.len() > MAX_DOCUMENTS_RESOURCE;
-            docs.truncate(MAX_DOCUMENTS_RESOURCE);
+                    .map_err(err_data)?
+            };
             let body = serde_json::to_string_pretty(&serde_json::json!({
                 "documents": docs,
                 "truncated": truncated,
@@ -132,11 +113,13 @@ impl ServerHandler for SkbServer {
             .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
             vec![ResourceContents::text(body, uri)]
         } else if uri == "skb://stats" {
+            let kb = self.kb.lock().await;
             let stats = kb.stats().await.map_err(err_data)?;
             let body = serde_json::to_string_pretty(&stats)
                 .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
             vec![ResourceContents::text(body, uri)]
         } else if let Some(id) = uri.strip_prefix("skb://documents/") {
+            let kb = self.kb.lock().await;
             let doc = kb
                 .get_document(&GetDocumentRequest {
                     id: id.to_string(),

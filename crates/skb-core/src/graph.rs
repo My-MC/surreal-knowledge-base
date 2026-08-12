@@ -605,9 +605,15 @@ pub async fn expand_search_hits(
                 })
                 .or_insert(decay);
         }
-        let frontier: Vec<(String, f64)> = best.into_iter().collect();
+        let mut frontier: Vec<(String, f64)> = best.into_iter().collect();
         // Same request-level fan-out bound as the hop-1 cap: the chunk-query
-        // loop below must not exceed the cap either.
+        // loop below must not exceed the cap either. Sort by decay descending,
+        // then entity name ascending, so truncation is deterministic.
+        frontier.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
         let frontier: Vec<(String, f64)> = frontier.into_iter().take(frontier_max).collect();
 
         // Chunks mentioning any frontier entity; scores are the origin hit's
@@ -855,7 +861,7 @@ pub fn extract_sections(content: &str) -> Vec<Section> {
     for cap in heading_re.captures_iter(content) {
         let level = cap.get(1).map(|m| m.as_str().len()).unwrap_or(1) as u32;
         let name = cap.get(2).map(|m| m.as_str().trim()).unwrap_or("");
-        if name.len() > 2 {
+        if name.chars().count() > 2 {
             sections.push(Section {
                 name: name.to_string(),
                 level,

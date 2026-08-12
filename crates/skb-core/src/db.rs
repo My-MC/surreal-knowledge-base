@@ -13,6 +13,21 @@ pub struct Db {
 const SET_META_SQL: &str = "INSERT INTO meta (key, meta_value) VALUES ($key, $val) \
                             ON DUPLICATE KEY UPDATE meta_value = $val";
 
+/// Delete a `meta` row (used to remove transient markers such as
+/// `reindex_in_progress` once the operation completes).
+pub(crate) async fn delete_meta(
+    db: &Surreal<surrealdb::engine::local::Db>,
+    key: &str,
+) -> Result<(), SkbError> {
+    db.query("DELETE FROM meta WHERE key = $key")
+        .bind(("key", key))
+        .await
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete_meta: {e}")))?
+        .check()
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete_meta check: {e}")))?;
+    Ok(())
+}
+
 /// Something that can persist a `meta` table key/value. Implemented for both
 /// the connection handle and an in-progress transaction so metadata writes can
 /// be grouped atomically (e.g. reindex §9-5).

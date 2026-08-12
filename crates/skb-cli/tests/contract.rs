@@ -224,8 +224,11 @@ fn contract_config_set_updates_existing_config() {
 #[test]
 fn contract_config_env_override() {
     setup_config();
+    // env_clear isolates the test from inherited SKB_* variables so only the
+    // explicitly set value can influence the result.
     let output = Command::new(skb_binary())
         .args(["config", "show"])
+        .env_clear()
         .env("SKB_SEARCH_TOP_K", "42")
         .current_dir(test_dir())
         .output()

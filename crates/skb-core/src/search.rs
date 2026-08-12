@@ -297,14 +297,20 @@ fn rows_to_hits(
     for row in rows {
         let content = row["content"].as_str().unwrap_or("").to_string();
         // Only terms actually present in this chunk's content are highlighted
-        // (match_terms already returns lowercase terms).
+        // (match_terms already returns lowercase terms); a filter that yields
+        // nothing becomes None (same representation as the hybrid path).
         let content_lower = content.to_lowercase();
-        let hit_highlights: Option<Vec<String>> = highlights.map(|terms| {
-            terms
+        let hit_highlights: Option<Vec<String>> = highlights.and_then(|terms| {
+            let filtered: Vec<String> = terms
                 .iter()
                 .filter(|t| content_lower.contains(t.as_str()))
                 .cloned()
-                .collect()
+                .collect();
+            if filtered.is_empty() {
+                None
+            } else {
+                Some(filtered)
+            }
         });
         hits.push(SearchHit {
             document_id: row["document"].as_str().unwrap_or("").to_string(),
