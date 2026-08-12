@@ -169,7 +169,14 @@ pub async fn upload(
             .begin()
             .await
             .map_err(|e| SkbError::new(ErrorCode::Db, format!("upload begin: {e}")))?;
-        let existed = doc_id_by_sha(&tx, &doc.sha256).await?.is_some();
+        let existed = match doc_id_by_sha(&tx, &doc.sha256).await {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(e) => {
+                let _ = tx.cancel().await;
+                return Err(e);
+            }
+        };
         if !force && existed {
             let _ = tx.cancel().await;
             return Ok(UploadResult {
@@ -599,15 +606,21 @@ async fn extract_pdf_checked(bytes: &[u8]) -> Result<String, SkbError> {
     }
     // The extraction itself is synchronous and cannot be cancelled; the
     // timeout bounds how long the caller waits. Parse and extraction share
-    // one MAX_PROCESS_SECONDS budget so a slow parse cannot be followed by a
-    // full second timeout. The permit is acquired FIRST, then the remaining
-    // budget is recalculated so the wait for the slot does not count as
-    // processing time.
+    // one MAX_PROCESS_SECONDS budget. Each permit wait consumes part of the
+    // budget, so `remaining` is always computed from start.elapsed() AFTER
+    // the semaphore acquisition; an exhausted budget fails before the
+    // blocking job is launched.
     let extract_permit = pdf_semaphore()
         .acquire()
         .await
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("pdf semaphore: {e}")))?;
     let remaining = Duration::from_secs(MAX_PROCESS_SECONDS).saturating_sub(start.elapsed());
+    if remaining.is_zero() {
+        return Err(SkbError::new(
+            ErrorCode::Validation,
+            "pdf extraction exceeded time limit",
+        ));
+    }
     let text = tokio::time::timeout(
         remaining,
         tokio::task::spawn_blocking({

@@ -329,11 +329,13 @@ pub async fn delete_document(
         .bind(("id", record_id))
         .await
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete: {e}")));
-    if let Err(e) = r {
-        let _ = tx.cancel().await;
-        return Err(e);
-    }
-    let r = r.unwrap();
+    let r = match r {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = tx.cancel().await;
+            return Err(e);
+        }
+    };
     if let Err(e) = r.check() {
         let _ = tx.cancel().await;
         return Err(SkbError::new(ErrorCode::Db, format!("delete check: {e}")));

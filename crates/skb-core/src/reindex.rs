@@ -59,9 +59,14 @@ pub async fn reindex(
         .and_then(|v| v.parse::<usize>().ok());
     let dimension_changed = stored_dim.is_some_and(|d| d != dimension);
     // An active reindex-in-progress marker means a previous run was
-    // interrupted; even when stored_dim matches dimension, the recovery path
-    // (including redefine_index) must run to complete the rebuild.
-    let interrupted = db.get_meta("reindex_in_progress").await?.as_deref() == Some("1");
+    // interrupted. Any non-empty value is active (legacy "1" included):
+    // "dim" routes through the full dimension-rebuild recovery path
+    // (including redefine_index), "meta" through metadata-only recovery
+    // (rebuild_all + update_metas).
+    let marker = db.get_meta("reindex_in_progress").await?;
+    let interrupted = marker.as_deref().is_some_and(|v| !v.is_empty());
+    let interrupted_dim = marker.as_deref() == Some("dim");
+    let dimension_changed = dimension_changed || interrupted_dim;
 
     // Get all documents
     let find =
@@ -119,42 +124,46 @@ pub async fn reindex(
         return Ok(result);
     }
 
-    // An interrupted reindex (marker active) must run the recovery path
-    // including redefine_index even when stored_dim already matches the
-    // dimension; the transition (wipe + field redefinition) only runs for a
-    // genuine dimension change.
-    if dimension_changed || interrupted {
-        if dimension_changed {
-            // Reindex-in-progress marker: set before the transition begins
-            // so an interrupted transition (crash, kill) is detected on the
-            // next normal open; deleted only after update_metas completes.
-            // `open_inner` treats the value "1" as active.
-            db.set_meta("reindex_in_progress", "1").await?;
-            // 1. Atomic transition: wipe old chunks/mentions and redefine the
-            //    embedding field for the new dimension (the HNSW index is
-            //    rebuilt after all new chunks exist — its rebuild cannot see
-            //    uncommitted deletes, and the field must exist again before
-            //    inserts). Retried on retryable write conflicts like every
-            //    other reindex transaction.
-            transition_retrying(db, dimension).await?;
-            // Mark the transition immediately: from here on the stored
-            // dimension matches the schema, so any interruption is detectable
-            // and a re-run of `reindex` completes the rebuild (spec §9-5).
-            db.set_meta("embedding_dimension", &dimension.to_string())
-                .await?;
-            db.set_meta("embedding_model", &config.embedding.model)
-                .await?;
-        }
+    // An interrupted reindex (marker active) must run the recovery path.
+    // "dim" (or legacy "1") requires the full dimension-rebuild recovery
+    // including redefine_index; "meta" resumes through rebuild_all +
+    // update_metas without touching chunks/indexes/fields. The transition
+    // (wipe + field redefinition) only runs for a genuine dimension change.
+    if dimension_changed {
+        // Reindex-in-progress marker: set before the transition begins
+        // so an interrupted transition (crash, kill) is detected on the
+        // next normal open; deleted only after update_metas completes.
+        // `open_inner` treats any non-empty value as active.
+        db.set_meta("reindex_in_progress", "dim").await?;
+        // 1. Atomic transition: wipe old chunks/mentions and redefine the
+        //    embedding field for the new dimension (the HNSW index is
+        //    rebuilt after all new chunks exist — its rebuild cannot see
+        //    uncommitted deletes, and the field must exist again before
+        //    inserts). Retried on retryable write conflicts like every
+        //    other reindex transaction.
+        transition_retrying(db, dimension).await?;
+        // Mark the transition immediately: from here on the stored
+        // dimension matches the schema, so any interruption is detectable
+        // and a re-run of `reindex` completes the rebuild (spec §9-5).
+        db.set_meta("embedding_dimension", &dimension.to_string())
+            .await?;
+        db.set_meta("embedding_model", &config.embedding.model)
+            .await?;
         // 2. Rebuild every document, then rebuild the HNSW index over the
-        //    chunks (the recovery path reaches this for an interrupted
-        //    reindex even when stored_dim already matches the dimension).
-        //    The begin -> redefine_index -> commit sequence is retried as a
-        //    whole: embedded SurrealKV commits can fail with a retryable
-        //    write conflict, and a transaction cannot be re-committed.
+        //    chunks. The begin -> redefine_index -> commit sequence is
+        //    retried as a whole: embedded SurrealKV commits can fail with a
+        //    retryable write conflict, and a transaction cannot be
+        //    re-committed.
         result = rebuild_all(db, embedder, tokenizer, config, &docs, progress).await?;
         redefine_index_retrying(db, dimension).await?;
         update_metas(db, embedder, tokenizer, config).await?;
     } else {
+        // Metadata-only recovery: a "meta" marker interruption (or a
+        // tokenizer-only change) resumes with rebuild_all + update_metas
+        // only — no chunk/index/field wipe.
+        if interrupted {
+            db.set_meta("reindex_in_progress", "meta").await?;
+        }
         result = rebuild_all(db, embedder, tokenizer, config, &docs, progress).await?;
         // Always refresh metadata after a successful rebuild: even a
         // tokenizer-only change must record the new fingerprint (§5.4).
@@ -288,8 +297,11 @@ async fn transition_dimension(tx: &LocalTransaction, dimension: usize) -> Result
 /// embeddings of the target dimension). Runs after the rebuild so its scan
 /// only sees committed, correct-dimension vectors.
 async fn redefine_index(tx: &LocalTransaction, dimension: usize) -> Result<(), SkbError> {
+    // Remove first so repeated recovery runs (redefine_index_retrying) are
+    // idempotent.
     let sql = format!(
-        "DEFINE INDEX chunk_embedding_hnsw ON chunk \
+        "REMOVE INDEX IF EXISTS chunk_embedding_hnsw ON chunk; \
+         DEFINE INDEX chunk_embedding_hnsw ON chunk \
          FIELDS embedding HNSW DIMENSION {dimension} DIST COSINE;"
     );
     tx.query(&sql)

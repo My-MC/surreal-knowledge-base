@@ -289,21 +289,32 @@ async fn hybrid_search(
 
     Ok(sorted
         .into_iter()
-        .map(|(_, hit)| SearchHit {
-            document_id: hit.document,
-            chunk_idx: hit.idx,
-            content: hit.content,
-            score: hit.score,
-            title: hit.title,
-            source: hit.source,
-            // Only keyword-matched chunks get highlights; vector-only hits
-            // keep None (spec §6).
-            highlights: if hit.keyword_matched {
-                Some(highlights.clone())
+        .map(|(_, hit)| {
+            let content = hit.content;
+            // Only keyword-matched chunks get highlights, and only for terms
+            // actually present in this chunk's body; vector-only hits keep
+            // None (spec §6).
+            let highlights = if hit.keyword_matched {
+                let content_lower = content.to_lowercase();
+                let filtered: Vec<String> = highlights
+                    .iter()
+                    .filter(|t| content_lower.contains(&t.to_lowercase()))
+                    .cloned()
+                    .collect();
+                Some(filtered)
             } else {
                 None
-            },
-            matched_entities: None,
+            };
+            SearchHit {
+                document_id: hit.document,
+                chunk_idx: hit.idx,
+                content,
+                score: hit.score,
+                title: hit.title,
+                source: hit.source,
+                highlights,
+                matched_entities: None,
+            }
         })
         .collect())
 }

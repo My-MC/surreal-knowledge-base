@@ -462,9 +462,23 @@ impl SkbServer {
                         drop(tx);
                         // Await the forwarder with a bounded timeout so a
                         // stalled peer cannot hang the tool indefinitely;
-                        // on expiry the forwarder task is aborted.
-                        let _ = tokio::time::timeout(std::time::Duration::from_secs(30), forwarder)
-                            .await;
+                        // on expiry the forwarder task is explicitly aborted.
+                        let mut forwarder = forwarder;
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(30),
+                            &mut forwarder,
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => {
+                                tracing::warn!(error = %e, "progress forwarder join failed");
+                            }
+                            Err(_) => {
+                                forwarder.abort();
+                                let _ = forwarder.await;
+                            }
+                        }
                         r
                     }
                     None => kb

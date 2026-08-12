@@ -328,11 +328,16 @@ async fn run(cli: &Cli) -> Result<u8> {
 
             if *stdin {
                 // Bound stdin reads by upload.max_file_mb (spec §12.3).
-                // Both branches share one read + byte-size validation + UTF-8
-                // conversion; only the build argument differs (base64 vs
-                // content).
+                // Base64 input can be up to 4/3 of the decoded size, so the
+                // read cap is scaled for the base64 branch; the byte-length
+                // validation below still rejects any input whose DECODED size
+                // would exceed max.
                 let max = kb.config().upload.max_file_mb.saturating_mul(1024 * 1024);
-                let read_cap = max.saturating_add(1);
+                let read_cap = if *base64 {
+                    max.saturating_mul(4).saturating_div(3).saturating_add(1)
+                } else {
+                    max.saturating_add(1)
+                };
                 let mut raw = Vec::new();
                 std::io::stdin().take(read_cap).read_to_end(&mut raw)?;
                 if raw.len() as u64 > max {
@@ -487,21 +492,24 @@ async fn run(cli: &Cli) -> Result<u8> {
             let kb = skb_core::KnowledgeBase::open_or_for_reindex(config).await?;
             let req = skb_core::reindex::ReindexRequest { dry_run: *dry_run };
             // Live \r-based progress only on a terminal; for piped stderr
-            // (CI logs) suppress intermediate updates.
+            // (CI logs) suppress intermediate updates. Track whether any TTY
+            // progress was actually emitted to decide on the trailing
+            // newline.
             let stderr_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
+            let emitted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let emitted_cb = emitted.clone();
             let progress = move |done: usize, total: usize| {
                 if stderr_tty {
+                    emitted_cb.store(true, std::sync::atomic::Ordering::Relaxed);
                     eprint!("\rreindexed {done}/{total}");
                     let _ = std::io::Write::flush(&mut std::io::stderr());
                 }
             };
             let result = kb.reindex(&req, Some(&progress)).await?;
-            if !*dry_run {
-                if stderr_tty {
-                    eprintln!();
-                } else {
-                    eprintln!("reindexed {} documents", result.documents_processed);
-                }
+            if emitted.load(std::sync::atomic::Ordering::Relaxed) {
+                eprintln!();
+            } else if !*dry_run {
+                eprintln!("reindexed {} documents", result.documents_processed);
             }
             output(&result, &fmt)?;
         }

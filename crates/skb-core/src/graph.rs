@@ -764,12 +764,14 @@ pub fn extract_entities(content: &str) -> Vec<EntityInfo> {
     // Markdown links: [text](link)
     let link_re = regex::Regex::new(r"\[([^\]]+)\]\(([^)]+)\)").unwrap();
     for cap in link_re.captures_iter(content) {
-        let link_text = cap.get(1).map(|m| m.as_str()).unwrap_or("");
-        entities.push(EntityInfo {
-            name: link_text.to_string(),
-            kind: "reference".into(),
-            description: None,
-        });
+        let link_text = cap.get(1).map(|m| m.as_str()).unwrap_or("").trim();
+        if !link_text.is_empty() {
+            entities.push(EntityInfo {
+                name: link_text.to_string(),
+                kind: "reference".into(),
+                description: None,
+            });
+        }
     }
 
     // WikiLinks: [[target]] or [[target|alias]]
@@ -985,14 +987,17 @@ pub(crate) async fn link_section_hierarchy(
                     })?;
             }
             // Idempotent edge: `RELATE` always creates a new edge, so remove
-            // an existing part-of edge between the same pair first. Section
-            // entities are global (shared across documents), so the dedup is
-            // per pair — repeated uploads never accumulate duplicates.
+            // the child's PREVIOUS part-of parent first (a hierarchy change
+            // must not leave the child with two parents). Adopted invariant:
+            // each section has exactly ONE part-of parent (global-parent
+            // invariant) — section entities are shared across documents, so
+            // a section name is a global node and its parent is the nearest
+            // ancestor in whichever document last linked it.
             // Direction: the child section is part of its ancestor, so the
             // edge points child -> part-of -> parent.
             tx.query(
                 "DELETE FROM related_to WHERE relation = 'part-of' \
-                 AND in = $child AND out = $parent; \
+                 AND in = $child; \
                  RELATE $child->related_to->$parent SET relation = 'part-of', weight = 1.0",
             )
             .bind(("child", entity_record_id(&section.name)?))

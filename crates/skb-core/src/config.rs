@@ -203,51 +203,35 @@ impl Config {
         if let Some(v) = env_opt("SKB_EMBEDDING_TOKENIZER")? {
             self.embedding.tokenizer = v;
         }
-        if let Some(v) = env_opt("SKB_EMBEDDING_DIMENSION")? {
-            self.embedding.dimension = v
-                .parse()
-                .with_context(|| format!("SKB_EMBEDDING_DIMENSION must be a number, got '{v}'"))?;
+        if let Some(v) = env_parse::<usize>("SKB_EMBEDDING_DIMENSION")? {
+            self.embedding.dimension = v;
         }
-        if let Some(v) = env_opt("SKB_EMBEDDING_MAX_INPUT_TOKENS")? {
-            self.embedding.max_input_tokens = v.parse().with_context(|| {
-                format!("SKB_EMBEDDING_MAX_INPUT_TOKENS must be a number, got '{v}'")
-            })?;
+        if let Some(v) = env_parse::<usize>("SKB_EMBEDDING_MAX_INPUT_TOKENS")? {
+            self.embedding.max_input_tokens = v;
         }
         if let Some(v) = env_opt("SKB_EMBEDDING_DEVICE")? {
             self.embedding.device = v;
         }
-        if let Some(v) = env_opt("SKB_EMBEDDING_BATCH_SIZE")? {
-            self.embedding.batch_size = v
-                .parse()
-                .with_context(|| format!("SKB_EMBEDDING_BATCH_SIZE must be a number, got '{v}'"))?;
+        if let Some(v) = env_parse::<usize>("SKB_EMBEDDING_BATCH_SIZE")? {
+            self.embedding.batch_size = v;
         }
-        if let Some(v) = env_opt("SKB_CHUNKING_MAX_TOKENS")? {
-            self.chunking.max_tokens = v
-                .parse()
-                .with_context(|| format!("SKB_CHUNKING_MAX_TOKENS must be a number, got '{v}'"))?;
+        if let Some(v) = env_parse::<usize>("SKB_CHUNKING_MAX_TOKENS")? {
+            self.chunking.max_tokens = v;
         }
-        if let Some(v) = env_opt("SKB_CHUNKING_OVERLAP_TOKENS")? {
-            self.chunking.overlap_tokens = v.parse().with_context(|| {
-                format!("SKB_CHUNKING_OVERLAP_TOKENS must be a number, got '{v}'")
-            })?;
+        if let Some(v) = env_parse::<usize>("SKB_CHUNKING_OVERLAP_TOKENS")? {
+            self.chunking.overlap_tokens = v;
         }
         if let Some(v) = env_opt("SKB_SEARCH_DEFAULT_MODE")? {
             self.search.default_mode = v.parse::<SearchMode>()?;
         }
-        if let Some(v) = env_opt("SKB_SEARCH_TOP_K")? {
-            self.search.top_k = v
-                .parse()
-                .with_context(|| format!("SKB_SEARCH_TOP_K must be a number, got '{v}'"))?;
+        if let Some(v) = env_parse::<usize>("SKB_SEARCH_TOP_K")? {
+            self.search.top_k = v;
         }
-        if let Some(v) = env_opt("SKB_SEARCH_RRF_K")? {
-            self.search.rrf_k = v
-                .parse()
-                .with_context(|| format!("SKB_SEARCH_RRF_K must be a number, got '{v}'"))?;
+        if let Some(v) = env_parse::<usize>("SKB_SEARCH_RRF_K")? {
+            self.search.rrf_k = v;
         }
-        if let Some(v) = env_opt("SKB_UPLOAD_MAX_FILE_MB")? {
-            self.upload.max_file_mb = v
-                .parse()
-                .with_context(|| format!("SKB_UPLOAD_MAX_FILE_MB must be a number, got '{v}'"))?;
+        if let Some(v) = env_parse::<u64>("SKB_UPLOAD_MAX_FILE_MB")? {
+            self.upload.max_file_mb = v;
         }
         if let Some(v) = env_opt("SKB_UPLOAD_ALLOWED_DIRS")? {
             let dirs: Vec<PathBuf> = v
@@ -406,6 +390,21 @@ fn env_opt(key: &str) -> anyhow::Result<Option<String>> {
         Ok(value) => Ok(Some(value)),
         Err(std::env::VarError::NotPresent) => Ok(None),
         Err(std::env::VarError::NotUnicode(_)) => Err(anyhow::anyhow!("{key} must be unicode")),
+    }
+}
+
+/// Fetch a numeric `SKB_*` value and parse it, attaching contextual error
+/// messages. Shared by all numeric environment overrides.
+fn env_parse<T>(key: &str) -> anyhow::Result<Option<T>>
+where
+    T: std::str::FromStr,
+{
+    match env_opt(key)? {
+        Some(v) => match v.parse::<T>() {
+            Ok(value) => Ok(Some(value)),
+            Err(_) => Err(anyhow::anyhow!("{key} must be a number, got '{v}'")),
+        },
+        None => Ok(None),
     }
 }
 
