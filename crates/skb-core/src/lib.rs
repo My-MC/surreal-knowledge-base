@@ -59,9 +59,9 @@ impl KnowledgeBase {
 
     /// Open the knowledge base, falling back to [`KnowledgeBase::open_for_reindex`]
     /// on `E_MODEL_MISMATCH`. A failed open releases the embedded SurrealKV
-    /// file lock asynchronously, so the reopen is retried a bounded number of
-    /// times to settle the lock before the mismatch fallback (CLI/MCP startup
-    /// share this single implementation).
+    /// file lock asynchronously, so both the normal open and the mismatch
+    /// fallback are retried a bounded number of times to settle the lock
+    /// (CLI/MCP startup share this single implementation).
     pub async fn open_or_for_reindex(config: Config) -> Result<Self, SkbError> {
         const ATTEMPTS: usize = 8;
         let mut last: Option<SkbError> = None;
@@ -72,7 +72,19 @@ impl KnowledgeBase {
                 // a previous in-process connection) are retried; validation,
                 // embedding and other errors are definitive.
                 Err(e) if e.code == ErrorCode::ModelMismatch => {
-                    return Self::open_for_reindex(config).await;
+                    // The fallback open can hit the same transient lock race;
+                    // retry it with the same bounded delay/attempt policy.
+                    match Self::open_for_reindex_retrying(config.clone()).await {
+                        Ok(kb) => return Ok(kb),
+                        Err(fb) => {
+                            if fb.code == ErrorCode::Db && attempt + 1 < ATTEMPTS {
+                                last = Some(fb);
+                                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                                continue;
+                            }
+                            return Err(fb);
+                        }
+                    }
                 }
                 Err(e) if e.code == ErrorCode::Db => {
                     last = Some(e);
@@ -81,6 +93,23 @@ impl KnowledgeBase {
                     }
                 }
                 Err(e) => return Err(e),
+            }
+        }
+        Err(last.expect("ATTEMPTS is non-zero"))
+    }
+
+    /// Retry-open the reindex management path, absorbing transient file-lock
+    /// races from a previous in-process connection.
+    async fn open_for_reindex_retrying(config: Config) -> Result<Self, SkbError> {
+        const ATTEMPTS: usize = 8;
+        let mut last = None;
+        for _ in 0..ATTEMPTS {
+            match Self::open_for_reindex(config.clone()).await {
+                Ok(kb) => return Ok(kb),
+                Err(e) => {
+                    last = Some(e);
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                }
             }
         }
         Err(last.expect("ATTEMPTS is non-zero"))
@@ -132,7 +161,7 @@ impl KnowledgeBase {
             // leaves the in-progress marker (value "1"); refuse normal opens
             // so the store is never used half-rebuilt (spec §9-5).
             let in_progress = db.get_meta("reindex_in_progress").await?;
-            if in_progress.as_deref() == Some("1") {
+            if in_progress.as_deref().is_some_and(|v| !v.is_empty()) {
                 return Err(SkbError::new(
                     ErrorCode::ModelMismatch,
                     "a reindex is in progress or was interrupted; run `skb reindex` to complete it",
@@ -272,6 +301,38 @@ impl KnowledgeBase {
     // ── CRUD ──
     pub async fn list_documents(&self, q: &ListQuery) -> Result<Vec<DocumentSummary>, SkbError> {
         crud::list_documents(&self.db, q).await
+    }
+
+    /// Paginated snapshot of all documents (stable order) capped at `max`:
+    /// returns the documents and whether the cap was hit. The MCP
+    /// `skb://documents` resource uses this so the lock is never held across
+    /// the paginated awaits.
+    pub async fn document_snapshot(
+        &self,
+        max: usize,
+    ) -> Result<(Vec<DocumentSummary>, bool), SkbError> {
+        let mut docs = Vec::new();
+        let mut offset = 0;
+        loop {
+            let page = crud::list_documents(
+                &self.db,
+                &ListQuery {
+                    limit: Some(100),
+                    offset: Some(offset),
+                    order: None,
+                },
+            )
+            .await?;
+            let page_len = page.len();
+            docs.extend(page);
+            if page_len < 100 || docs.len() > max {
+                break;
+            }
+            offset += 100;
+        }
+        let truncated = docs.len() > max;
+        docs.truncate(max);
+        Ok((docs, truncated))
     }
 
     pub async fn get_document(&self, req: &GetDocumentRequest) -> Result<DocumentDetail, SkbError> {

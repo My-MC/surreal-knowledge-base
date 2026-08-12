@@ -489,10 +489,12 @@ pub async fn expand_search_hits(
         return Ok((vec![], std::collections::HashMap::new()));
     }
 
-    let mut expanded = Vec::new();
+    let mut expanded_map: std::collections::HashMap<(String, usize), crate::search::SearchHit> =
+        std::collections::HashMap::new();
     let mut origin_entities: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
-    let mut seen_chunks: std::collections::HashSet<(String, usize)> = hits
+    // Chunks that are themselves direct hits are excluded from expansion.
+    let seen_chunks: std::collections::HashSet<(String, usize)> = hits
         .iter()
         .map(|h| (h.document_id.clone(), h.chunk_idx))
         .collect();
@@ -666,7 +668,10 @@ pub async fn expand_search_hits(
         for erow in erows.iter() {
             let document_id = erow["document"].as_str().unwrap_or("").to_string();
             let chunk_idx = erow["idx"].as_u64().unwrap_or(0) as usize;
-            if !seen_chunks.insert((document_id.clone(), chunk_idx)) {
+            let key = (document_id, chunk_idx);
+            // A chunk that is itself a direct hit is never re-added as an
+            // expanded result.
+            if seen_chunks.contains(&key) {
                 continue;
             }
             let matched = to_string_vec(&erow["e"]);
@@ -677,21 +682,36 @@ pub async fn expand_search_hits(
                 .filter_map(|e| decay_map.get(e).map(|d| (d, e.clone())))
                 .max_by(|a, b| a.0.partial_cmp(b.0).unwrap_or(std::cmp::Ordering::Equal))
                 .unwrap_or((&0.95, matched.into_iter().next().unwrap_or_default()));
-            expanded.push(SearchHit {
-                document_id,
-                chunk_idx,
+            let score = origin_score * *decay;
+            // Keep the BEST candidate per chunk: a later origin can produce a
+            // higher decayed score for the same chunk, which must replace the
+            // earlier entry (dedup by (document, idx), not first-wins).
+            let candidate = SearchHit {
+                document_id: key.0.clone(),
+                chunk_idx: key.1,
                 content: erow["content"].as_str().unwrap_or("").to_string(),
-                score: origin_score * *decay,
+                score,
                 title: erow["title"].as_str().map(|s| s.to_string()),
                 source: erow["source"].as_str().map(|s| s.to_string()),
                 highlights: None,
                 matched_entities: Some(vec![entity]),
-            });
+            };
+            match expanded_map.entry(key) {
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    if candidate.score > e.get().score {
+                        e.insert(candidate);
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(candidate);
+                }
+            }
         }
     }
 
     // No count truncation here: `max_expand` is the hop depth and the caller
     // (KnowledgeBase::search) trims the merged list to top_k (spec §6).
+    let mut expanded: Vec<SearchHit> = expanded_map.into_values().collect();
     expanded.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
@@ -799,16 +819,19 @@ pub fn extract_entities(content: &str) -> Vec<EntityInfo> {
         });
     }
 
-    // Headings: ^#{1,6}\s+(.+)
-    let heading_re = regex::Regex::new(r"(?m)^#{1,6}\s+(.+)").unwrap();
-    for cap in heading_re.captures_iter(content) {
-        let heading = cap.get(1).map(|m| m.as_str()).unwrap_or("");
-        if heading_name_visible(heading) {
-            entities.push(EntityInfo {
-                name: heading.trim().to_string(),
-                kind: "section".into(),
-                description: None,
-            });
+    // Headings: ^#{1,6}\s+(.+) outside fenced code blocks (shared fence
+    // detection with the chunking logic in tokenize.rs).
+    let heading_re = regex::Regex::new(r"^(#{1,6})\s+(.+)").unwrap();
+    for (_, line) in crate::tokenize::visible_lines(content) {
+        if let Some(cap) = heading_re.captures(line.trim_start()) {
+            let heading = cap.get(2).map(|m| m.as_str()).unwrap_or("");
+            if heading_name_visible(heading) {
+                entities.push(EntityInfo {
+                    name: heading.trim().to_string(),
+                    kind: "section".into(),
+                    description: None,
+                });
+            }
         }
     }
 
@@ -902,15 +925,19 @@ fn heading_name_visible(name: &str) -> bool {
 /// Extract heading sections with levels for hierarchy linking.
 pub fn extract_sections(content: &str) -> Vec<Section> {
     let mut sections = Vec::new();
-    let heading_re = regex::Regex::new(r"(?m)^(#{1,6})\s+(.+)").unwrap();
-    for cap in heading_re.captures_iter(content) {
-        let level = cap.get(1).map(|m| m.as_str().len()).unwrap_or(1) as u32;
-        let name = cap.get(2).map(|m| m.as_str().trim()).unwrap_or("");
-        if heading_name_visible(name) {
-            sections.push(Section {
-                name: name.to_string(),
-                level,
-            });
+    let heading_re = regex::Regex::new(r"^(#{1,6})\s+(.+)").unwrap();
+    // Only lines OUTSIDE fenced code blocks can be headings (shared fence
+    // detection with the chunking logic in tokenize.rs).
+    for (_, line) in crate::tokenize::visible_lines(content) {
+        if let Some(cap) = heading_re.captures(line.trim_start()) {
+            let level = cap.get(1).map(|m| m.as_str().len()).unwrap_or(1) as u32;
+            let name = cap.get(2).map(|m| m.as_str().trim()).unwrap_or("");
+            if heading_name_visible(name) {
+                sections.push(Section {
+                    name: name.to_string(),
+                    level,
+                });
+            }
         }
     }
     sections

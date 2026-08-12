@@ -131,29 +131,6 @@ pub async fn upload(
     let force = req.force.unwrap_or(false);
     let doc = extract_document_data(req, config).await?;
 
-    // The transaction starts BEFORE the duplicate check so the lookup and the
-    // write share one transaction (a concurrent identical upload cannot both
-    // create the document). Extraction and validation happen before this.
-    let tx = db
-        .db
-        .clone()
-        .begin()
-        .await
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("upload begin: {e}")))?;
-    let existed = doc_id_by_sha(&tx, &doc.sha256).await?.is_some();
-    if !force && existed {
-        let _ = tx.cancel().await;
-        return Ok(UploadResult {
-            document_id: None,
-            title: doc.title,
-            status: "skipped".into(),
-            chunks: 0,
-            tokens: 0,
-            sha256: doc.sha256,
-            entities: vec![],
-        });
-    }
-
     let chunks = tokenizer.chunk(
         &doc.content,
         config.chunking.max_tokens,
@@ -161,7 +138,6 @@ pub async fn upload(
     )?;
 
     if chunks.is_empty() {
-        let _ = tx.cancel().await;
         return Ok(UploadResult {
             document_id: None,
             title: doc.title,
@@ -177,32 +153,83 @@ pub async fn upload(
     let embeddings = embed_batch(embedder, &texts, config.embedding.batch_size)?;
     let total_tokens: usize = chunks.iter().map(|c| c.token_count).sum();
 
-    let stored = store_and_index(&tx, &doc, &chunks, &embeddings, force && existed).await;
-    let (doc_id, entities) = match stored {
-        Ok(pair) => pair,
-        Err(e) => {
+    // The transaction starts BEFORE the duplicate check so the lookup and the
+    // write share one transaction (a concurrent identical upload cannot both
+    // create the document). The begin -> check -> store -> commit sequence is
+    // retried as a whole on retryable SurrealKV write conflicts (a
+    // transaction cannot be re-committed; store_and_index is idempotent for a
+    // given (doc, chunks) pair).
+    const ATTEMPTS: usize = 8;
+    let mut last = None;
+    let mut delay = std::time::Duration::from_millis(50);
+    for attempt in 0..ATTEMPTS {
+        let tx = db
+            .db
+            .clone()
+            .begin()
+            .await
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("upload begin: {e}")))?;
+        let existed = doc_id_by_sha(&tx, &doc.sha256).await?.is_some();
+        if !force && existed {
             let _ = tx.cancel().await;
-            return Err(e);
+            return Ok(UploadResult {
+                document_id: None,
+                title: doc.title,
+                status: "skipped".into(),
+                chunks: 0,
+                tokens: 0,
+                sha256: doc.sha256,
+                entities: vec![],
+            });
         }
-    };
 
-    tx.commit()
-        .await
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("upload commit: {e}")))?;
+        let stored = store_and_index(&tx, &doc, &chunks, &embeddings, force && existed).await;
+        let (doc_id, entities) = match stored {
+            Ok(pair) => pair,
+            Err(e) => {
+                let _ = tx.cancel().await;
+                return Err(e);
+            }
+        };
 
-    Ok(UploadResult {
-        document_id: Some(doc_id),
-        title: doc.title,
-        status: if existed {
-            "updated".into()
-        } else {
-            "created".into()
-        },
-        chunks: chunks.len(),
-        tokens: total_tokens,
-        sha256: doc.sha256,
-        entities,
-    })
+        match tx.commit().await {
+            Ok(_) => {
+                return Ok(UploadResult {
+                    document_id: Some(doc_id),
+                    title: doc.title,
+                    status: if existed {
+                        "updated".into()
+                    } else {
+                        "created".into()
+                    },
+                    chunks: chunks.len(),
+                    tokens: total_tokens,
+                    sha256: doc.sha256,
+                    entities,
+                });
+            }
+            Err(e) if e.to_string().contains("Transaction write conflict") => {
+                last = Some(e);
+                if attempt + 1 < ATTEMPTS {
+                    tokio::time::sleep(delay).await;
+                    delay = delay
+                        .saturating_mul(2)
+                        .min(std::time::Duration::from_millis(800));
+                }
+            }
+            Err(e) => {
+                // commit consumed the transaction; nothing to cancel.
+                return Err(SkbError::new(ErrorCode::Db, format!("upload commit: {e}")));
+            }
+        }
+    }
+    Err(SkbError::new(
+        ErrorCode::Db,
+        format!(
+            "upload commit: {}",
+            last.map(|e| e.to_string()).unwrap_or_default()
+        ),
+    ))
 }
 
 type LocalTransaction = surrealdb::method::Transaction<surrealdb::engine::local::Db>;
@@ -317,16 +344,21 @@ async fn store_and_index(
         entities.extend(names);
     }
     // Heading hierarchy: sections become part-of their nearest ancestor.
-    // First remove every existing part-of edge whose child is a section of
-    // THIS document, so each child keeps only its current nearest parent
-    // (a force re-upload with a restructured document cannot leave stale
-    // edges to an old parent).
+    // First remove every existing part-of edge whose child is a section
+    // mentioned by THIS document's chunks, so each child keeps only its
+    // current nearest parent (a force re-upload with a restructured document
+    // cannot leave stale edges to an old parent). Scoped via the chunk
+    // mentions edge so other documents' hierarchies are untouched even when
+    // they share section names.
     for section in graph::extract_sections(&doc.content) {
         tx.query(
             "DELETE FROM related_to WHERE relation = 'part-of' \
-             AND in = $child",
+             AND in = $child \
+             AND $child IN (SELECT VALUE ->mentions->entity FROM chunk \
+                            WHERE document = $document)",
         )
         .bind(("child", graph::entity_record_id(&section.name)?))
+        .bind(("document", document.clone()))
         .await
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("section edge cleanup: {e}")))?
         .check()

@@ -250,11 +250,19 @@ impl Config {
                 .with_context(|| format!("SKB_UPLOAD_MAX_FILE_MB must be a number, got '{v}'"))?;
         }
         if let Some(v) = env_opt("SKB_UPLOAD_ALLOWED_DIRS")? {
-            self.upload.allowed_dirs = v
+            let dirs: Vec<PathBuf> = v
                 .split(',')
                 .map(|part| PathBuf::from(part.trim()))
                 .filter(|p| !p.as_os_str().is_empty())
                 .collect();
+            if dirs.is_empty() {
+                // Present but all entries empty would silently disable the
+                // allowed-directories restriction; reject the configuration.
+                anyhow::bail!(
+                    "SKB_UPLOAD_ALLOWED_DIRS must list at least one directory, got '{v}'"
+                );
+            }
+            self.upload.allowed_dirs = dirs;
         }
         Ok(())
     }
@@ -560,7 +568,7 @@ mod tests {
     }
 
     #[test]
-    fn load_works_without_config_file_when_env_set() {
+    fn env_override_beats_default_config() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let _model = EnvGuard::set("SKB_EMBEDDING_MODEL", "env-only-model");
         // Exercise the env-override path directly (Config::default() + env),

@@ -147,6 +147,27 @@ fn contract_upload() {
 }
 
 #[test]
+fn contract_upload_url_with_recursive_flag() {
+    setup_config();
+    // --url --recursive (no --path) must reach the single-URL upload flow
+    // instead of erroring on the recursive directory requirement. The URL
+    // itself is unresolvable, so the run fails with a fetch error — but NOT
+    // with the "--recursive requires --path" usage error, proving the branch
+    // is taken.
+    let output = Command::new(skb_binary())
+        .args(["upload", "--url", "http://127.0.0.1:1/x", "--recursive"])
+        .current_dir(test_dir())
+        .output()
+        .expect("failed to run skb upload --url --recursive");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("--recursive requires --path"),
+        "URL must take precedence over the recursive path requirement: {stderr}"
+    );
+}
+
+#[test]
 fn contract_search() {
     setup_config();
     run_skb(

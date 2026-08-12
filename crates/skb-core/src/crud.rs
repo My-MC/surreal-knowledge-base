@@ -568,5 +568,36 @@ mod tests {
             value["properties"]["limit"]["maximum"],
             MAX_LIST_LIMIT as u64
         );
+        assert_eq!(
+            value["properties"]["offset"]["minimum"], 0,
+            "schema offset minimum must be 0"
+        );
+        assert_eq!(
+            value["properties"]["offset"]["maximum"], MAX_LIST_OFFSET as u64,
+            "schema offset maximum must track MAX_LIST_OFFSET"
+        );
+    }
+
+    #[test]
+    fn list_query_rejects_offset_above_max() {
+        let q = ListQuery {
+            limit: None,
+            offset: Some(MAX_LIST_OFFSET + 1),
+            order: None,
+        };
+        assert!(matches!(
+            q.validate(),
+            Err(SkbError {
+                code: ErrorCode::Validation,
+                ..
+            })
+        ));
+        // At the cap and below are valid.
+        let ok = ListQuery {
+            limit: None,
+            offset: Some(MAX_LIST_OFFSET),
+            order: None,
+        };
+        assert!(ok.validate().is_ok());
     }
 }

@@ -146,23 +146,49 @@ impl Tokenize for TokenizersImpl {
     }
 }
 
-/// Byte offsets of markdown heading lines (`^#{1,6}\s`), for boundary-aware
-/// chunking. Scanning is byte-oriented and cheap enough for large inputs.
-fn heading_starts(text: &str) -> Vec<usize> {
+/// Iterate the byte offset and text of every line OUTSIDE fenced code blocks.
+/// Fences open with ``` or ~~~ and close only on a line starting with the SAME
+/// marker (CommonMark). Shared by chunking (heading_starts) and graph entity
+/// extraction so heading-like lines inside fences are ignored consistently.
+pub(crate) fn visible_lines(text: &str) -> Vec<(usize, &str)> {
     let mut out = Vec::new();
     let mut line_start = 0usize;
+    let mut fence_marker: Option<&str> = None;
     for (i, b) in text.bytes().enumerate() {
         if b == b'\n' {
-            if is_heading_line(&text[line_start..i]) {
-                out.push(line_start);
+            let line = &text[line_start..i];
+            let trimmed = line.trim_start();
+            if let Some(open) = fence_marker {
+                if trimmed.starts_with(open) {
+                    fence_marker = None;
+                }
+            } else if trimmed.starts_with("```") {
+                fence_marker = Some("```");
+            } else if trimmed.starts_with("~~~") {
+                fence_marker = Some("~~~");
+            } else {
+                out.push((line_start, line));
             }
             line_start = i + 1;
         }
     }
-    if line_start < text.len() && is_heading_line(&text[line_start..]) {
-        out.push(line_start);
+    if line_start < text.len() {
+        let line = &text[line_start..];
+        let trimmed = line.trim_start();
+        if !(trimmed.starts_with("```") || trimmed.starts_with("~~~")) && fence_marker.is_none() {
+            out.push((line_start, line));
+        }
     }
     out
+}
+
+/// Byte offsets of markdown heading lines (`^#{1,6}\s`), for boundary-aware
+/// chunking. Scanning is byte-oriented and cheap enough for large inputs.
+fn heading_starts(text: &str) -> Vec<usize> {
+    visible_lines(text)
+        .into_iter()
+        .filter_map(|(off, line)| is_heading_line(line.trim_start()).then_some(off))
+        .collect()
 }
 
 fn is_heading_line(line: &str) -> bool {

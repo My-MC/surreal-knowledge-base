@@ -295,8 +295,10 @@ async fn run(cli: &Cli) -> Result<u8> {
                 .unwrap_or_default();
 
             // Expand a directory path into individual files when --recursive.
+            // A URL input takes precedence: `--url --recursive` (no --path)
+            // follows the single-URL upload flow instead of erroring.
             let mut paths: Vec<String> = Vec::new();
-            if *recursive {
+            if *recursive && url.is_none() {
                 if let Some(p) = path {
                     let p = std::path::Path::new(p);
                     if p.is_dir() {
