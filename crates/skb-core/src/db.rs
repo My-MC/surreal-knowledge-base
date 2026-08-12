@@ -47,15 +47,35 @@ impl MetaStore for Db {
 
 impl MetaStore for surrealdb::method::Transaction<surrealdb::engine::local::Db> {
     async fn set_meta(&self, key: &str, val: &str) -> Result<(), SkbError> {
-        self.query(SET_META_SQL)
-            .bind(("key", key))
-            .bind(("val", val))
-            .await
-            .map_err(|e| SkbError::new(ErrorCode::Db, format!("set_meta: {e}")))?
-            .check()
-            .map_err(|e| SkbError::new(ErrorCode::Db, format!("set_meta check: {e}")))?;
-        Ok(())
+        set_meta_impl(self, key, val).await
     }
+}
+
+// Generic helpers that receive `&Transaction` (e.g. with_tx_retry closures)
+// can call MetaStore methods through this reference impl.
+impl MetaStore for &surrealdb::method::Transaction<surrealdb::engine::local::Db> {
+    async fn set_meta(&self, key: &str, val: &str) -> Result<(), SkbError> {
+        set_meta_impl(self, key, val).await
+    }
+}
+
+/// Shared upsert implementation for the transaction handle. The inherent
+/// `Db::set_meta` is the single public implementation for the connection; both
+/// delegate here so removing or renaming a method cannot turn a trait call
+/// into infinite recursion.
+async fn set_meta_impl(
+    tx: &surrealdb::method::Transaction<surrealdb::engine::local::Db>,
+    key: &str,
+    val: &str,
+) -> Result<(), SkbError> {
+    tx.query(SET_META_SQL)
+        .bind(("key", key))
+        .bind(("val", val))
+        .await
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("set_meta: {e}")))?
+        .check()
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("set_meta check: {e}")))?;
+    Ok(())
 }
 
 impl Db {

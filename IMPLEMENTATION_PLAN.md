@@ -42,8 +42,8 @@
 | Phase | 内容 | 状態 | 主な不足 |
 |---|---|---|---|
 | 0 | 技術検証スパイク | 部分完了 | 0-2/0-3の検証証跡を成果物として整理する |
-| 1 | `skb-core` 基盤 | 部分完了 | 設定検証、入力安全性、DTO、CRUD件数、検索応答の不足 |
-| 2 | グラフ + reindex | 部分完了 | N-hop、再ランク、dimension/HNSW/meta整合性の不足 |
+| 1 | `skb-core` 基盤 | 部分完了 | 設定検証は実装済み（9-1）。入力安全性・DTOは実装済み（9-2/9-3）。CRUD件数・検索応答は実装済み（9-4/9-6）。残る不足はなし（9-6完了） |
+| 2 | グラフ + reindex | 部分完了 | N-hop、再ランク、dimension/HNSW/meta整合性は実装済み（9-4/9-5）。残る不足はなし（9-5完了） |
 | 3 | CLI | 部分完了 | 仕様上の入力形式、glob、JSON doctor、queryの不足（reindex progressは実装済み） |
 | 4 | MCP | 部分完了 | reindex progress（notifications/progress）は実装済み。upload progressは対象外（文書ごとのサイズ制限により単発完了応答で十分） |
 | 5 | 契約テスト + npm | 部分完了 | MCP/CLI比較、全ターゲットE2E、upload/search smokeの不足 |
@@ -60,7 +60,7 @@
 | Upload | 全経路のサイズ上限、SSRF（手動redirect各hop検証・IPブロック）、base64任意バイナリ分類、単一トランザクション+rollback、CLI部分失敗errors[]（9-3完了） | 検証済みIPへの接続固定（DNS rebindingは接続直前の再解決で緩和）、圧縮爆弾/ネスト深度/メモリ上限（PDFはページ数・時間上限のみ） | — |
 | Chunk/Graph/Search | 見出し境界チャンキング+heading永続化、EntityExtractor（WikiLink/frontmatter/見出し階層part-of）、N-hop+再ランク、検索応答title/source/highlights/matched_entities（9-4完了） | なし | — |
 | Reindex | migrate前のmodel/dimension比較（新規DBは初期化パス）、open_for_reindex管理経路、dimension変更のwipe+フィールド再定義→HNSW再構築→meta更新、中断検出+再実行復旧、MCP/CLI progress（9-5完了） | なし | — |
-| CLI/MCP | stdio MCP、主要CLI/MCP操作、resource-not-found、共通DTO/JSON Schema（9-2完了） | CLI parity、件数、query、JSON、progress、golden test | 9-6 |
+| CLI/MCP | stdio MCP、主要CLI/MCP操作、resource-not-found、共通DTO/JSON Schema（9-2完了） | CLI parity、件数、query、JSON、golden test | 9-6 |
 | 配布/CI | 4ターゲットbuild matrix、linux smoke initialize | upload/search E2E、bunx、runtime依存、リリースゲート | 9-7 |
 
 ---

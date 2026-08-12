@@ -141,7 +141,7 @@ fn clean_entity_name(name: &str) -> String {
         .collect()
 }
 
-fn entity_record_id(name: &str) -> Result<RecordId, SkbError> {
+pub(crate) fn entity_record_id(name: &str) -> Result<RecordId, SkbError> {
     let cleaned = clean_entity_name(name);
     if cleaned.is_empty() {
         return Err(SkbError::new(
@@ -568,9 +568,16 @@ pub async fn expand_search_hits(
         }
 
         // Cap each hop's frontier so a dense graph cannot issue unbounded
-        // related_to queries (request-level bound on query fan-out).
-        const FRONTIER_MAX: usize = 100;
+        // related_to queries (request-level bound on query fan-out). Sort by
+        // decay descending, then entity name ascending, so truncation keeps
+        // the closest hops deterministically.
+        const FRONTIER_MAX: usize = 200;
         if frontier.len() > FRONTIER_MAX {
+            frontier.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.0.cmp(&b.0))
+            });
             frontier.truncate(FRONTIER_MAX);
         }
 
@@ -609,8 +616,15 @@ pub async fn expand_search_hits(
             }
             // Cap the frontier at the end of each hop so a dense graph
             // cannot grow it unboundedly across hops (request-level bound).
+            // Sort by decay descending, then entity name ascending, so
+            // truncation keeps the closest hops deterministically.
             frontier.extend(next);
             if frontier.len() > FRONTIER_MAX {
+                frontier.sort_by(|a, b| {
+                    b.1.partial_cmp(&a.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.0.cmp(&b.0))
+                });
                 frontier.truncate(FRONTIER_MAX);
             }
         }

@@ -169,13 +169,16 @@ pub async fn reindex(
     Ok(result)
 }
 
+type LocalTransaction = surrealdb::method::Transaction<surrealdb::engine::local::Db>;
+
 /// Redefine the HNSW index, retrying the whole begin -> redefine -> commit
 /// sequence on retryable transaction write conflicts (embedded SurrealKV; a
 /// transaction cannot be re-committed, so a new one is started per attempt).
 async fn redefine_index_retrying(db: &Db, dimension: usize) -> Result<(), SkbError> {
     const ATTEMPTS: usize = 8;
     let mut last = None;
-    for _ in 0..ATTEMPTS {
+    let mut delay = std::time::Duration::from_millis(50);
+    for attempt in 0..ATTEMPTS {
         let tx = db
             .db
             .clone()
@@ -187,10 +190,14 @@ async fn redefine_index_retrying(db: &Db, dimension: usize) -> Result<(), SkbErr
                 Ok(_) => return Ok(()),
                 Err(e) if e.to_string().contains("Transaction write conflict") => {
                     last = Some(e);
-                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    if attempt + 1 < ATTEMPTS {
+                        tokio::time::sleep(delay).await;
+                        delay = delay
+                            .saturating_mul(2)
+                            .min(std::time::Duration::from_millis(800));
+                    }
                 }
                 Err(e) => {
-                    // commit consumed the transaction; nothing to cancel.
                     return Err(SkbError::new(ErrorCode::Db, format!("reindex commit: {e}")));
                 }
             },
@@ -209,8 +216,6 @@ async fn redefine_index_retrying(db: &Db, dimension: usize) -> Result<(), SkbErr
     ))
 }
 
-type LocalTransaction = surrealdb::method::Transaction<surrealdb::engine::local::Db>;
-
 /// Run the dimension transition, retrying the whole begin -> transition ->
 /// commit sequence on retryable write conflicts (embedded SurrealKV; a
 /// transaction cannot be re-committed, so a fresh one is started per attempt;
@@ -218,7 +223,8 @@ type LocalTransaction = surrealdb::method::Transaction<surrealdb::engine::local:
 async fn transition_retrying(db: &Db, dimension: usize) -> Result<(), SkbError> {
     const ATTEMPTS: usize = 8;
     let mut last = None;
-    for _ in 0..ATTEMPTS {
+    let mut delay = std::time::Duration::from_millis(50);
+    for attempt in 0..ATTEMPTS {
         let tx = db
             .db
             .clone()
@@ -230,10 +236,14 @@ async fn transition_retrying(db: &Db, dimension: usize) -> Result<(), SkbError> 
                 Ok(_) => return Ok(()),
                 Err(e) if e.to_string().contains("Transaction write conflict") => {
                     last = Some(e);
-                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    if attempt + 1 < ATTEMPTS {
+                        tokio::time::sleep(delay).await;
+                        delay = delay
+                            .saturating_mul(2)
+                            .min(std::time::Duration::from_millis(800));
+                    }
                 }
                 Err(e) => {
-                    // commit consumed the transaction; nothing to cancel.
                     return Err(SkbError::new(ErrorCode::Db, format!("reindex commit: {e}")));
                 }
             },
@@ -366,9 +376,13 @@ async fn update_metas(
 ) -> Result<(), SkbError> {
     // begin -> writes -> commit retried as a whole on retryable write
     // conflicts (embedded SurrealKV; a transaction cannot be re-committed).
+    // This op captures external references (embedder/tokenizer/config), so it
+    // keeps its own retry loop with the same backoff policy as the other
+    // transaction helpers.
     const ATTEMPTS: usize = 8;
     let mut last = None;
-    for _ in 0..ATTEMPTS {
+    let mut delay = std::time::Duration::from_millis(50);
+    for attempt in 0..ATTEMPTS {
         let tx = db
             .db
             .clone()
@@ -397,7 +411,12 @@ async fn update_metas(
                 Ok(_) => return Ok(()),
                 Err(e) if e.to_string().contains("Transaction write conflict") => {
                     last = Some(e);
-                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    if attempt + 1 < ATTEMPTS {
+                        tokio::time::sleep(delay).await;
+                        delay = delay
+                            .saturating_mul(2)
+                            .min(std::time::Duration::from_millis(800));
+                    }
                 }
                 Err(e) => {
                     // commit consumed the transaction; nothing to cancel.
@@ -436,7 +455,8 @@ async fn rebuild_document_retrying(
 ) -> Result<Vec<String>, SkbError> {
     const ATTEMPTS: usize = 8;
     let mut last = None;
-    for _ in 0..ATTEMPTS {
+    let mut delay = std::time::Duration::from_millis(50);
+    for attempt in 0..ATTEMPTS {
         let tx = db
             .db
             .clone()
@@ -448,10 +468,14 @@ async fn rebuild_document_retrying(
                 Ok(_) => return Ok(names),
                 Err(e) if e.to_string().contains("Transaction write conflict") => {
                     last = Some(e);
-                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    if attempt + 1 < ATTEMPTS {
+                        tokio::time::sleep(delay).await;
+                        delay = delay
+                            .saturating_mul(2)
+                            .min(std::time::Duration::from_millis(800));
+                    }
                 }
                 Err(e) => {
-                    // commit consumed the transaction; nothing to cancel.
                     return Err(SkbError::new(ErrorCode::Db, format!("reindex commit: {e}")));
                 }
             },
@@ -477,6 +501,19 @@ async fn rebuild_document(
     chunks: &[crate::tokenize::Chunk],
     embeddings: &[Vec<f32>],
 ) -> Result<Vec<String>, SkbError> {
+    // Guard against silent truncation by the zip() calls below: the stored
+    // chunk count must equal the embedding count so rebuild_all's reported
+    // numbers match what is actually persisted.
+    if chunks.len() != embeddings.len() {
+        return Err(SkbError::new(
+            ErrorCode::Db,
+            format!(
+                "rebuild_document: chunk count ({}) != embedding count ({}) for document '{did}'",
+                chunks.len(),
+                embeddings.len()
+            ),
+        ));
+    }
     let document = surrealdb::types::RecordId::new("document", did);
     tx.query(
         "DELETE FROM mentions WHERE in.document = $document; \

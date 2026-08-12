@@ -130,8 +130,19 @@ pub async fn upload(
     req.validate()?;
     let force = req.force.unwrap_or(false);
     let doc = extract_document_data(req, config).await?;
-    let existed = doc_exists(db, &doc.sha256).await?;
+
+    // The transaction starts BEFORE the duplicate check so the lookup and the
+    // write share one transaction (a concurrent identical upload cannot both
+    // create the document). Extraction and validation happen before this.
+    let tx = db
+        .db
+        .clone()
+        .begin()
+        .await
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("upload begin: {e}")))?;
+    let existed = doc_id_by_sha(&tx, &doc.sha256).await?.is_some();
     if !force && existed {
+        let _ = tx.cancel().await;
         return Ok(UploadResult {
             document_id: None,
             title: doc.title,
@@ -150,6 +161,7 @@ pub async fn upload(
     )?;
 
     if chunks.is_empty() {
+        let _ = tx.cancel().await;
         return Ok(UploadResult {
             document_id: None,
             title: doc.title,
@@ -164,13 +176,6 @@ pub async fn upload(
     let texts: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
     let embeddings = embed_batch(embedder, &texts, config.embedding.batch_size)?;
     let total_tokens: usize = chunks.iter().map(|c| c.token_count).sum();
-
-    let tx = db
-        .db
-        .clone()
-        .begin()
-        .await
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("upload begin: {e}")))?;
 
     let stored = store_and_index(&tx, &doc, &chunks, &embeddings, force && existed).await;
     let (doc_id, entities) = match stored {
@@ -215,8 +220,12 @@ async fn store_and_index(
     let mut document_id: Option<String> = None;
     if replace_existing {
         // Preserve the document's id (upsert semantics, spec §4.2): update the
-        // existing record in place and only replace chunks/mentions.
-        let did = doc_id_by_sha(tx, &doc.sha256).await?;
+        // existing record in place and only replace chunks/mentions. The
+        // existence check above ran in the same transaction, so a vanished
+        // record here is a genuine error.
+        let did = doc_id_by_sha(tx, &doc.sha256)
+            .await?
+            .ok_or_else(|| SkbError::new(ErrorCode::Db, "document vanished during upload"))?;
         document_id = Some(format!("document:{did}"));
         let record = surrealdb::types::RecordId::new("document", did);
         tx.query(
@@ -308,6 +317,21 @@ async fn store_and_index(
         entities.extend(names);
     }
     // Heading hierarchy: sections become part-of their nearest ancestor.
+    // First remove every existing part-of edge whose child is a section of
+    // THIS document, so each child keeps only its current nearest parent
+    // (a force re-upload with a restructured document cannot leave stale
+    // edges to an old parent).
+    for section in graph::extract_sections(&doc.content) {
+        tx.query(
+            "DELETE FROM related_to WHERE relation = 'part-of' \
+             AND in = $child",
+        )
+        .bind(("child", graph::entity_record_id(&section.name)?))
+        .await
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("section edge cleanup: {e}")))?
+        .check()
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("section edge cleanup check: {e}")))?;
+    }
     graph::link_section_hierarchy(tx, &doc.content).await?;
     entities.sort();
     entities.dedup();
@@ -315,7 +339,7 @@ async fn store_and_index(
     Ok((doc_id, entities))
 }
 
-async fn doc_id_by_sha(tx: &LocalTransaction, sha256: &str) -> Result<String, SkbError> {
+async fn doc_id_by_sha(tx: &LocalTransaction, sha256: &str) -> Result<Option<String>, SkbError> {
     let mut r = tx
         .query("SELECT meta::id(id) AS did FROM document WHERE sha256 = $sha256 LIMIT 1")
         .bind(("sha256", sha256.to_string()))
@@ -326,10 +350,10 @@ async fn doc_id_by_sha(tx: &LocalTransaction, sha256: &str) -> Result<String, Sk
     let rows: Vec<serde_json::Value> = r
         .take(0)
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("doc lookup take: {e}")))?;
-    rows.first()
+    Ok(rows
+        .first()
         .and_then(|v| v["did"].as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| SkbError::new(ErrorCode::Db, "document vanished during upload"))
+        .map(|s| s.to_string()))
 }
 
 fn record_key(doc_id: &str) -> Result<&str, SkbError> {
@@ -834,6 +858,11 @@ fn is_blocked_v4(v4: std::net::Ipv4Addr) -> bool {
         || is_benchmarking(v4)
         || is_reserved_v4(v4)
         || v4.octets() == [169, 254, 169, 254]
+        // 0.0.0.0/8 — "this network" (block the whole range, not only the
+        // unspecified address).
+        || v4.octets()[0] == 0
+        // 192.88.99.0/24 — 6to4 relay anycast.
+        || (v4.octets()[0] == 192 && v4.octets()[1] == 88 && v4.octets()[2] == 99)
 }
 
 /// 100.64.0.0/10 — shared address space (CGNAT).
@@ -932,21 +961,6 @@ fn embed_batch(
     Ok(all)
 }
 
-async fn doc_exists(db: &Db, sha256: &str) -> Result<bool, SkbError> {
-    let query = "SELECT count() AS c FROM document WHERE sha256 = $sha256 GROUP ALL";
-    let mut r = db
-        .db
-        .query(query)
-        .bind(("sha256", sha256.to_string()))
-        .await
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("doc_exists: {e}")))?;
-    let rows: Vec<serde_json::Value> = r
-        .take(0)
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("doc_exists take: {e}")))?;
-    let count = rows.first().and_then(|v| v["c"].as_u64()).unwrap_or(0);
-    Ok(count > 0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1005,6 +1019,8 @@ mod tests {
             "240.0.0.1",
             "255.255.255.255",
             "0.0.0.0",
+            "0.1.2.3",
+            "192.88.99.1",
             "192.0.2.1",
             "::1",
             "fe80::1",

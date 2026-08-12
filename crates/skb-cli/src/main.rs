@@ -581,7 +581,16 @@ fn parse_scalar_item(raw: &str) -> toml_edit::Item {
 }
 
 fn cfg() -> Result<Config> {
-    Config::load()
+    // Map configuration-loading failures (TOML parse, invalid SKB_* numeric
+    // values, missing/invalid file) to E_CONFIG so the CLI reports the
+    // correct error code and exit status.
+    Config::load().map_err(|e| {
+        let err = skb_core::error::SkbError::new(
+            skb_core::error::ErrorCode::Config,
+            format!("failed to load config: {e:#}"),
+        );
+        anyhow::Error::from(err)
+    })
 }
 
 #[cfg(test)]
