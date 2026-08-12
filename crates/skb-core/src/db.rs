@@ -13,6 +13,21 @@ pub struct Db {
 const SET_META_SQL: &str = "INSERT INTO meta (key, meta_value) VALUES ($key, $val) \
                             ON DUPLICATE KEY UPDATE meta_value = $val";
 
+/// Delete a `meta` row (used to remove transient markers such as
+/// `reindex_in_progress` once the operation completes).
+pub(crate) async fn delete_meta(
+    db: &Surreal<surrealdb::engine::local::Db>,
+    key: &str,
+) -> Result<(), SkbError> {
+    db.query("DELETE FROM meta WHERE key = $key")
+        .bind(("key", key))
+        .await
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete_meta: {e}")))?
+        .check()
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete_meta check: {e}")))?;
+    Ok(())
+}
+
 /// Something that can persist a `meta` table key/value. Implemented for both
 /// the connection handle and an in-progress transaction so metadata writes can
 /// be grouped atomically (e.g. reindex §5.4).
@@ -113,18 +128,38 @@ impl Db {
         // When the stored embedding dimension differs from the target, the
         // existing embedding field ASSERT and HNSW index are redefined to the
         // new dimension (a dimension change through reindex); otherwise the
-        // IF NOT EXISTS definitions below leave them untouched. A brand-new
-        // store has no meta table yet, which is not a dimension change.
+        // IF NOT EXISTS definitions below leave them untouched. Only a
+        // genuinely missing meta table (fresh store) maps to None; all other
+        // Db failures propagate so a transient read error is not mistaken for
+        // a new database.
         let stored_dim = match self.get_meta("embedding_dimension").await {
             Ok(v) => v.and_then(|s| s.parse::<usize>().ok()),
-            Err(e) if e.code == ErrorCode::Db => None, // fresh store
+            Err(e)
+                if e.code == ErrorCode::Db
+                    && e.to_string().to_lowercase().contains("meta")
+                    && (e.to_string().contains("does not exist")
+                        || e.to_string().contains("not found")) =>
+            {
+                None // fresh store: meta table does not exist yet
+            }
             Err(e) => return Err(e),
         };
         if stored_dim.is_some_and(|d| d != embedding_dim) {
+            // Remove the index and the field ASSERT first (an UPDATE on a
+            // field with an ASSERT is validated against existing rows), then
+            // wipe the stored vectors, then redefine the field for the new
+            // dimension.
+            let wipe = "REMOVE INDEX IF EXISTS chunk_embedding_hnsw ON chunk; \
+                        REMOVE FIELD IF EXISTS embedding ON chunk; \
+                        UPDATE chunk UNSET embedding;";
+            self.db
+                .query(wipe)
+                .await
+                .map_err(|e| SkbError::new(ErrorCode::Db, format!("migrate wipe: {e}")))?
+                .check()
+                .map_err(|e| SkbError::new(ErrorCode::Db, format!("migrate wipe check: {e}")))?;
             let redefine = format!(
-                "REMOVE INDEX IF EXISTS chunk_embedding_hnsw ON chunk; \
-                 REMOVE FIELD IF EXISTS embedding ON chunk; \
-                 DEFINE FIELD embedding ON chunk TYPE array<float> \
+                "DEFINE FIELD embedding ON chunk TYPE array<float> \
                      ASSERT array::len($value) = {embedding_dim};"
             );
             self.db

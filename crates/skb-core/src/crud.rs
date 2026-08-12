@@ -91,9 +91,15 @@ pub struct ListQuery {
     // Mirrors MAX_TOP_K (schemars range attributes accept literals only).
     #[schemars(range(min = 1, max = 1000))]
     pub limit: Option<usize>,
+    // Huge offsets make SurrealDB scan that many records before returning.
+    #[schemars(range(min = 0, max = 1_000_000))]
     pub offset: Option<usize>,
     pub order: Option<OrderBy>,
 }
+
+/// Upper bound for list offset: a huge offset makes SurrealDB scan that many
+/// records before returning, so cap it to bound per-request CPU/IO.
+pub(crate) const MAX_LIST_OFFSET: usize = 1_000_000;
 
 impl ListQuery {
     pub fn validate(&self) -> Result<(), SkbError> {
@@ -108,6 +114,14 @@ impl ListQuery {
                 return Err(SkbError::new(
                     ErrorCode::Validation,
                     format!("limit must be at most {}", crate::search::MAX_TOP_K),
+                ));
+            }
+        }
+        if let Some(offset) = self.offset {
+            if offset > MAX_LIST_OFFSET {
+                return Err(SkbError::new(
+                    ErrorCode::Validation,
+                    format!("offset must be at most {MAX_LIST_OFFSET}"),
                 ));
             }
         }
@@ -287,31 +301,65 @@ pub async fn delete_document(
     req: &DeleteDocumentRequest,
 ) -> Result<DeleteResult, SkbError> {
     let record_id = req.validate()?;
-    let query = "DELETE FROM chunk WHERE document = $id RETURN BEFORE; DELETE $id;";
-    let r = db
+    // Existence check, chunk deletion and document deletion share one
+    // transaction; every failure cancels it before returning, and only a
+    // fully successful run commits.
+    let tx = db
         .db
+        .clone()
+        .begin()
+        .await
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete begin: {e}")))?;
+    let query = "DELETE FROM chunk WHERE document = $id RETURN BEFORE; DELETE $id;";
+    let r = tx
         .query(query)
         .bind(("id", record_id.clone()))
         .await
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete: {e}")))?;
-    let mut r = r
-        .check()
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete check: {e}")))?;
-    let deleted: Vec<serde_json::Value> = r
-        .take(0)
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete take: {e}")))?;
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete: {e}")));
+    let r = match r {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = tx.cancel().await;
+            return Err(e);
+        }
+    };
+    let mut r = match r.check() {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = tx.cancel().await;
+            return Err(SkbError::new(ErrorCode::Db, format!("delete check: {e}")));
+        }
+    };
+    let deleted: Vec<serde_json::Value> = match r.take(0) {
+        Ok(rows) => rows,
+        Err(e) => {
+            let _ = tx.cancel().await;
+            return Err(SkbError::new(ErrorCode::Db, format!("delete take: {e}")));
+        }
+    };
     // The `DELETE $id` statement returns the removed document (a single
     // object, or NONE for a missing document), so report E_DOCUMENT_NOT_FOUND
     // when nothing was deleted.
-    let doc_result: surrealdb::types::Value = r
-        .take(1)
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete doc take: {e}")))?;
+    let doc_result: surrealdb::types::Value = match r.take(1) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = tx.cancel().await;
+            return Err(SkbError::new(
+                ErrorCode::Db,
+                format!("delete doc take: {e}"),
+            ));
+        }
+    };
     if doc_result == surrealdb::types::Value::None {
+        let _ = tx.cancel().await;
         return Err(SkbError::new(
             ErrorCode::DocumentNotFound,
             format!("not found: {}", req.id),
         ));
     }
+    tx.commit()
+        .await
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete commit: {e}")))?;
 
     Ok(DeleteResult {
         document_id: req.id.clone(),

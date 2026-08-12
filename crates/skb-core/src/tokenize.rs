@@ -61,6 +61,12 @@ impl Tokenize for TokenizersImpl {
     }
 
     fn config_json(&self) -> Result<serde_json::Value, SkbError> {
+        // Serialization of the full tokenizer config (including the
+        // vocabulary) is measured once per startup for the fingerprint;
+        // for bge-m3 (~250k vocab) this is tens of ms and a few MB of JSON,
+        // acceptable for a one-time cost. If it ever becomes significant,
+        // stream-hash the tokenizer.json file instead (fingerprint must stay
+        // deterministic).
         serde_json::to_value(&self.tokenizer).map_err(|e| {
             SkbError::new(
                 ErrorCode::Tokenize,

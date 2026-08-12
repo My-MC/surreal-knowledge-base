@@ -237,7 +237,7 @@ Phase 0〜8 で確定した方針（`tokenizers`、SurrealKV 組込み、ORT 静
 - fingerprint schema version、canonicalization規則、取得元、アルゴリズム/バージョン、fingerprintを`meta`に保存し、`KnowledgeBase::open`と`reindex`で比較する。
 - **完了条件**: 不正設定、環境変数上書き、model/dimension/max input mismatch、tokenizer fingerprint不一致、保存後の再起動検証が緑。
 
-✅ 実装済み: `Config::validate()`（`0 <= overlap < max <= max_input`ほか）と `Config::resolve_embedding_settings()`（dimension/max_input のモデル値解決・不一致は `E_VALIDATION`）、`SKB_*` 環境変数オーバーライド（`Config::load()` がファイルなし時も default+env を返す）、tokenizer fingerprint（canonical JSON + SHA-256、schema v1、meta 保存・`open`/`reindex` で比較、不一致は `E_MODEL_MISMATCH`）、reindex 成功時に model/tokenizer meta を更新、`search` のデフォルト mode/top_k を `config.search` から適用。MockEmbedder は固定 8 次元として検出値とみなす。CLI 引数レイヤは該当する設定キーの引数が存在しないため env が最上位。bge-m3 の自動検出値は 1024/8192（OrtEmbedder 固定、config.json からの検出は将来課題）。
+✅ 実装済み: `Config::validate()`（`0 <= overlap < max <= max_input`ほか）と `Config::resolve_embedding_settings()`（dimension/max_input のモデル値解決・不一致は `E_VALIDATION`）、`SKB_*` 環境変数オーバーライド（`Config::load()` がファイルなし時も default+env を返す）、tokenizer fingerprint（canonical JSON + SHA-256、schema v1、meta 保存・`open`/`reindex` で比較、不一致は `E_MODEL_MISMATCH`）、reindex 成功時に model/tokenizer meta を更新、`search` のデフォルト mode/top_k を `config.search` から適用。次元変更時は `Db::migrate` が既存 chunk の embedding 値を `UPDATE chunk UNSET embedding` で消去してから field/HNSW index を新次元で再定義する（次元変更 reindex の統合テストで検証）。MockEmbedder は固定 8 次元として検出値とみなす。CLI 引数レイヤは該当する設定キーの引数が存在しないため env が最上位。bge-m3 の自動検出値は 1024/8192（OrtEmbedder 固定、config.json からの検出は将来課題）。
 
 ### 9-2: 共通DTO・JSON Schema基盤（完了）
 

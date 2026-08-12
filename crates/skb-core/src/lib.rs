@@ -95,17 +95,51 @@ impl KnowledgeBase {
         let is_new = db.is_new_database().await?;
         if is_new {
             db.migrate(dimension).await?;
-            db.set_meta("embedding_model", &config.embedding.model)
+            // Write all initialization metadata atomically in one
+            // transaction so a partial failure cannot leave a half-initialized
+            // store.
+            let tx = db
+                .db
+                .clone()
+                .begin()
+                .await
+                .map_err(|e| SkbError::new(ErrorCode::Db, format!("init meta begin: {e}")))?;
+            let meta_result = async {
+                use crate::db::MetaStore;
+                tx.set_meta("embedding_model", &config.embedding.model)
+                    .await?;
+                tx.set_meta("embedding_dimension", &dimension.to_string())
+                    .await?;
+                tx.set_meta(
+                    "embedding_max_input_tokens",
+                    &config.embedding.max_input_tokens.to_string(),
+                )
                 .await?;
-            db.set_meta("embedding_dimension", &dimension.to_string())
-                .await?;
-            db.set_meta(
-                "embedding_max_input_tokens",
-                &config.embedding.max_input_tokens.to_string(),
-            )
-            .await?;
-            db.set_meta("schema_version", crate::SCHEMA_VERSION).await?;
+                tx.set_meta("schema_version", crate::SCHEMA_VERSION).await?;
+                Ok::<(), SkbError>(())
+            }
+            .await;
+            match meta_result {
+                Ok(()) => {
+                    tx.commit().await.map_err(|e| {
+                        SkbError::new(ErrorCode::Db, format!("init meta commit: {e}"))
+                    })?;
+                }
+                Err(e) => {
+                    let _ = tx.cancel().await;
+                    return Err(e);
+                }
+            }
         } else if !allow_mismatch {
+            // A reindex interrupted before completion leaves the marker;
+            // refuse normal opens so the store is never used half-rebuilt.
+            let in_progress = db.get_meta("reindex_in_progress").await?;
+            if in_progress.as_deref().is_some_and(|v| !v.is_empty()) {
+                return Err(SkbError::new(
+                    ErrorCode::ModelMismatch,
+                    "a reindex is in progress or was interrupted; run `skb reindex` to complete it",
+                ));
+            }
             let stored_model = db.get_meta("embedding_model").await?;
             if let Some(ref stored) = stored_model {
                 if stored != &config.embedding.model {
@@ -636,6 +670,43 @@ mod tests {
         let kb = setup().await;
         assert_eq!(kb.embedder().dimension(), 8);
         cleanup(&kb);
+    }
+
+    #[tokio::test]
+    async fn test_migrate_dimension_change_unsets_embeddings() {
+        let kb = setup().await;
+        let path = kb.config().storage.path.clone();
+
+        kb.upload(UploadRequest {
+            path: None,
+            url: None,
+            content: Some("document with an embedding to wipe".into()),
+            content_base64: None,
+            title: Some("dim-migrate".into()),
+            tags: None,
+            metadata: None,
+            force: None,
+        })
+        .await
+        .unwrap();
+
+        // Re-migrate at a different dimension: existing chunk embedding
+        // values must be removed (REMOVE FIELD alone leaves the vectors).
+        let db = kb.db();
+        db.migrate(16).await.unwrap();
+        let mut r = db
+            .db
+            .query(
+                "SELECT count() AS c FROM chunk \
+                 WHERE embedding != NONE GROUP ALL",
+            )
+            .await
+            .unwrap();
+        let rows: Vec<serde_json::Value> = r.take(0).unwrap();
+        let count = rows.first().and_then(|v| v["c"].as_u64()).unwrap_or(1);
+        assert_eq!(count, 0, "all prior embeddings must be unset after migrate");
+
+        let _ = std::fs::remove_dir_all(&path);
     }
 
     #[tokio::test]
