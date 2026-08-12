@@ -21,7 +21,7 @@ description: >-
 
 Retrieve current documentation and code examples for any library using the Context7 CLI.
 
-Run commands with `npx ctx7@0.5.8` so setup always uses the latest CLI without a global install:
+Run commands with `npx ctx7@0.5.8` — the approved pinned CLI version — without a global install:
 
 ```bash
 npx ctx7@0.5.8 library <name> "<query>"

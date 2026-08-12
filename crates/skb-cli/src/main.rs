@@ -351,6 +351,14 @@ async fn run(cli: &Cli) -> Result<u8> {
                     let result = kb.upload(build(None, Some(content), None)).await?;
                     output(&result, &fmt)?;
                 }
+            } else if url.is_some() {
+                // URL-only upload keeps the direct UploadResult shape; the
+                // URL is injected by build (url.clone()). This branch also
+                // handles `--url --recursive` (no --path): the directory
+                // collection above was skipped, so a single URL upload is
+                // performed instead of an empty multi-input loop.
+                let result = kb.upload(build(None, None, None)).await?;
+                output(&result, &fmt)?;
             } else if paths.len() > 1 || *recursive {
                 // Multi-input uploads: successful uploads are committed and
                 // returned in `results`, failures are aggregated in `errors`

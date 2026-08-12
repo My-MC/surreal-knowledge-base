@@ -43,6 +43,16 @@ pub struct KnowledgeBase {
 
 impl KnowledgeBase {
     pub async fn open(config: Config) -> Result<Self, SkbError> {
+        Self::open_inner(config, false).await
+    }
+
+    /// Open even when a reindex was interrupted (marker present), so a
+    /// subsequent `reindex` run can complete the rebuild.
+    pub async fn open_for_reindex(config: Config) -> Result<Self, SkbError> {
+        Self::open_inner(config, true).await
+    }
+
+    async fn open_inner(config: Config, allow_mismatch: bool) -> Result<Self, SkbError> {
         let db = Db::open(&config).await?;
 
         let tokenizer_path = resolve_tokenizer_path(&config)?;
@@ -81,9 +91,11 @@ impl KnowledgeBase {
         db.migrate(dimension).await?;
 
         // A reindex interrupted before completion leaves the marker; refuse
-        // normal opens so the store is never used half-rebuilt.
+        // normal opens so the store is never used half-rebuilt. The reindex
+        // management path (open_for_reindex) tolerates the marker so a
+        // subsequent run can complete the rebuild.
         let in_progress = db.get_meta("reindex_in_progress").await?;
-        if in_progress.as_deref().is_some_and(|v| !v.is_empty()) {
+        if !allow_mismatch && in_progress.as_deref().is_some_and(|v| !v.is_empty()) {
             return Err(SkbError::new(
                 ErrorCode::ModelMismatch,
                 "a reindex is in progress or was interrupted; run `skb reindex` to complete it",
@@ -91,13 +103,25 @@ impl KnowledgeBase {
         }
 
         let stored_model = db.get_meta("embedding_model").await?;
-        if let Some(ref stored) = stored_model {
-            if stored != &config.embedding.model {
+        if stored_model.is_none() && !allow_mismatch {
+            // Fresh store: record the initialization metadata.
+            db.set_meta("embedding_model", &config.embedding.model)
+                .await?;
+            db.set_meta("embedding_dimension", &dimension.to_string())
+                .await?;
+            db.set_meta(
+                "embedding_max_input_tokens",
+                &config.embedding.max_input_tokens.to_string(),
+            )
+            .await?;
+            db.set_meta("schema_version", "1").await?;
+        } else if !allow_mismatch {
+            if stored_model.as_deref() != Some(config.embedding.model.as_str()) {
                 return Err(SkbError::new(
                     ErrorCode::ModelMismatch,
                     format!(
-                        "config: '{}', stored: '{}'. Run reindex to switch models.",
-                        config.embedding.model, stored
+                        "config: '{}', stored: '{:?}'. Run reindex to switch models.",
+                        config.embedding.model, stored_model
                     ),
                 ));
             }
@@ -111,16 +135,16 @@ impl KnowledgeBase {
                 .await?;
             }
         } else {
-            db.set_meta("embedding_model", &config.embedding.model)
+            // open_for_reindex: never write model/dimension metadata; the
+            // successful reindex records them. Only backfill max_input_tokens
+            // if missing (harmless, read by doctor).
+            if db.get_meta("embedding_max_input_tokens").await?.is_none() {
+                db.set_meta(
+                    "embedding_max_input_tokens",
+                    &config.embedding.max_input_tokens.to_string(),
+                )
                 .await?;
-            db.set_meta("embedding_dimension", &dimension.to_string())
-                .await?;
-            db.set_meta(
-                "embedding_max_input_tokens",
-                &config.embedding.max_input_tokens.to_string(),
-            )
-            .await?;
-            db.set_meta("schema_version", "1").await?;
+            }
         }
 
         // Tokenizer fingerprint: compute, then compare against the stored

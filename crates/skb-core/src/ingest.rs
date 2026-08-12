@@ -356,11 +356,12 @@ async fn extract_document_data(
             .to_string();
         let config = config.clone();
         let raw = tokio::task::spawn_blocking(move || -> Result<RawInput, SkbError> {
-            validate_path(&path, &config)?;
-            let meta = std::fs::metadata(&path)
+            // Validation and reading operate on the same resolved path.
+            let resolved = validate_path(&path, &config)?;
+            let meta = std::fs::metadata(&resolved)
                 .map_err(|e| SkbError::new(ErrorCode::Io, format!("stat file: {e}")))?;
             check_size(meta.len(), &config)?;
-            let bytes = read_file_bytes(&path)?;
+            let bytes = read_file_bytes(&resolved)?;
             Ok(RawInput::Bytes(bytes))
         })
         .await
@@ -405,6 +406,7 @@ async fn extract_document_data(
         ));
     };
 
+    let content_type_hint = content_type_hint.map(|m| m.to_lowercase());
     let mime_hint = mime_for(&source)
         .or_else(|| req.title.as_deref().and_then(mime_for))
         .or_else(|| mime_for(&file_title))
@@ -703,6 +705,12 @@ fn fetch_url_with_validator(
 /// Resolution happens immediately before the request so the validated answer
 /// is as fresh as possible (residual DNS-rebinding window is inherent to the
 /// transport; the resolver/connector pinning is not exposed by ureq).
+/// Pre-request, defense-in-depth host validation: scheme check + DNS
+/// resolution restricted to public addresses. Note: ureq 3.3 keeps the
+/// Resolver trait's parameter types (Uri/Config/NextTimeout) private, so a
+/// custom resolver cannot be implemented from outside the crate; connection
+/// pinning to validated addresses is therefore limited to this pre-request
+/// check (the resolution happens immediately before the request).
 pub fn validate_url_host(url: &Url) -> Result<(), SkbError> {
     match url.scheme() {
         "http" | "https" => {}
@@ -860,10 +868,11 @@ fn base64_decode_checked(b64: &str, config: &Config) -> Result<Vec<u8>, SkbError
     Ok(bytes)
 }
 
-fn validate_path(path: &std::path::Path, config: &Config) -> Result<(), SkbError> {
+fn validate_path(path: &std::path::Path, config: &Config) -> Result<std::path::PathBuf, SkbError> {
     let allowed = &config.upload.allowed_dirs;
     if allowed.is_empty() {
-        return Ok(());
+        // Preserve the input path when no restriction is configured.
+        return Ok(path.to_path_buf());
     }
     let canonical = path
         .canonicalize()
@@ -873,7 +882,7 @@ fn validate_path(path: &std::path::Path, config: &Config) -> Result<(), SkbError
             .canonicalize()
             .map_err(|e| SkbError::new(ErrorCode::Io, format!("resolve allowed dir: {e}")))?;
         if canonical.starts_with(&can_dir) {
-            return Ok(());
+            return Ok(canonical);
         }
     }
     Err(SkbError::new(

@@ -145,16 +145,15 @@ async fn vector_search(
 }
 
 async fn keyword_search(db: &Db, query: &str, top_k: usize) -> Result<Vec<SearchHit>, SkbError> {
-    let escaped = surql_escape(query);
-    let sql = format!(
-        "SELECT content, idx, meta::id(document) AS document, \
+    let sql = "SELECT content, idx, meta::id(document) AS document, \
          document.title AS title, document.source AS source, search::score(0) AS score \
-         FROM chunk WHERE content @@ '{escaped}' ORDER BY score DESC LIMIT {top_k}"
-    );
+         FROM chunk WHERE content @@ $query ORDER BY score DESC LIMIT $top";
 
     let mut r = db
         .db
-        .query(&sql)
+        .query(sql)
+        .bind(("query", query.to_string()))
+        .bind(("top", top_k as i64))
         .await
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("keyword: {e}")))?;
     let rows: Vec<serde_json::Value> = r
@@ -201,16 +200,15 @@ async fn hybrid_search(
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("hybrid vec take: {e}")))?;
 
     // Keyword results
-    let escaped = surql_escape(query);
-    let ksql = format!(
-        "SELECT content, idx, meta::id(id) AS chunk_id, \
+    let ksql = "SELECT content, idx, meta::id(id) AS chunk_id, \
          meta::id(document) AS document, \
          document.title AS title, document.source AS source, search::score(0) AS score \
-         FROM chunk WHERE content @@ '{escaped}' ORDER BY score DESC LIMIT {fetch_k}"
-    );
+         FROM chunk WHERE content @@ $query ORDER BY score DESC LIMIT $fetch";
     let mut r = db
         .db
-        .query(&ksql)
+        .query(ksql)
+        .bind(("query", query.to_string()))
+        .bind(("fetch", fetch_k as i64))
         .await
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("hybrid kw: {e}")))?;
     let krows: Vec<serde_json::Value> = r
@@ -327,13 +325,6 @@ fn rows_to_hits(
 }
 
 /// Escape a string literal for embedding in SurrealQL: backslashes first (so
-/// the quote doubling cannot be undone by a preceding backslash), then single
-/// quotes doubled (SurrealQL's string-literal escaping). Used by the keyword
-/// query construction until the SurrealDB `@@ $query` binding defect is fixed.
-pub(crate) fn surql_escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('\'', "''")
-}
-
 /// The query terms that a keyword search can highlight: whitespace/punctuation
 /// separated words of at least two characters (Unicode chars, not bytes).
 fn match_terms(query: &str) -> Vec<String> {
@@ -438,21 +429,6 @@ mod tests {
             graph_expand: None,
             filter: None,
         }
-    }
-
-    #[test]
-    fn surql_escape_doubles_quotes_and_backslashes() {
-        // A quote must be doubled and a backslash must be doubled BEFORE the
-        // quote so the escaping cannot be undone (backslash then quote).
-        assert_eq!(surql_escape("it's"), "it''s");
-        assert_eq!(surql_escape(r"a\b"), r"a\\b");
-        assert_eq!(surql_escape(r"a\'b"), r"a\\''b");
-        assert_eq!(
-            surql_escape("'; DELETE FROM document; --"),
-            "''; DELETE FROM document; --"
-        );
-        // ASCII-only input is unchanged.
-        assert_eq!(surql_escape("plain query"), "plain query");
     }
 
     #[test]

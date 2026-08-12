@@ -909,8 +909,6 @@ pub(crate) async fn link_section_hierarchy(
                         SkbError::new(ErrorCode::Db, format!("section upsert check: {e}"))
                     })?;
             }
-            // Idempotent edge: `RELATE` always creates a new edge, so remove
-            // an existing part-of edge between the same pair first. Section
             // Idempotent edge with a single-parent invariant: remove EVERY
             // existing part-of edge where this child is the `in` endpoint
             // before creating the current parent edge, so a child that
