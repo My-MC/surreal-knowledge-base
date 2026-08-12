@@ -660,10 +660,14 @@ pub async fn expand_search_hits(
         // candidate chunks are filtered before LIMIT, not scanned and cut).
         let names: Vec<String> = frontier.iter().map(|(e, _)| e.clone()).collect();
         let decay_map: std::collections::HashMap<String, f64> = frontier.into_iter().collect();
+        // Start from the indexed entity.name values and traverse the mentions
+        // edge BACK to the matching chunks (selective: entity rows are
+        // filtered by the indexed name before any chunk work happens, and the
+        // LIMIT applies to the resulting chunks).
         let esql = "SELECT content, idx, meta::id(document) AS document, \
                     document.title AS title, document.source AS source, \
-                    ->mentions->entity.name AS e \
-                    FROM chunk WHERE $names CONTAINSANY ->mentions->entity.name \
+                    name AS e \
+                    FROM chunk WHERE ->mentions->entity.name IN $names \
                     LIMIT 200";
         let mut r = db
             .db

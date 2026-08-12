@@ -127,7 +127,14 @@ impl ServerHandler for SkbServer {
                     .map_err(err_data)?
                 };
                 if let Some(last) = page.last() {
-                    after = Some((last.created_at.clone(), last.id.clone()));
+                    // DocumentSummary.id is `document:<key>`; the keyset cursor
+                    // compares raw record keys, so strip the prefix.
+                    let key = last
+                        .id
+                        .strip_prefix("document:")
+                        .unwrap_or(&last.id)
+                        .to_string();
+                    after = Some((last.created_at.clone(), key));
                 }
                 let page_len = page.len();
                 docs.extend(page);
@@ -328,11 +335,29 @@ impl SkbServer {
         context: &rmcp::service::RequestContext<RoleServer>,
     ) -> Result<Value, String> {
         let args = req.arguments.unwrap_or_default();
-        // While a reindex is running, other tools would block on the kb lock
-        // for the whole operation; reject them immediately instead.
-        if req.name != "skb_reindex" && self.reindexing.load(std::sync::atomic::Ordering::Acquire) {
-            return Err("a reindex is in progress; retry after it completes".to_string());
-        }
+        // The reindexing claim happens BEFORE the kb lock so a concurrent
+        // skb_reindex is rejected immediately, and other tools are rejected
+        // while a reindex runs (they would otherwise block on the lock).
+        let reindex_guard = if req.name == "skb_reindex" {
+            if self
+                .reindexing
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                )
+                .is_err()
+            {
+                return Err("a reindex is already in progress".to_string());
+            }
+            Some(ReindexGuard(self.reindexing.clone()))
+        } else {
+            if self.reindexing.load(std::sync::atomic::Ordering::Acquire) {
+                return Err("a reindex is in progress; retry after it completes".to_string());
+            }
+            None
+        };
         let kb = self.kb.lock().await;
 
         match req.name.as_ref() {
@@ -406,26 +431,11 @@ impl SkbServer {
                     .map_err(|e| format!("{e}"))
             }
             "skb_reindex" => {
-                // Atomically claim the reindexing flag: a second concurrent
-                // skb_reindex is rejected. The guard resets the flag on drop,
-                // so cancellation or a panic cannot leave it set.
-                if self
-                    .reindexing
-                    .compare_exchange(
-                        false,
-                        true,
-                        std::sync::atomic::Ordering::AcqRel,
-                        std::sync::atomic::Ordering::Acquire,
-                    )
-                    .is_err()
-                {
-                    return Err("a reindex is already in progress".to_string());
-                }
-                let _guard = ReindexGuard(self.reindexing.clone());
-                // Release the kb guard before handle_reindex so that method
-                // reacquires it (and the reindexing flag is not held across
-                // the lock).
+                // The reindexing flag was claimed (and the guard created)
+                // before the kb lock above; release the kb guard so
+                // handle_reindex reacquires it.
                 drop(kb);
+                let _guard = reindex_guard;
                 self.handle_reindex(Value::Object(args), context).await
             }
             name => Err(format!("unknown tool: {name}")),
@@ -671,5 +681,29 @@ mod tests {
     fn reindex_request_preserves_explicit_dry_run() {
         let params: ReindexRequest = serde_json::from_value(json!({"dry_run": true})).unwrap();
         assert!(params.dry_run);
+    }
+
+    #[test]
+    fn reindex_guard_claims_and_releases_flag() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        assert!(flag
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok());
+        // A second claim while the first guard is alive is rejected.
+        let second = flag.compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        );
+        assert!(second.is_err(), "second skb_reindex must be rejected");
+        // Dropping the guard resets the flag.
+        drop(ReindexGuard(flag.clone()));
+        assert!(!flag.load(std::sync::atomic::Ordering::Acquire));
     }
 }

@@ -242,9 +242,13 @@ impl KnowledgeBase {
             }
             resp.hits.extend(expanded);
             resp.hits.sort_by(|a, b| {
+                // Score descending, then (document_id, chunk_idx) ascending so
+                // equal scores keep a deterministic order before truncation.
                 b.score
                     .partial_cmp(&a.score)
                     .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.document_id.cmp(&b.document_id))
+                    .then_with(|| a.chunk_idx.cmp(&b.chunk_idx))
             });
             resp.hits.truncate(top_k);
         }
@@ -429,12 +433,26 @@ pub(crate) fn tokenizer_fingerprint(
         .and_then(|v| v.as_str())
         .unwrap_or("unknown")
         .to_string();
+    // Recursively sort all object keys so the hash is independent of JSON key
+    // order (nested values from the tokenizers crate may arrive in arbitrary
+    // order).
+    fn sort_keys(value: serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Object(map) => {
+                serde_json::Value::Object(map.into_iter().map(|(k, v)| (k, sort_keys(v))).collect())
+            }
+            serde_json::Value::Array(arr) => {
+                serde_json::Value::Array(arr.into_iter().map(sort_keys).collect())
+            }
+            other => other,
+        }
+    }
     let canonical = serde_json::to_string(&serde_json::json!({
         "schema": TOKENIZER_FINGERPRINT_SCHEMA,
         "tokenizers": TOKENIZER_CRATE_VERSION,
         "source": source,
         "algorithm": algorithm,
-        "config": config,
+        "config": sort_keys(config.clone()),
     }))
     .map_err(|e| {
         SkbError::new(

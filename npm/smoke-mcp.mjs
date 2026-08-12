@@ -57,6 +57,9 @@ function fail(message) {
     cleanupDb();
     process.exit(1);
   }, 5000).unref();
+  // Final operation: throw so callers stop immediately and cannot continue
+  // into subsequent logic after an assertion failure.
+  throw new Error(message);
 }
 
 child.on("exit", () => {

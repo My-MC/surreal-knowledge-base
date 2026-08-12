@@ -147,6 +147,20 @@ impl ListQuery {
                 ));
             }
         }
+        if self.after.is_some() && self.offset.is_some() {
+            return Err(SkbError::new(
+                ErrorCode::Validation,
+                "after (keyset cursor) and offset cannot be combined",
+            ));
+        }
+        if self.after.is_some()
+            && matches!(self.order, Some(OrderBy::TitleAsc | OrderBy::TitleDesc))
+        {
+            return Err(SkbError::new(
+                ErrorCode::Validation,
+                "after (keyset cursor) is only supported with created_at ordering",
+            ));
+        }
         Ok(())
     }
 }
@@ -221,10 +235,19 @@ pub async fn list_documents(db: &Db, q: &ListQuery) -> Result<Vec<DocumentSummar
         Some(o) => format!("{}, id", OrderBy::to_surql(o)),
         None => "created_at DESC, id".to_string(),
     };
-    // Keyset cursor: resume strictly after the given document key. The
-    // cursor value is bound (never interpolated), so it is safe.
+    // Keyset cursor: resume strictly after the given (created_at, id) pair.
+    // Only the created_at orderings are supported (title ordering has no
+    // created_at cursor); the predicate direction matches the ordering.
+    // Cursor values are bound (never interpolated), so they are safe.
     let cursor_clause = match &q.after {
-        Some(_) => " AND meta::id(id) > $after".to_string(),
+        Some(_) => {
+            let op = if q.order == Some(OrderBy::CreatedDesc) || q.order.is_none() {
+                "<"
+            } else {
+                ">"
+            };
+            format!(" AND (created_at, meta::id(id)) {op} ($after_created, $after_id)")
+        }
         None => String::new(),
     };
     let query = format!(
@@ -233,14 +256,11 @@ pub async fn list_documents(db: &Db, q: &ListQuery) -> Result<Vec<DocumentSummar
          FROM document WHERE true{cursor_clause} ORDER BY {order_by} LIMIT {limit} START {offset}"
     );
     let mut r = if q.after.is_some() {
-        let after_key = q
-            .after
-            .as_ref()
-            .map(|(_, id)| id.clone())
-            .unwrap_or_default();
+        let after = q.after.clone().unwrap_or_default();
         db.db
             .query(&query)
-            .bind(("after", after_key))
+            .bind(("after_created", after.0))
+            .bind(("after_id", after.1))
             .await
             .map_err(|e| SkbError::new(ErrorCode::Db, format!("list: {e}")))?
     } else {

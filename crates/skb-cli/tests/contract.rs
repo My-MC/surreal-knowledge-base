@@ -381,8 +381,24 @@ fn contract_upload_glob_and_multiple_paths() {
     assert_eq!(val["results"].as_array().unwrap().len(), 2);
     assert_eq!(val["errors"].as_array().unwrap().len(), 0);
 
+    // A --recursive directory containing exactly one file still uses the
+    // multi-input {results, errors} envelope (one result, zero errors).
+    let single = dir.join("singledir");
+    std::fs::create_dir_all(&single).unwrap();
+    std::fs::write(single.join("only.md"), "# Only\n\ncontent only").unwrap();
+    let val = run_skb(
+        &["upload", single.to_str().unwrap(), "--recursive", "--force"],
+        None,
+    );
+    assert_eq!(
+        val["results"].as_array().unwrap().len(),
+        1,
+        "recursive single-file upload must use the {{results, errors}} envelope"
+    );
+    assert_eq!(val["errors"].as_array().unwrap().len(), 0);
+
     let list = run_skb(&["list"], None);
-    assert_eq!(list.as_array().unwrap().len(), 3);
+    assert_eq!(list.as_array().unwrap().len(), 4);
 }
 
 #[test]

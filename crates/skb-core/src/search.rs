@@ -153,7 +153,7 @@ async fn vector_search(
 async fn keyword_search(db: &Db, query: &str, top_k: usize) -> Result<Vec<SearchHit>, SkbError> {
     let sql = "SELECT content, idx, meta::id(document) AS document, \
          document.title AS title, document.source AS source, search::score(0) AS score \
-         FROM chunk WHERE content @@ $q ORDER BY score DESC LIMIT $top";
+         FROM chunk WHERE content @0@ $q ORDER BY score DESC LIMIT $top";
 
     let mut r = db
         .db
@@ -210,7 +210,7 @@ async fn hybrid_search(
     let ksql = "SELECT content, idx, meta::id(id) AS chunk_id, \
          meta::id(document) AS document, \
          document.title AS title, document.source AS source, search::score(0) AS score \
-         FROM chunk WHERE content @@ $q ORDER BY score DESC LIMIT $fetch";
+         FROM chunk WHERE content @0@ $q ORDER BY score DESC LIMIT $fetch";
     let mut r = db
         .db
         .query(ksql)

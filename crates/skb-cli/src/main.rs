@@ -148,7 +148,13 @@ fn output(val: &impl serde::Serialize, format: &str) -> Result<()> {
                 println!("{t}");
             }
         }
-        f => anyhow::bail!("unknown format: {f}"),
+        f => {
+            return Err(skb_core::error::SkbError::new(
+                skb_core::error::ErrorCode::Validation,
+                format!("unknown format: {f}"),
+            )
+            .into());
+        }
     }
     Ok(())
 }
@@ -270,7 +276,11 @@ async fn run(cli: &Cli) -> Result<u8> {
         }
         Commands::Delete { id, yes } => {
             if !yes {
-                anyhow::bail!("use --yes to confirm deletion of {id}");
+                return Err(skb_core::error::SkbError::new(
+                    skb_core::error::ErrorCode::Validation,
+                    format!("use --yes to confirm deletion of {id}"),
+                )
+                .into());
             }
             let kb = KnowledgeBase::open(cfg()?).await?;
             let result = kb
@@ -316,6 +326,10 @@ async fn run(cli: &Cli) -> Result<u8> {
                     println!("Status: {} problem(s) found", report.errors.len());
                 }
             }
+            // An unhealthy report exits non-zero so scripts can react.
+            if !report.is_healthy() {
+                return Ok(1);
+            }
         }
         Commands::Query { surql } => {
             let kb = KnowledgeBase::open(cfg()?).await?;
@@ -348,7 +362,11 @@ async fn run(cli: &Cli) -> Result<u8> {
                 .filter(|present| *present)
                 .count();
             if active_sources > 1 {
-                anyhow::bail!("specify exactly one of --stdin, --url, or paths, not several");
+                return Err(skb_core::error::SkbError::new(
+                    skb_core::error::ErrorCode::Validation,
+                    "specify exactly one of --stdin, --url, or paths, not several".to_string(),
+                )
+                .into());
             }
 
             // Expand positional paths: glob patterns, and directories when
@@ -359,7 +377,10 @@ async fn run(cli: &Cli) -> Result<u8> {
             // exactly one file; only one explicitly provided path keeps the
             // direct UploadResult shape.
             let mut expanded: Vec<String> = Vec::new();
-            let mut multi_input = paths.len() > 1;
+            // Multi-input envelope whenever multiple paths are given OR a
+            // --recursive directory expansion is requested (even if it yields
+            // exactly one file).
+            let mut multi_input = paths.len() > 1 || (*recursive && !paths.is_empty());
             for pattern in paths {
                 if pattern.contains(['*', '?', '[']) {
                     multi_input = true;
@@ -378,7 +399,11 @@ async fn run(cli: &Cli) -> Result<u8> {
                         }
                     }
                     if !matched {
-                        anyhow::bail!("no files match '{pattern}'");
+                        return Err(skb_core::error::SkbError::new(
+                            skb_core::error::ErrorCode::Validation,
+                            format!("no files match '{pattern}'"),
+                        )
+                        .into());
                     }
                 } else {
                     let path = std::path::Path::new(pattern);
@@ -387,7 +412,11 @@ async fn run(cli: &Cli) -> Result<u8> {
                             expanded.push(file.display().to_string());
                         }
                     } else if path.is_dir() {
-                        anyhow::bail!("no files to upload: input is a directory; use --recursive");
+                        return Err(skb_core::error::SkbError::new(
+                            skb_core::error::ErrorCode::Validation,
+                            "no files to upload: input is a directory; use --recursive".to_string(),
+                        )
+                        .into());
                     } else {
                         expanded.push(pattern.clone());
                     }
@@ -397,9 +426,12 @@ async fn run(cli: &Cli) -> Result<u8> {
             // empty even though the user did provide inputs; report that with a
             // dedicated message instead of the misleading "no input" error.
             if !paths.is_empty() && expanded.is_empty() {
-                anyhow::bail!(
+                return Err(skb_core::error::SkbError::new(
+                    skb_core::error::ErrorCode::Validation,
                     "no files to upload: matched entries are directories; use --recursive"
-                );
+                        .to_string(),
+                )
+                .into());
             }
 
             let build = |p: Option<String>,
@@ -426,7 +458,11 @@ async fn run(cli: &Cli) -> Result<u8> {
                 let mut raw = Vec::new();
                 std::io::stdin().take(read_cap).read_to_end(&mut raw)?;
                 if raw.len() as u64 > max {
-                    anyhow::bail!("stdin exceeds upload.max_file_mb");
+                    return Err(skb_core::error::SkbError::new(
+                        skb_core::error::ErrorCode::Validation,
+                        "stdin exceeds upload.max_file_mb".to_string(),
+                    )
+                    .into());
                 }
                 let content = String::from_utf8(raw)?;
                 let result = if *base64 {
@@ -479,7 +515,11 @@ async fn run(cli: &Cli) -> Result<u8> {
                 let result = kb.upload(build(Some(p), None, None, None)).await?;
                 output(&result, &fmt)?;
             } else {
-                anyhow::bail!("no input: provide paths, --url, or --stdin");
+                return Err(skb_core::error::SkbError::new(
+                    skb_core::error::ErrorCode::Validation,
+                    "no input: provide paths, --url, or --stdin".to_string(),
+                )
+                .into());
             }
         }
         Commands::Search {
@@ -494,10 +534,18 @@ async fn run(cli: &Cli) -> Result<u8> {
                 .iter()
                 .map(|kv| {
                     kv.split_once('=').map_or_else(
-                        || anyhow::bail!("invalid filter '{kv}'; expected KEY=VALUE"),
+                        || {
+                            Err(skb_core::error::SkbError::new(
+                                skb_core::error::ErrorCode::Validation,
+                                format!("invalid filter '{kv}'; expected KEY=VALUE"),
+                            ))
+                        },
                         |(k, v)| {
                             if k.is_empty() {
-                                anyhow::bail!("invalid filter '{kv}'; key must not be empty")
+                                return Err(skb_core::error::SkbError::new(
+                                    skb_core::error::ErrorCode::Validation,
+                                    format!("invalid filter '{kv}'; key must not be empty"),
+                                ));
                             }
                             Ok((k.to_string(), v.to_string()))
                         },
@@ -625,7 +673,11 @@ fn set_config(key: &str, value: &str) -> Result<()> {
 
     let parts: Vec<&str> = key.trim().split('.').filter(|s| !s.is_empty()).collect();
     if parts.is_empty() {
-        anyhow::bail!("invalid key: {key}");
+        return Err(skb_core::error::SkbError::new(
+            skb_core::error::ErrorCode::Validation,
+            format!("invalid key: {key}"),
+        )
+        .into());
     }
 
     // Walk (or create) nested tables for all but the last segment.
