@@ -1,3 +1,5 @@
+use serial_test::serial;
+
 // Contract tests: verify CLI and core API produce compatible JSON output
 
 use serde_json::Value;
@@ -135,6 +137,7 @@ fn core_stats() -> Value {
 
 const TEST_DATA: &str = "SurrealDB supports vector search with HNSW and full-text with BM25.";
 
+#[serial(contract)]
 #[test]
 fn contract_upload() {
     setup_config();
@@ -147,6 +150,34 @@ fn contract_upload() {
     assert!(cli_val["chunks"].as_u64().unwrap() > 0);
 }
 
+#[serial(contract)]
+#[test]
+fn contract_upload_url_with_recursive() {
+    setup_config();
+    // --url --recursive (no --path) must reach the single-URL upload flow
+    // (and fail on the unreachable URL) instead of an empty multi-input loop
+    // or the "--recursive requires --path" usage error.
+    let output = Command::new(skb_binary())
+        .args(["upload", "--url", "http://127.0.0.1:1/x", "--recursive"])
+        .current_dir(test_dir())
+        .output()
+        .expect("failed to run skb upload --url --recursive");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stderr.contains("--recursive requires --path"),
+        "URL must take precedence over the recursive path requirement: {stderr}"
+    );
+    // The multi-input envelope would be emitted on stdout; the URL branch
+    // must not produce it.
+    assert!(
+        !stdout.contains("results"),
+        "URL upload must not enter the multi-input loop: stdout={stdout}"
+    );
+}
+
+#[serial(contract)]
 #[test]
 fn contract_upload_url_with_recursive_flag() {
     setup_config();
@@ -184,6 +215,7 @@ fn contract_search() {
     assert_eq!(cli_val["mode"], core_val["mode"]);
 }
 
+#[serial(contract)]
 #[test]
 fn contract_list() {
     setup_config();
@@ -199,6 +231,7 @@ fn contract_list() {
     assert!(!core_val.as_array().unwrap().is_empty());
 }
 
+#[serial(contract)]
 #[test]
 fn contract_stats() {
     setup_config();
@@ -219,6 +252,7 @@ fn contract_stats() {
     );
 }
 
+#[serial(contract)]
 #[test]
 fn contract_config_set_updates_existing_config() {
     setup_config();
@@ -235,11 +269,15 @@ fn contract_config_set_updates_existing_config() {
     assert_eq!(shown["search"]["rrf_k"], 42);
 }
 
+#[serial(contract)]
 #[test]
 fn contract_config_env_override() {
     setup_config();
+    // env_clear isolates the test from inherited SKB_* variables so only the
+    // explicitly set value can influence the result.
     let output = Command::new(skb_binary())
         .args(["config", "show"])
+        .env_clear()
         .env("SKB_SEARCH_TOP_K", "42")
         .current_dir(test_dir())
         .output()
@@ -249,6 +287,7 @@ fn contract_config_env_override() {
     assert_eq!(val["search"]["top_k"], 42);
 }
 
+#[serial(contract)]
 #[test]
 fn contract_upload_partial_failure() {
     setup_config();
@@ -289,6 +328,7 @@ fn contract_upload_partial_failure() {
     );
 }
 
+#[serial(contract)]
 #[test]
 fn contract_search_response_fields() {
     setup_config();
@@ -309,6 +349,7 @@ fn contract_search_response_fields() {
     assert!(vec["hits"][0]["highlights"].is_null());
 }
 
+#[serial(contract)]
 #[test]
 fn contract_list_chunk_count_and_delete_counts() {
     setup_config();
