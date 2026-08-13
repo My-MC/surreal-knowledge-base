@@ -94,6 +94,9 @@ pub async fn search(
     req: SearchRequest,
 ) -> Result<SearchResponse, SkbError> {
     req.validate()?;
+    // Fallbacks for direct callers that bypass `KnowledgeBase::search` (which
+    // fills these from `config.search`). Keep them in sync with
+    // `SearchConfig::default()` when the defaults change.
     let mode = req.mode.unwrap_or(SearchMode::Hybrid);
     let top_k = req.top_k.unwrap_or(10);
     let start = std::time::Instant::now();
@@ -177,9 +180,7 @@ async fn hybrid_search(
     top_k: usize,
     rrf_k: usize,
 ) -> Result<Vec<SearchHit>, SkbError> {
-    let fetch_k = top_k
-        .checked_mul(3)
-        .ok_or_else(|| SkbError::new(ErrorCode::Validation, "top_k too large"))?;
+    let fetch_k = top_k * 3;
 
     let query_emb = embedder
         .embed_batch(&[query.to_string()])?
@@ -530,6 +531,10 @@ mod tests {
             serde_json::json!(["hybrid", "vector", "keyword"])
         );
         assert_eq!(value["properties"]["top_k"]["minimum"], 1);
+        assert_eq!(
+            value["properties"]["top_k"]["maximum"], MAX_TOP_K as u64,
+            "schema top_k maximum must track MAX_TOP_K"
+        );
         assert_eq!(value["properties"]["graph_expand"]["maximum"], 5);
     }
 }
