@@ -42,26 +42,26 @@
 | Phase | 内容 | 状態 | 主な不足 |
 |---|---|---|---|
 | 0 | 技術検証スパイク | 部分完了 | 0-2/0-3の検証証跡を成果物として整理する |
-| 1 | `skb-core` 基盤 | 完了 | — |
-| 2 | グラフ + reindex | 完了 | — |
-| 3 | CLI | 完了 | — |
-| 4 | MCP | 完了 | — |
-| 5 | 契約テスト + npm | 部分完了 | 全ターゲットE2E（linux-arm64 / darwin-arm64 / win32-x64）の実機ランナーでの緑確認が未完了 |
+| 1 | `skb-core` 基盤 | 部分完了 | 設定検証、入力安全性、DTO、CRUD件数、検索応答の不足 |
+| 2 | グラフ + reindex | 部分完了 | N-hop、再ランク、dimension/HNSW/meta整合性の不足 |
+| 3 | CLI | 部分完了 | 仕様上の入力形式、glob、JSON doctor、query、progressの不足 |
+| 4 | MCP | 部分完了 | progressの不足 |
+| 5 | 契約テスト + npm | 部分完了 | MCP/CLI比較、全ターゲットE2E、upload/search smokeの不足 |
 | 6 | Skill | 部分完了 | 実装済みレスポンスとSkillの引用・エラー説明の同期が必要 |
 | 7 | 仕上げ | 進行中 | ベンチ結果の判定、日本語FTS評価、公開手順の整理が必要 |
 | 8 | ort有効バイナリ + 依存最小化 | 部分完了 | CI証跡と生成artifactの扱い、Windows runtime案内のE2Eが必要 |
-| 9 | 仕様適合化と未実施機能 | 部分完了 | 9-1〜9-7のコード・テストは実装済み。CI の新ジョブ（e2e-linux-arm64 / e2e-macos / e2e-windows）の実機ランナーでの緑確認、および公開後のレジストリ経由の手動検証（npx と bunx の両方でパッケージを実行して upload→search を確認）後に「完了」へ更新 |
+| 9 | 仕様適合化と未実施機能 | 部分完了 | 9-1〜9-6完了、9-7は部分完了。CI の新ジョブ（e2e-linux-arm64 / e2e-macos / e2e-windows）は実機ランナーでの緑確認とレジストリ経由の手動検証後に確定 |
 
 ### 現状検証マトリクス
 
 | 領域 | 現在確認できる実装 | 不足する検証/実装 | 次のPhase |
 |---|---|---|---|
-| 設定・モデル | `./skb.toml`/ユーザー設定探索、`SKB_*`環境変数オーバーライド、model名のmeta照合、dimension/max_inputのモデル解決と`E_VALIDATION`、tokenizer fingerprintの生成・meta保存・`E_MODEL_MISMATCH`、再起動検証（9-1完了） | config.jsonからの dimension / max_input_tokens 自動検出は未実装 | — |
-| Upload | 全経路のサイズ上限、SSRF（手動redirect各hop検証・IPブロック・SafeResolverで検証済みアドレスへの接続固定）、base64任意バイナリ分類、単一トランザクション+rollback、CLI部分失敗errors[]（9-3完了） | 圧縮爆弾/ネスト深度/メモリ上限（PDFはページ数・時間上限のみ） | — |
+| 設定・モデル | `./skb.toml`/ユーザー設定探索、`SKB_*`環境変数オーバーライド、model名のmeta照合、dimension/max_inputのモデル解決と`E_VALIDATION`、tokenizer fingerprintの生成・meta保存・`E_MODEL_MISMATCH`、再起動検証（9-1完了） | config.jsonからの dimension / max_input_tokens 自動検出は対象外（OrtEmbedder は固定検出値 1024/8192 を使用） | — |
+| Upload | 全経路のサイズ上限、SSRF（手動redirect各hop検証・IPブロック、SafeResolver+with_partsで接続固定）、base64任意バイナリ分類、単一トランザクション+rollback、CLI部分失敗errors[]（9-3完了） | 圧縮爆弾/ネスト深度/メモリ上限（PDFはページ数・時間上限のみ）（残存リスク: 実装予定なし） | なし |
 | Chunk/Graph/Search | 見出し境界チャンキング+heading永続化、EntityExtractor（WikiLink/frontmatter/見出し階層part-of）、N-hop+再ランク、検索応答title/source/highlights/matched_entities（9-4完了） | なし | — |
 | Reindex | migrate前のmodel/dimension比較（新規DBは初期化パス）、open_for_reindex管理経路、dimension変更のwipe+フィールド再定義→HNSW再構築→meta更新、中断検出+再実行復旧、MCP/CLI progress（9-5完了） | なし | — |
 | CLI/MCP | 全CLIコマンド（複数パス/glob/`skb query`/doctor JSON/reindex progress）、chunk_count/chunks_deleted/E_DOCUMENT_NOT_FOUND、MCP resource-not-found、ゴールデン契約テスト（9-6完了） | なし | — |
-| 配布/CI | 4ターゲットbuild matrix、linux smoke、linux-arm64/darwin-arm64/win32-x64 の E2E（initialize→upload→search）、依存検査（ldd/otool/dumpbin）、npm 配布、リリースゲート（9-7実装済み） | e2e-linux-arm64 / e2e-macos / e2e-windows の実機ランナーでの緑確認が未完了 | — |
+| 配布/CI | 4ターゲットbuild matrix、linux smoke initialize | upload/search E2E、bunx、runtime依存、リリースゲート | 9-7 |
 
 ---
 
@@ -230,14 +230,14 @@ Phase 0〜8 で確定した方針（`tokenizers`、SurrealKV 組込み、ORT 静
 
 ### 9-1: 設定・モデル・tokenizer整合性（完了）
 
-- `KnowledgeBase::open` は明示設定か自動検出かを保持したまま、`max_input_tokens = 0` をモデル設定から解決し、dimension/max inputを正規化してから `Config::validate()` の `0 ≤ overlap_tokens < max_tokens <= max_input_tokens` を適用する。明示値とモデル値が不一致の場合は `E_VALIDATION` とする。
-- CLI引数、`SKB_*`環境変数、`./skb.toml`、ユーザー設定の優先順位を実装する。
-- モデル設定からdimensionと最大入力トークン数を検出し、明示設定との不一致を`E_VALIDATION`にする。
+- `KnowledgeBase::open` は明示設定か自動検出かを保持したまま、`max_input_tokens = 0` をモデル設定から解決し、dimension/max inputを正規化してから `Config::validate()` の `0 <= overlap_tokens < max_tokens <= max_input_tokens` を適用する。明示値とモデル値が不一致の場合は `E_VALIDATION` とする。
+- CLI引数、`SKB_*`環境変数、`./skb.toml`、ユーザー設定の優先順位を実装する（該当する設定キーの CLI 引数が存在しないため、現在は env が最上位）。
+- モデル設定からdimensionと最大入力トークン数を検出し、明示設定との不一致を`E_VALIDATION`にする。実装は OrtEmbedder の固定検出値（1024/8192）を使用する。**config.json からの任意モデル値の自動検出は完了条件に含めない**（OrtEmbedder は固定値を持つため；任意モデル対応が必要になった場合のみ検出処理とテストを追加する）。
 - `embedding.tokenizer` の明示パスと`"auto"`を同じ解決経路として扱い、取得元、`tokenizers`のアルゴリズム/バージョン、対象構成をcanonical JSON serializationしてSHA-256 fingerprintを作成する。
 - fingerprint schema version、canonicalization規則、取得元、アルゴリズム/バージョン、fingerprintを`meta`に保存し、`KnowledgeBase::open`と`reindex`で比較する。
 - **完了条件**: 不正設定、環境変数上書き、model/dimension/max input mismatch、tokenizer fingerprint不一致、保存後の再起動検証が緑。
 
-✅ 実装済み: `Config::validate()`（`0 ≤ overlap < max <= max_input`ほか）と `Config::resolve_embedding_settings()`（dimension/max_input のモデル値解決・不一致は `E_VALIDATION`）、`SKB_*` 環境変数オーバーライド（`Config::load()` がファイルなし時も default+env を返す）、tokenizer fingerprint（canonical JSON + SHA-256、schema v1、meta 保存・`open`/`reindex` で比較、不一致は `E_MODEL_MISMATCH`）、reindex 成功時に model/tokenizer meta を更新、`search` のデフォルト mode/top_k を `config.search` から適用。MockEmbedder は固定 8 次元として検出値とみなす。CLI 引数レイヤは該当する設定キーの引数が存在しないため env が最上位。bge-m3 の自動検出値は 1024/8192（OrtEmbedder 固定、config.json からの検出は将来課題）。
+✅ 実装済み: `Config::validate()`（`0 <= overlap < max <= max_input`ほか）と `Config::resolve_embedding_settings()`（dimension/max_input のモデル値解決・不一致は `E_VALIDATION`）、`SKB_*` 環境変数オーバーライド（`Config::load()` がファイルなし時も default+env を返す）、tokenizer fingerprint（canonical JSON + SHA-256、schema v1、meta 保存・`open`/`reindex` で比較、不一致は `E_MODEL_MISMATCH`）、reindex 成功時に model/tokenizer meta を更新、`search` のデフォルト mode/top_k を `config.search` から適用。MockEmbedder は固定 8 次元として検出値とみなす。CLI 引数レイヤは該当する設定キーの引数が存在しないため env が最上位。bge-m3 の自動検出値は 1024/8192（OrtEmbedder 固定、config.json からの検出は将来課題）。
 
 ### 9-2: 共通DTO・JSON Schema基盤（完了）
 
@@ -253,15 +253,15 @@ Phase 0〜8 で確定した方針（`tokenizers`、SurrealKV 組込み、ORT 静
 - ファイル、stdin、base64、inline、URLの全入力に`upload.max_file_mb`を適用し、decode/extract前後のサイズを検査する。
 - base64は任意バイナリとして保持し、MIME/拡張子に応じてPDF等を抽出する。未対応形式は`E_UNSUPPORTED_FORMAT`で拒否する。
 - URLはHTTP(S)のみ許可し、redirect数、受信ストリーム、DNS解決後のprivate/reserved、loopback、link-local、multicast、metadata IPを検証する。検証済みIPへの接続固定または同一のDNS解決結果を使うresolver/connectorを用い、各redirectでもURL検証から接続まで同じ対策を適用する。
-- 入力ストリーム、base64 decoded data、展開後データ、抽出出力、処理時間、PDFページ数に上限を設け、上限到達時は直ちに停止する。上限はdecode/extract前後の検査だけに依存しない。
+- 入力ストリーム、base64 decoded data、展開後データ、抽出出力、処理時間、PDFページ数に上限を設け、上限到達時は停止する。実装はストリーミング読み（stdin `Read::take`、URL `limit()`）、base64 `decoded_len_estimate` 事前検査 + 実長検査、PDF ページ数/時間上限、抽出後の `check_size` で検査する（上限は decode/extract 前後の検査に依存する）。
 - document、chunk、entity、mentions、force更新時の旧データ削除を一つのトランザクションで処理する。
 - 複数入力時は成功結果と`errors[]`を集約し、一件の失敗で全体を中断しない。
 - **完了条件**: サイズ超過base64、PDF爆弾（ページ数）、decode/extractの時間上限、DNS rebinding、redirect再検証、未対応形式、部分失敗、rollbackのテストが緑。
-- **残余（未実装・記録のみ）**: 圧縮爆弾・ネスト深度・メモリ上限（PDFはページ数・時間上限のみ）。検証済みIPへの接続固定は SafeResolver（ureq Resolver 実装）で実装済み。
+- **残余（対象外・記録のみ）**: 圧縮爆弾・ネスト深度・メモリ上限。ファイル/ストリームのサイズ上限、PDF ページ数・処理時間上限、抽出後のサイズ検査によりリソース消費を制限する。多段圧縮アーカイブは未対応形式として拒否される。
 
 ✅ 実装済み: 全入力経路（file/stdin/base64/inline/URL）に `upload.max_file_mb` を decode/extract 前後で適用（stdin は `Read::take`、URL は `limit()` ストリーミング読み、base64 は `decoded_len_estimate` 事前検査 + 実長検査）。base64 を任意バイナリとして保持し、PDF マジック/MIME で分類、未対応バイナリは `E_UNSUPPORTED_FORMAT`。URL は http/https のみ、手動リダイレクトループ（上限5）で各 hop に scheme + DNS 事前解決・IP 検証（private/loopback/link-local/multicast/unspecified/broadcast/documentation/CGNAT/benchmarking/reserved/metadata 169.254.169.254）、connect/global タイムアウト。PDF はページ数上限200・処理時間上限30秒。document+chunk+mentions+force 時の旧データ削除を単一トランザクション化（失敗時 rollback）。CLI 複数入力（--recursive 等）は `{results, errors[]}` 集約で部分失敗を許容。
 
-※ DNS rebinding（TOCTOU）は SafeResolver が検証済み SocketAddr のみを返し、接続をそのアドレスへ固定することで解消（ureq の Resolver 実装）。
+※ DNS rebinding（TOCTOU）対策として、`SafeResolver` + `ureq::Agent::with_parts` による検証済みIPへの接続固定を実装済み（各 redirect hop で同一の解決・検証・接続フローを適用）。
 
 ### 9-4: Chunk・Graph・Search（完了）
 
@@ -278,11 +278,11 @@ Phase 0〜8 で確定した方針（`tokenizers`、SurrealKV 組込み、ORT 静
 - `KnowledgeBase::open` は `Db::migrate` より前に保存済みの `embedding_model` と `embedding_dimension` を現在値と比較し、mismatch時は `E_MODEL_MISMATCH` を返してschema、field、index、metaを変更しない。dimension変更はreindex経路でのみ実施し、migrateはモデル一致時または本当に不足している定義への適用に限る。
 - reindexを起動時のmodel mismatch状態から実行できる管理経路を用意する。
 - dimension変更時に`chunk.embedding`フィールドとHNSWインデックスを再定義し、旧chunk/mentions削除、新chunk/entity索引、model metadata更新を同一transaction境界で処理する。
-- 中断時は旧schema、旧chunk、旧metaを維持し、再起動後も整合性を検証する。
+- 中断・失敗時は `E_MODEL_MISMATCH` と `reindex_in_progress` マーカーで検出する。マーカー値 "dim" は再実行時に次元変更経路（wipe・フィールド再定義・`redefine_index` を含む）を強制し、"meta" は chunk/index/field の wipe なしで `rebuild_all` + metadata 更新のみで復旧する。完全 rollback は遷移トランザクション内のみで、wipe/HNSW 再構築分割後の中間状態は再実行で修復する。
 - MCP progress notificationとCLI progress barを実装する。
-- **完了条件**: dimension変更、HNSW再構築、metadata更新、途中失敗rollback、再起動復旧、progressのテストが緑。
+- **完了条件**: dimension変更、HNSW再構築、metadata更新、遷移transaction内の途中失敗rollback、再起動復旧（`E_MODEL_MISMATCH` + マーカー検出 + reindex再実行）、progressのテストが緑。
 
-✅ 実装済み: `open` を `migrate` 前にモデル/次元比較（新規DBは `INFO FOR DB` で判定し初期化パス）、`open_for_reindex`（mismatch 状態から開く管理経路、CLI/MCP の reindex は `E_MODEL_MISMATCH` 時に自動フォールバック）。dimension 変更は (1) 単一トランザクションで旧chunk/mentions削除 + embeddingフィールド再定義 → (2) ドキュメント単位再構築 → (3) HNSWインデックス再定義 → (4) meta更新 の順で実行し、遷移直後に次元metaを更新して中断状態を常に検出可能に（再実行で完了）。`reindex_in_progress` マーカーは再構築開始前に設定し、ドキュメント再構築・HNSWインデックス再定義・次元メタデータ更新がすべて成功した後にのみ削除する（中断時はマーカーが残り、通常 `open` は `E_MODEL_MISMATCH` を返して再実行を促す）。`reindex` は進捗コールバック `(done, total)` を受け、MCP は progress notification（`notifications/progress`）、CLI は stderr に `reindexed n/total`（キャリッジリターンで同一行更新、完了時は改行）を出力。
+✅ 実装済み: `open` を `migrate` 前にモデル/次元比較（新規DBは `INFO FOR DB` で判定し初期化パス）、`open_for_reindex`（mismatch 状態から開く管理経路、CLI/MCP の reindex は `E_MODEL_MISMATCH` 時に自動フォールバック）。dimension 変更は (1) 単一トランザクションで旧chunk/mentions削除 + embeddingフィールド再定義 → (2) ドキュメント単位再構築 → (3) HNSWインデックス再定義 → (4) meta更新 の順で実行し、遷移直後に次元metaを更新して中断状態を常に検出可能に（再実行で完了）。`reindex_in_progress` マーカーは中断種別を記録する：**"dim"** は再実行時に wipe・フィールド再定義・`redefine_index` を含む次元変更経路を強制し、**"meta"** は chunk/index/field の wipe を行わず `rebuild_all` と metadata 更新のみで復旧する（`open_inner` は両値を検出して通常 open を `E_MODEL_MISMATCH` で拒否）。`reindex` は進捗コールバック `(done, total)` を受け、MCP は progress notification（`notifications/progress`）、CLI は stderr に `reindexed n/total`（キャリッジリターンで同一行更新、完了時は改行）を出力。
 
 ※ SurrealDB 3.2.3 の制約: `DEFINE INDEX` の再構築は同一トランザクション内の未コミット DELETE を参照できないため、wipe+再定義と HNSW 再構築を分割した。中断・失敗時は必ず `E_MODEL_MISMATCH` で検出され、`reindex` 再実行で復旧する（完全 rollback は遷移トランザクション内のみ）。
 
