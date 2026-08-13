@@ -13,3 +13,4 @@ skb.toml
 spike/
 # npm platform binaries (injected by CI, never committed)
 npm/packages/*/bin/
+npm/node_modules/
