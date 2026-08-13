@@ -152,8 +152,41 @@ fn contract_upload() {
 
 #[serial(contract)]
 #[test]
-fn contract_upload_url_with_recursive() {
+fn contract_upload_rejects_multiple_sources() {
     setup_config();
+    // Combining input sources is rejected at runtime with E_VALIDATION
+    // (spec §12.2: exactly one of --stdin, --url, or paths).
+    let output = Command::new(skb_binary())
+        .args([
+            "upload",
+            "--stdin",
+            "--url",
+            "http://127.0.0.1:1/x",
+            "--title",
+            "multi",
+        ])
+        .current_dir(test_dir())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn skb upload")
+        .wait_with_output()
+        .expect("failed to run skb upload");
+    assert_eq!(output.status.code(), Some(8), "E_VALIDATION exit code");
+    let val: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(val["error"], "E_VALIDATION");
+    assert!(
+        val["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("exactly one"),
+        "must explain the single-source rule: {val}"
+    );
+}
+
+#[serial(contract)]
+#[test]
+fn contract_upload_url_with_recursive() {
     // --url --recursive (no --path) must reach the single-URL upload flow
     // (and fail on the unreachable URL) instead of an empty multi-input loop
     // or the "--recursive requires --path" usage error.

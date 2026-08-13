@@ -748,9 +748,8 @@ mod tests {
 
     #[test]
     fn upload_input_source_precedence() {
-        // clap accepts combined sources; runtime precedence is stdin > url >
-        // paths (the upload branch checks stdin first). Only --base64 is
-        // clap-restricted (requires --stdin, conflicts with paths/url).
+        // clap accepts combined sources at parse time; the runtime check
+        // (exactly one of --stdin, --url, paths) rejects combinations.
         assert!(Cli::try_parse_from(["skb", "upload", "a.md", "--stdin"]).is_ok());
         assert!(
             Cli::try_parse_from(["skb", "upload", "a.md", "--url", "https://x.example/a"]).is_ok()

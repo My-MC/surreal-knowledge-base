@@ -496,7 +496,7 @@ mod tests {
     #[test]
     fn validate_rejects_max_tokens_above_model_input() {
         let mut c = resolved_default();
-        c.chunking.max_tokens = 9000;
+        c.chunking.max_tokens = crate::embed::MOCK_EMBEDDER_MAX_INPUT_TOKENS + 1;
         assert!(matches!(
             c.validate(),
             Err(SkbError {
@@ -509,7 +509,8 @@ mod tests {
     #[test]
     fn resolve_rejects_explicit_dimension_mismatch() {
         let mut c = Config::default();
-        c.embedding.dimension = 16; // explicit value disagrees with detected 8
+        // Explicit value deliberately disagrees with the detected dimension.
+        c.embedding.dimension = crate::embed::MOCK_EMBEDDER_DIMENSION + 1;
         assert!(matches!(
             c.resolve_embedding_settings(
                 crate::embed::MOCK_EMBEDDER_DIMENSION,
@@ -525,7 +526,8 @@ mod tests {
     #[test]
     fn resolve_rejects_explicit_max_input_mismatch() {
         let mut c = Config::default();
-        c.embedding.max_input_tokens = 4096;
+        // Explicit value deliberately disagrees with the detected max input.
+        c.embedding.max_input_tokens = crate::embed::MOCK_EMBEDDER_MAX_INPUT_TOKENS / 2;
         assert!(matches!(
             c.resolve_embedding_settings(
                 crate::embed::MOCK_EMBEDDER_DIMENSION,
