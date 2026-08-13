@@ -27,8 +27,8 @@ DEFINE FIELD IF NOT EXISTS heading     ON chunk TYPE option<string>;
 -- no portable dedup statement for a pre-existing legacy store; instead,
 -- Db::migrate validates existing chunk records for duplicate (document, idx)
 -- pairs after this index (and the schema) is applied and aborts with E_DB on
--- any duplicates. The check runs against the applied store, not in place of
--- building the index.
+-- any duplicates. The check runs once per store (success is recorded in the
+-- meta table) rather than on every startup.
 -- First creation on an existing large store runs synchronously during
 -- Db::migrate on startup.
 DEFINE INDEX IF NOT EXISTS chunk_document_idx ON chunk FIELDS document, idx;

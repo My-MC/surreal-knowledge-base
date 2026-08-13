@@ -106,6 +106,12 @@ function shutdown(code) {
   if (childRef === null) {
     process.exit(code);
   }
+  // If the child already exited, "exit" never fires again and the unref'd
+  // timer below cannot keep the loop alive; exit with the intended code.
+  process.exitCode = code;
+  if (childRef.exitCode !== null || childRef.signalCode !== null) {
+    process.exit(code);
+  }
   // Wait for the child to exit so its SurrealKV file handles are released
   // before the job moves on; fall back to exiting after 5s.
   childRef.once("exit", () => process.exit(code));
