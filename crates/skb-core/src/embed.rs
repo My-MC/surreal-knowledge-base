@@ -10,28 +10,29 @@ pub trait Embed: Send + Sync {
 /// so that explicit `embedding.dimension` values are validated against it.
 pub const MOCK_EMBEDDER_DIMENSION: usize = 8;
 
-/// Max input tokens of the mock embedder; shares the same fixed contract as
-/// the dimension so tests never hardcode a divergent value.
+/// Maximum input tokens of the mock embedder (fixed, like the real bge-m3
+/// bound used by `resolve_embedding_settings`).
 pub const MOCK_EMBEDDER_MAX_INPUT_TOKENS: usize = 8192;
 
-pub struct MockEmbedder;
+pub struct MockEmbedder {
+    pub dimension: usize,
+}
 
 impl Embed for MockEmbedder {
     fn dimension(&self) -> usize {
-        MOCK_EMBEDDER_DIMENSION
+        self.dimension
     }
     fn max_input_tokens(&self) -> usize {
         MOCK_EMBEDDER_MAX_INPUT_TOKENS
     }
 
     fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, SkbError> {
-        let dim = self.dimension();
         Ok(texts
             .iter()
             .enumerate()
             .map(|(i, _)| {
-                let mut v = vec![0.0f32; dim];
-                v[i % dim] = 1.0;
+                let mut v = vec![0.0f32; self.dimension];
+                v[i % self.dimension] = 1.0;
                 l2_normalize(&mut v);
                 v
             })

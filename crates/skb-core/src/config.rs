@@ -147,6 +147,21 @@ impl std::str::FromStr for SearchMode {
     }
 }
 
+impl std::str::FromStr for StorageMode {
+    type Err = crate::error::SkbError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "embedded" => Ok(StorageMode::Embedded),
+            "remote" => Ok(StorageMode::Remote),
+            other => Err(crate::error::SkbError::new(
+                crate::error::ErrorCode::Validation,
+                format!("unknown storage mode: {other}"),
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UploadConfig {
@@ -188,6 +203,20 @@ impl Config {
         if let Some(v) = env_opt("SKB_STORAGE_PATH")? {
             self.storage.path = PathBuf::from(v);
         }
+        if let Some(v) = env_opt("SKB_STORAGE_MODE")? {
+            self.storage.mode = v
+                .parse::<StorageMode>()
+                .with_context(|| format!("SKB_STORAGE_MODE invalid, got '{v}'"))?;
+        }
+        if let Some(v) = env_opt("SKB_STORAGE_URL")? {
+            self.storage.url = Some(v);
+        }
+        if let Some(v) = env_opt("SKB_STORAGE_USERNAME")? {
+            self.storage.username = Some(v);
+        }
+        if let Some(v) = env_opt("SKB_STORAGE_PASSWORD")? {
+            self.storage.password = Some(v);
+        }
         if let Some(v) = env_opt("SKB_STORAGE_NAMESPACE")? {
             self.storage.namespace = v;
         }
@@ -222,7 +251,9 @@ impl Config {
             self.chunking.overlap_tokens = v;
         }
         if let Some(v) = env_opt("SKB_SEARCH_DEFAULT_MODE")? {
-            self.search.default_mode = v.parse::<SearchMode>()?;
+            self.search.default_mode = v
+                .parse::<SearchMode>()
+                .with_context(|| format!("SKB_SEARCH_DEFAULT_MODE invalid, got '{v}'"))?;
         }
         if let Some(v) = env_parse("SKB_SEARCH_TOP_K")? {
             self.search.top_k = v;
@@ -240,13 +271,12 @@ impl Config {
                 .filter(|p| !p.as_os_str().is_empty())
                 .collect();
             if dirs.is_empty() {
-                return Err(SkbError::new(
-                    ErrorCode::Config,
-                    format!(
-                        "SKB_UPLOAD_ALLOWED_DIRS must contain at least one directory (got '{v}')"
-                    ),
-                )
-                .into());
+                // Present but all entries empty (empty string, commas,
+                // whitespace) would silently disable the allowed-directories
+                // restriction; reject the configuration.
+                anyhow::bail!(
+                    "SKB_UPLOAD_ALLOWED_DIRS must list at least one directory, got '{v}'"
+                );
             }
             self.upload.allowed_dirs = dirs;
         }
@@ -281,6 +311,8 @@ impl Config {
                 "chunking.max_tokens must be at least 1",
             ));
         }
+        // overlap_tokens == 0 (no overlap) is a valid configuration; only
+        // overlap >= max_tokens is rejected below.
         if self.chunking.overlap_tokens >= self.chunking.max_tokens {
             return Err(SkbError::new(
                 ErrorCode::Validation,
@@ -448,7 +480,8 @@ mod tests {
     fn validate_accepts_zero_overlap() {
         let mut c = resolved_default();
         c.chunking.overlap_tokens = 0;
-        assert!(c.validate().is_ok());
+        // No-overlap chunking is valid (spec allows 0 <= overlap < max).
+        c.validate().unwrap();
     }
 
     #[test]
@@ -572,7 +605,7 @@ mod tests {
 
     #[test]
     fn env_overrides_apply_with_precedence() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let _model = EnvGuard::set("SKB_EMBEDDING_MODEL", "env-model");
         let _tokens = EnvGuard::set("SKB_CHUNKING_MAX_TOKENS", "256");
         let _top_k = EnvGuard::set("SKB_SEARCH_TOP_K", "42");
@@ -591,7 +624,7 @@ mod tests {
 
     #[test]
     fn env_overrides_reject_invalid_numbers() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let _tokens = EnvGuard::set("SKB_CHUNKING_MAX_TOKENS", "not-a-number");
         let mut config = Config::default();
         assert!(config.apply_env_overrides().is_err());
@@ -599,13 +632,35 @@ mod tests {
 
     #[test]
     fn load_works_without_config_file_when_env_set() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let _model = EnvGuard::set("SKB_EMBEDDING_MODEL", "env-only-model");
-        // Exercise the env-override path directly instead of Config::load(),
-        // so a developer's ~/.config/skb/config.toml (even malformed) cannot
-        // affect this test. Defaults + env override must yield the env model.
-        let mut config = Config::default();
-        config.apply_env_overrides().unwrap();
+        // Run Config::load() from an isolated cwd with no config file: it must
+        // fall back to defaults and apply the environment override.
+        let original = std::env::current_dir().unwrap();
+        let isolated =
+            std::path::PathBuf::from(format!("./target/skb-config-test-{}", std::process::id()));
+        std::fs::create_dir_all(&isolated).unwrap();
+        std::env::set_current_dir(&isolated).unwrap();
+        let _cwd_guard = CwdGuard::new(original);
+        let config = Config::load().unwrap();
+        let _ = std::fs::remove_dir_all(&isolated);
         assert_eq!(config.embedding.model, "env-only-model");
+    }
+
+    /// Restores the original current directory on drop, including on panic.
+    struct CwdGuard {
+        original: std::path::PathBuf,
+    }
+
+    impl CwdGuard {
+        fn new(original: std::path::PathBuf) -> Self {
+            Self { original }
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.original);
+        }
     }
 }
