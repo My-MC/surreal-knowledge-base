@@ -95,6 +95,11 @@ function assert(cond, message) {
 }
 
 function shutdown(code) {
+  // A synchronous module-evaluation failure before the `child` const is
+  // initialized (TDZ) must still exit with the original failure reason.
+  if (typeof child === "undefined") {
+    process.exit(code);
+  }
   // Wait for the child to exit so its SurrealKV file handles are released
   // before the job moves on; fall back to exiting after 5s.
   child.once("exit", () => process.exit(code));
