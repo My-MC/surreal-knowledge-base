@@ -7,7 +7,7 @@
 __pycache__/
 *.py[cod]
 # Test database directories
-target/skb-test-*
+**/target/skb-test-*
 skb.toml
 # Experiments (6GB of build artifacts, excluded from workspace)
 spike/

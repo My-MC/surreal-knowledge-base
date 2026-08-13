@@ -232,53 +232,37 @@ impl Config {
         if let Some(v) = env_opt("SKB_EMBEDDING_TOKENIZER")? {
             self.embedding.tokenizer = v;
         }
-        if let Some(v) = env_opt("SKB_EMBEDDING_DIMENSION")? {
-            self.embedding.dimension = v
-                .parse()
-                .with_context(|| format!("SKB_EMBEDDING_DIMENSION must be a number, got '{v}'"))?;
+        if let Some(v) = env_parse("SKB_EMBEDDING_DIMENSION")? {
+            self.embedding.dimension = v;
         }
-        if let Some(v) = env_opt("SKB_EMBEDDING_MAX_INPUT_TOKENS")? {
-            self.embedding.max_input_tokens = v.parse().with_context(|| {
-                format!("SKB_EMBEDDING_MAX_INPUT_TOKENS must be a number, got '{v}'")
-            })?;
+        if let Some(v) = env_parse("SKB_EMBEDDING_MAX_INPUT_TOKENS")? {
+            self.embedding.max_input_tokens = v;
         }
         if let Some(v) = env_opt("SKB_EMBEDDING_DEVICE")? {
             self.embedding.device = v;
         }
-        if let Some(v) = env_opt("SKB_EMBEDDING_BATCH_SIZE")? {
-            self.embedding.batch_size = v
-                .parse()
-                .with_context(|| format!("SKB_EMBEDDING_BATCH_SIZE must be a number, got '{v}'"))?;
+        if let Some(v) = env_parse("SKB_EMBEDDING_BATCH_SIZE")? {
+            self.embedding.batch_size = v;
         }
-        if let Some(v) = env_opt("SKB_CHUNKING_MAX_TOKENS")? {
-            self.chunking.max_tokens = v
-                .parse()
-                .with_context(|| format!("SKB_CHUNKING_MAX_TOKENS must be a number, got '{v}'"))?;
+        if let Some(v) = env_parse("SKB_CHUNKING_MAX_TOKENS")? {
+            self.chunking.max_tokens = v;
         }
-        if let Some(v) = env_opt("SKB_CHUNKING_OVERLAP_TOKENS")? {
-            self.chunking.overlap_tokens = v.parse().with_context(|| {
-                format!("SKB_CHUNKING_OVERLAP_TOKENS must be a number, got '{v}'")
-            })?;
+        if let Some(v) = env_parse("SKB_CHUNKING_OVERLAP_TOKENS")? {
+            self.chunking.overlap_tokens = v;
         }
         if let Some(v) = env_opt("SKB_SEARCH_DEFAULT_MODE")? {
             self.search.default_mode = v
                 .parse::<SearchMode>()
                 .with_context(|| format!("SKB_SEARCH_DEFAULT_MODE invalid, got '{v}'"))?;
         }
-        if let Some(v) = env_opt("SKB_SEARCH_TOP_K")? {
-            self.search.top_k = v
-                .parse()
-                .with_context(|| format!("SKB_SEARCH_TOP_K must be a number, got '{v}'"))?;
+        if let Some(v) = env_parse("SKB_SEARCH_TOP_K")? {
+            self.search.top_k = v;
         }
-        if let Some(v) = env_opt("SKB_SEARCH_RRF_K")? {
-            self.search.rrf_k = v
-                .parse()
-                .with_context(|| format!("SKB_SEARCH_RRF_K must be a number, got '{v}'"))?;
+        if let Some(v) = env_parse("SKB_SEARCH_RRF_K")? {
+            self.search.rrf_k = v;
         }
-        if let Some(v) = env_opt("SKB_UPLOAD_MAX_FILE_MB")? {
-            self.upload.max_file_mb = v
-                .parse()
-                .with_context(|| format!("SKB_UPLOAD_MAX_FILE_MB must be a number, got '{v}'"))?;
+        if let Some(v) = env_parse("SKB_UPLOAD_MAX_FILE_MB")? {
+            self.upload.max_file_mb = v;
         }
         if let Some(v) = env_opt("SKB_UPLOAD_ALLOWED_DIRS")? {
             let dirs: Vec<PathBuf> = v
@@ -433,11 +417,32 @@ impl Config {
     }
 }
 
-fn env_opt(key: &str) -> anyhow::Result<Option<String>> {
+fn env_opt(key: &str) -> Result<Option<String>, SkbError> {
     match std::env::var(key) {
         Ok(value) => Ok(Some(value)),
         Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(std::env::VarError::NotUnicode(_)) => Err(anyhow::anyhow!("{key} must be unicode")),
+        Err(std::env::VarError::NotUnicode(_)) => Err(SkbError::new(
+            ErrorCode::Config,
+            format!("{key} must be unicode"),
+        )),
+    }
+}
+
+/// Parse a numeric `SKB_*` environment variable, keeping a missing variable as
+/// `None` and centralizing the key/value/error context for all numeric fields.
+fn env_parse<T>(key: &str) -> Result<Option<T>, SkbError>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    match env_opt(key)? {
+        Some(v) => v.parse::<T>().map(Some).map_err(|e| {
+            SkbError::new(
+                ErrorCode::Config,
+                format!("{key} must be a number, got '{v}': {e}"),
+            )
+        }),
+        None => Ok(None),
     }
 }
 
@@ -496,7 +501,7 @@ mod tests {
     #[test]
     fn validate_rejects_max_tokens_above_model_input() {
         let mut c = resolved_default();
-        c.chunking.max_tokens = crate::embed::MOCK_EMBEDDER_MAX_INPUT_TOKENS + 1;
+        c.chunking.max_tokens = 9000;
         assert!(matches!(
             c.validate(),
             Err(SkbError {
@@ -509,8 +514,7 @@ mod tests {
     #[test]
     fn resolve_rejects_explicit_dimension_mismatch() {
         let mut c = Config::default();
-        // Explicit value deliberately disagrees with the detected dimension.
-        c.embedding.dimension = crate::embed::MOCK_EMBEDDER_DIMENSION + 1;
+        c.embedding.dimension = 16; // explicit value disagrees with detected 8
         assert!(matches!(
             c.resolve_embedding_settings(
                 crate::embed::MOCK_EMBEDDER_DIMENSION,
@@ -526,8 +530,7 @@ mod tests {
     #[test]
     fn resolve_rejects_explicit_max_input_mismatch() {
         let mut c = Config::default();
-        // Explicit value deliberately disagrees with the detected max input.
-        c.embedding.max_input_tokens = crate::embed::MOCK_EMBEDDER_MAX_INPUT_TOKENS / 2;
+        c.embedding.max_input_tokens = 4096;
         assert!(matches!(
             c.resolve_embedding_settings(
                 crate::embed::MOCK_EMBEDDER_DIMENSION,
@@ -548,7 +551,7 @@ mod tests {
                 crate::embed::MOCK_EMBEDDER_MAX_INPUT_TOKENS,
             )
             .unwrap();
-        assert_eq!(c.embedding.dimension, 8);
+        assert_eq!(c.embedding.dimension, crate::embed::MOCK_EMBEDDER_DIMENSION);
         assert_eq!(
             c.embedding.max_input_tokens,
             crate::embed::MOCK_EMBEDDER_MAX_INPUT_TOKENS
@@ -558,7 +561,7 @@ mod tests {
     #[test]
     fn resolve_accepts_matching_explicit_values() {
         let mut c = Config::default();
-        c.embedding.dimension = crate::embed::MOCK_EMBEDDER_DIMENSION;
+        c.embedding.dimension = 8;
         c.embedding.max_input_tokens = crate::embed::MOCK_EMBEDDER_MAX_INPUT_TOKENS;
         let resolved = c
             .resolve_embedding_settings(

@@ -28,6 +28,9 @@ use std::sync::Arc;
 /// the canonicalization rules or the covered fields change.
 pub const TOKENIZER_FINGERPRINT_SCHEMA: &str = "1";
 
+/// Database schema version written to the `schema_version` metadata key.
+pub const SCHEMA_VERSION: &str = "1";
+
 /// `tokenizers` crate version the fingerprint is bound to. Keep in sync with
 /// `crates/skb-core/Cargo.toml`; bumping `tokenizers` (or the serializer)
 /// changes the canonical JSON output, so a fingerprint mismatch is expected and
@@ -111,7 +114,8 @@ impl KnowledgeBase {
                     "a reindex is in progress or was interrupted; run `skb reindex` to complete it",
                 ));
             }
-            if let Some(ref stored) = db.get_meta("embedding_model").await? {
+            let stored_model = db.get_meta("embedding_model").await?;
+            if let Some(ref stored) = stored_model {
                 if stored != &config.embedding.model {
                     return Err(SkbError::new(
                         ErrorCode::ModelMismatch,
@@ -121,54 +125,94 @@ impl KnowledgeBase {
                         ),
                     ));
                 }
+            } else {
+                // An existing store missing embedding_model cannot be
+                // distinguished from a fresh one without inspecting vectors;
+                // refuse to guess and require an explicit rebuild rather than
+                // silently re-initializing over existing vectors.
+                return Err(SkbError::new(
+                    ErrorCode::ModelMismatch,
+                    "existing store has no embedding_model metadata. Run reindex to rebuild.",
+                ));
             }
-            if let Some(ref stored) = db.get_meta("embedding_dimension").await? {
-                if stored != &dimension.to_string() {
+            // Existing store: validate any stored dimension/max_input values
+            // before operating, so a partial write cannot hide a mismatch.
+            // Each value is fetched once and reused for validation and the
+            // missing-value backfill below.
+            let expected_dim = dimension.to_string();
+            match db.get_meta("embedding_dimension").await? {
+                Some(stored_dim) if stored_dim != expected_dim => {
                     return Err(SkbError::new(
                         ErrorCode::ModelMismatch,
                         format!(
-                            "config dimension: '{dimension}', stored: '{stored}'. Run reindex to rebuild."
+                            "config dimension: '{dimension}', stored: '{stored_dim}'. Run reindex to rebuild."
                         ),
                     ));
+                }
+                Some(_) => {}
+                None => db.set_meta("embedding_dimension", &expected_dim).await?,
+            }
+            let expected_tokens = config.embedding.max_input_tokens.to_string();
+            match db.get_meta("embedding_max_input_tokens").await? {
+                Some(stored_tokens) if stored_tokens != expected_tokens => {
+                    return Err(SkbError::new(
+                        ErrorCode::ModelMismatch,
+                        format!(
+                            "config max_input_tokens: '{expected_tokens}', stored: '{stored_tokens}'. Run reindex to rebuild."
+                        ),
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    db.set_meta("embedding_max_input_tokens", &expected_tokens)
+                        .await?
                 }
             }
         }
 
-        db.migrate(dimension).await?;
-
         if is_new {
-            db.set_meta("embedding_model", &config.embedding.model)
-                .await?;
-            db.set_meta("embedding_dimension", &dimension.to_string())
-                .await?;
-            db.set_meta(
-                "embedding_max_input_tokens",
-                &config.embedding.max_input_tokens.to_string(),
-            )
-            .await?;
-            db.set_meta("schema_version", "1").await?;
-        } else if !allow_mismatch {
-            // Backfill metadata for stores created before the keys existed;
-            // read by doctor and dimension/mismatch checks. Existing values
-            // are preserved (the mismatch check above already refuses to
-            // operate when they disagree with the config). In allow_mismatch
-            // mode (open_for_reindex) nothing is written: model/dimension/
-            // max_input are recorded only after a successful reindex.
-            if db.get_meta("embedding_model").await?.is_none() {
-                db.set_meta("embedding_model", &config.embedding.model)
+            // Fresh store: write all initialization metadata atomically in one
+            // transaction so a partial failure cannot leave a half-initialized
+            // store. The schema (which creates the meta table) must exist
+            // first.
+            db.migrate(dimension).await?;
+            let tx = db
+                .db
+                .clone()
+                .begin()
+                .await
+                .map_err(|e| SkbError::new(ErrorCode::Db, format!("init meta begin: {e}")))?;
+            let meta_result = async {
+                use crate::db::MetaStore;
+                tx.set_meta("embedding_model", &config.embedding.model)
                     .await?;
-            }
-            if db.get_meta("embedding_dimension").await?.is_none() {
-                db.set_meta("embedding_dimension", &dimension.to_string())
+                tx.set_meta("embedding_dimension", &dimension.to_string())
                     .await?;
-            }
-            if db.get_meta("embedding_max_input_tokens").await?.is_none() {
-                db.set_meta(
+                tx.set_meta(
                     "embedding_max_input_tokens",
                     &config.embedding.max_input_tokens.to_string(),
                 )
                 .await?;
+                tx.set_meta("schema_version", crate::SCHEMA_VERSION).await?;
+                Ok::<(), SkbError>(())
             }
+            .await;
+            match meta_result {
+                Ok(()) => {
+                    tx.commit().await.map_err(|e| {
+                        SkbError::new(ErrorCode::Db, format!("init meta commit: {e}"))
+                    })?;
+                }
+                Err(e) => {
+                    let _ = tx.cancel().await;
+                    return Err(e);
+                }
+            }
+        } else {
+            // Existing store: apply the schema (IF NOT EXISTS, so no-op on a
+            // matching store). The mismatch checks above already refused to
+            // operate on a mismatched store, so this cannot redefine anything.
+            db.migrate(dimension).await?;
         }
 
         // Tokenizer fingerprint: compute, then compare against the stored
@@ -258,6 +302,40 @@ impl KnowledgeBase {
     // ── CRUD ──
     pub async fn list_documents(&self, q: &ListQuery) -> Result<Vec<DocumentSummary>, SkbError> {
         crud::list_documents(&self.db, q).await
+    }
+
+    /// Return at most `max` documents plus whether more remain. Paging is
+    /// performed here with a stable order so callers do not hold a lock across
+    /// repeated async fetches (the MCP `skb://documents` resource, §8.3).
+    pub async fn document_snapshot(
+        &self,
+        max: usize,
+    ) -> Result<(Vec<DocumentSummary>, bool), SkbError> {
+        const PAGE: usize = 100;
+        let mut docs = Vec::new();
+        let mut offset = 0;
+        loop {
+            // Request only the remaining allowance so an exact-max store does
+            // not trigger an extra empty page fetch.
+            let want = PAGE.min(max + 1 - docs.len());
+            let page = self
+                .list_documents(&ListQuery {
+                    limit: Some(want),
+                    offset: Some(offset),
+                    order: None,
+                    after: None,
+                })
+                .await?;
+            let page_len = page.len();
+            docs.extend(page);
+            if page_len < want || docs.len() > max {
+                break;
+            }
+            offset += want;
+        }
+        let truncated = docs.len() > max;
+        docs.truncate(max);
+        Ok((docs, truncated))
     }
 
     pub async fn get_document(&self, req: &GetDocumentRequest) -> Result<DocumentDetail, SkbError> {
@@ -435,24 +513,13 @@ pub(crate) fn tokenizer_fingerprint(
     // Recursively sort all object keys so the hash is independent of JSON key
     // order (nested values from the tokenizers crate may arrive in arbitrary
     // order).
-    fn sort_keys(value: serde_json::Value) -> serde_json::Value {
-        match value {
-            serde_json::Value::Object(map) => {
-                serde_json::Value::Object(map.into_iter().map(|(k, v)| (k, sort_keys(v))).collect())
-            }
-            serde_json::Value::Array(arr) => {
-                serde_json::Value::Array(arr.into_iter().map(sort_keys).collect())
-            }
-            other => other,
-        }
-    }
-    let canonical = serde_json::to_string(&serde_json::json!({
+    let canonical = serde_json::to_string(&sort_json_keys(&serde_json::json!({
         "schema": TOKENIZER_FINGERPRINT_SCHEMA,
         "tokenizers": TOKENIZER_CRATE_VERSION,
         "source": source,
         "algorithm": algorithm,
-        "config": sort_keys(config.clone()),
-    }))
+        "config": config,
+    })))
     .map_err(|e| {
         SkbError::new(
             ErrorCode::Tokenize,
@@ -471,6 +538,25 @@ pub(crate) fn tokenizer_fingerprint(
         algorithm,
         tokenizers_version: TOKENIZER_CRATE_VERSION.to_string(),
     })
+}
+
+/// Recursively sort JSON object keys so the fingerprint is independent of
+/// serde_json's `preserve_order` feature (or any insertion-order differences).
+fn sort_json_keys(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut sorted: Vec<(String, serde_json::Value)> = map
+                .iter()
+                .map(|(k, v)| (k.clone(), sort_json_keys(v)))
+                .collect();
+            sorted.sort_by(|a, b| a.0.cmp(&b.0));
+            serde_json::Value::Object(sorted.into_iter().collect())
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(sort_json_keys).collect())
+        }
+        other => other.clone(),
+    }
 }
 
 /// Compare the computed tokenizer fingerprint against `meta` and persist it on
@@ -644,11 +730,14 @@ mod tests {
     /// Write a minimal but valid `tokenizer.json` (single-token BPE) for
     /// fingerprint tests; `word` changes the vocabulary so fingerprints differ.
     fn write_fixture_tokenizer(path: &std::path::Path, word: &str) {
-        use tokenizers::models::bpe::BPE;
+        use tokenizers::models::bpe::{Vocab, BPE};
         use tokenizers::pre_tokenizers::whitespace::WhitespaceSplit;
         use tokenizers::Tokenizer;
 
-        let mut vocab = ahash::AHashMap::default();
+        // BPE::builder().vocab_and_merges expects tokenizers' public Vocab
+        // type (an AHashMap alias), so no separate ahash dependency is
+        // needed for this construction.
+        let mut vocab = Vocab::default();
         vocab.insert("<unk>".to_string(), 0);
         vocab.insert(word.to_string(), 1);
         let bpe = BPE::builder()
@@ -664,10 +753,18 @@ mod tests {
     }
 
     async fn open_expecting_error(config: Config) -> SkbError {
-        match KnowledgeBase::open(config).await {
-            Ok(_) => panic!("expected open to fail"),
-            Err(e) => e,
+        // A prior open's file lock may still be releasing; retry on Db errors
+        // until the real validation error surfaces.
+        for _ in 0..20 {
+            match KnowledgeBase::open(config.clone()).await {
+                Ok(_) => panic!("expected open to fail"),
+                Err(e) if matches!(e.code, ErrorCode::Db) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                Err(e) => return e,
+            }
         }
+        panic!("database lock was not released in time");
     }
 
     /// Open and drop a KnowledgeBase, retrying transient embedded-SurrealKv

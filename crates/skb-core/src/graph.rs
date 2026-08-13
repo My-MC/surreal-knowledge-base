@@ -74,7 +74,8 @@ pub struct GraphQueryRequest {
     pub relation: Option<String>,
     #[schemars(range(min = 1, max = 5))]
     pub depth: Option<usize>,
-    #[schemars(range(min = 1))]
+    // Mirrors MAX_TOP_K (schemars range attributes accept literals only).
+    #[schemars(range(min = 1, max = 1000))]
     pub limit: Option<usize>,
 }
 
@@ -99,6 +100,12 @@ impl GraphQueryRequest {
                 return Err(SkbError::new(
                     ErrorCode::Validation,
                     "limit must be at least 1",
+                ));
+            }
+            if limit > crate::search::MAX_TOP_K {
+                return Err(SkbError::new(
+                    ErrorCode::Validation,
+                    format!("limit must be at most {}", crate::search::MAX_TOP_K),
                 ));
             }
         }
@@ -1066,6 +1073,32 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn rejects_limit_above_max_top_k() {
+        let mut req = graph_request("A");
+        req.limit = Some(crate::search::MAX_TOP_K + 1);
+        assert!(matches!(
+            req.validate(),
+            Err(SkbError {
+                code: ErrorCode::Validation,
+                ..
+            })
+        ));
+        req.limit = Some(crate::search::MAX_TOP_K);
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn graph_query_schema_marks_limit_max() {
+        let schema = schemars::schema_for!(GraphQueryRequest);
+        let value = serde_json::to_value(&schema).unwrap();
+        assert_eq!(
+            value["properties"]["limit"]["maximum"],
+            crate::search::MAX_TOP_K as u64,
+            "schema limit maximum must track MAX_TOP_K"
+        );
     }
 
     #[test]

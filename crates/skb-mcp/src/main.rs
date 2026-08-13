@@ -93,7 +93,9 @@ impl ServerHandler for SkbServer {
         _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
     ) -> Result<ListResourceTemplatesResult, rmcp::ErrorData> {
         let templates = vec![ResourceTemplate::new("skb://documents/{id}", "document")
-            .with_description("A single document body and its chunks, by id")];
+            .with_description(
+                "A single document body and its chunks, by id (document:<key>, e.g. skb://documents/document:abc)",
+            )];
         Ok(ListResourceTemplatesResult::with_all_items(templates))
     }
 
@@ -293,7 +295,7 @@ fn all_tools() -> Result<Vec<ToolDef>, rmcp::ErrorData> {
         )?,
         tool_def(
             "skb_delete_document",
-            "Delete a document",
+            "Delete a document (requires confirm: true)",
             schemars::schema_for!(DeleteDocumentRequest),
         )?,
         tool_def(
