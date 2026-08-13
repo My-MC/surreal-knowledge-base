@@ -396,6 +396,7 @@ fn contract_list_chunk_count_and_delete_counts() {
     assert_eq!(val["error"], "E_DOCUMENT_NOT_FOUND");
 }
 
+#[serial(contract)]
 #[test]
 fn contract_query_command() {
     setup_config();
@@ -413,6 +414,7 @@ fn contract_query_command() {
     assert!(statements[0][0]["c"].as_u64().unwrap() >= 1);
 }
 
+#[serial(contract)]
 #[test]
 fn contract_doctor_json() {
     setup_config();
@@ -422,6 +424,7 @@ fn contract_doctor_json() {
     assert!(val["errors"].as_array().unwrap().is_empty());
 }
 
+#[serial(contract)]
 #[test]
 fn contract_upload_glob_and_multiple_paths() {
     setup_config();
@@ -475,6 +478,7 @@ fn contract_upload_glob_and_multiple_paths() {
     assert_eq!(list.as_array().unwrap().len(), 4);
 }
 
+#[serial(contract)]
 #[test]
 fn contract_upload_url_reaches_url_branch() {
     setup_config();
@@ -502,6 +506,7 @@ fn contract_upload_url_reaches_url_branch() {
     );
 }
 
+#[serial(contract)]
 #[test]
 fn contract_pipeline() {
     setup_config();
