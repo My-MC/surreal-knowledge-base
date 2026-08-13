@@ -17,6 +17,11 @@ if (!bin) {
 const pending = new Map();
 let nextId = 1;
 
+// childRef is null until the child is spawned; a synchronous module
+// evaluation failure before that must still exit with the original
+// failure reason instead of tripping over the uninitialized child const.
+let childRef = null;
+
 // Registered before any await so an assertion failure anywhere in the flow
 // reaches the top-level failure path (terminate child, wait for exit,
 // exit non-zero) instead of dying with an unhandled rejection.
@@ -26,6 +31,7 @@ process.on("uncaughtException", (err) => {
 });
 
 const child = spawn(bin, [], { stdio: ["pipe", "pipe", "inherit"] });
+childRef = child;
 child.on("error", (err) => {
   for (const [id, { reject, timer }] of pending) {
     clearTimeout(timer);
@@ -95,15 +101,15 @@ function assert(cond, message) {
 }
 
 function shutdown(code) {
-  // A synchronous module-evaluation failure before the `child` const is
-  // initialized (TDZ) must still exit with the original failure reason.
-  if (typeof child === "undefined") {
+  // A synchronous module-evaluation failure before the child is spawned must
+  // still exit with the original failure reason.
+  if (childRef === null) {
     process.exit(code);
   }
   // Wait for the child to exit so its SurrealKV file handles are released
   // before the job moves on; fall back to exiting after 5s.
-  child.once("exit", () => process.exit(code));
-  child.kill();
+  childRef.once("exit", () => process.exit(code));
+  childRef.kill();
   setTimeout(() => process.exit(code), 5000).unref();
 }
 

@@ -51,12 +51,20 @@ fn golden_root() -> PathBuf {
     path
 }
 
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
 struct McpClient {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<std::process::ChildStdout>,
     next_id: u64,
     alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    last_response: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl McpClient {
@@ -72,17 +80,29 @@ impl McpClient {
         let stdin = child.stdin.take().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
         // Watchdog: if the server stays alive without replying, read_response
-        // would block forever; abort the test process after 60s instead of
-        // hanging CI (matches the 30s smoke limit with margin). It is
-        // cancelled when the client is dropped so multiple sequential clients
-        // cannot trip the first watchdog.
+        // would block forever; abort the test process after 60s without
+        // progress instead of hanging CI (matches the 30s smoke limit with
+        // margin). The deadline is refreshed on every received response so a
+        // long but healthy golden flow (upload, search, list, stats, get,
+        // delete) never trips it, and it is cancelled when the client is
+        // dropped so multiple sequential clients cannot trip an old watchdog.
         let alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let last_response = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(now_millis()));
         let watch = alive.clone();
+        let watch_deadline = last_response.clone();
         std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_secs(60));
-            if watch.load(std::sync::atomic::Ordering::SeqCst) {
-                eprintln!("golden test watchdog: aborting after 60s (no response from skb-mcp)");
-                std::process::abort();
+            while watch.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                if watch.load(std::sync::atomic::Ordering::SeqCst)
+                    && now_millis()
+                        .saturating_sub(watch_deadline.load(std::sync::atomic::Ordering::SeqCst))
+                        >= 60_000
+                {
+                    eprintln!(
+                        "golden test watchdog: aborting after 60s without progress from skb-mcp"
+                    );
+                    std::process::abort();
+                }
             }
         });
         McpClient {
@@ -91,6 +111,7 @@ impl McpClient {
             stdout,
             next_id: 1,
             alive,
+            last_response,
         }
     }
 
@@ -120,6 +141,8 @@ impl McpClient {
             }
             let msg: Value = serde_json::from_str(&line).unwrap();
             if msg["id"] == json!(id) {
+                self.last_response
+                    .store(now_millis(), std::sync::atomic::Ordering::SeqCst);
                 return msg;
             }
         }
