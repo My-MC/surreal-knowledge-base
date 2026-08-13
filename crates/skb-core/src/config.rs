@@ -556,7 +556,7 @@ mod tests {
     #[test]
     fn resolve_accepts_matching_explicit_values() {
         let mut c = Config::default();
-        c.embedding.dimension = 8;
+        c.embedding.dimension = crate::embed::MOCK_EMBEDDER_DIMENSION;
         c.embedding.max_input_tokens = crate::embed::MOCK_EMBEDDER_MAX_INPUT_TOKENS;
         let resolved = c
             .resolve_embedding_settings(
@@ -564,7 +564,10 @@ mod tests {
                 crate::embed::MOCK_EMBEDDER_MAX_INPUT_TOKENS,
             )
             .unwrap();
-        assert_eq!(resolved.embedding.dimension, 8);
+        assert_eq!(
+            resolved.embedding.dimension,
+            crate::embed::MOCK_EMBEDDER_DIMENSION
+        );
         assert_eq!(
             resolved.embedding.max_input_tokens,
             crate::embed::MOCK_EMBEDDER_MAX_INPUT_TOKENS

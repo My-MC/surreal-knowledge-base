@@ -404,8 +404,9 @@ fn contract_upload_glob_and_multiple_paths() {
 #[test]
 fn contract_upload_url_reaches_url_branch() {
     setup_config();
-    // An unreachable URL must reach the URL upload flow (and fail with a
-    // fetch error) instead of the "no files to upload" usage error.
+    // http://127.0.0.1:1/x is blocked by SSRF validation before any
+    // connection, so the URL branch must fail with E_VALIDATION (not fall
+    // through to the "no files to upload" usage error).
     let output = Command::new(skb_binary())
         .args(["upload", "--url", "http://127.0.0.1:1/x"])
         .current_dir(test_dir())
@@ -414,13 +415,16 @@ fn contract_upload_url_reaches_url_branch() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let combined = format!("{stdout}\n{stderr}");
     assert!(
-        !stderr.contains("no files to upload"),
-        "URL must not fall through to the no-files error: {stderr}"
+        !combined.contains("no files to upload"),
+        "URL must not fall through to the no-files error: {combined}"
     );
-    assert!(
-        stderr.contains("E_IO") || stdout.contains("E_IO") || !output.stdout.is_empty(),
-        "URL branch must produce a fetch result: stderr={stderr} stdout={stdout}"
+    let val: Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|e| panic!("stdout must be JSON: {e}\nstdout={stdout}"));
+    assert_eq!(
+        val["error"], "E_VALIDATION",
+        "SSRF-blocked URL must report E_VALIDATION: {combined}"
     );
 }
 
