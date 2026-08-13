@@ -250,7 +250,7 @@ v1 では LLM 非依存のルールベースで行う:
 |---|---|---|
 | Markdown の `[[WikiLink]]` / `[text](link)` | リンク先を `entity` 化 | `chunk ->mentions-> entity`、リンク先が他ドキュメントならエンティティ経由で関連 |
 | YAML frontmatter の `tags`, `aliases` | タグを `entity(kind="tag")` 化 | `mentions` |
-| 見出し階層 | 章題を `entity(kind="section")` 化 | `related_to(relation="part-of")` |
+| 見出し階層 | 章題を `entity(kind="section")` 化 | `related_to(relation="part-of")`。**不変条件**: 再取り込み後も重複エッジが発生せず、各セクション（child）の親は最大 1 件（single-parent invariant） |
 | 手動操作 | `skb graph link` / MCP `skb_graph_link` | `related_to` |
 
 LLM 抽出は `EntityExtractor` トレイトの差し替え実装として将来追加する。
@@ -287,7 +287,8 @@ LLM 抽出は `EntityExtractor` トレイトの差し替え実装として将来
 > serde_json 等のシリアライザを更新し、同じ `tokenizer.json` に対する canonical JSON 出力が
 > 変わった場合、schema version（`TOKENIZER_FINGERPRINT_SCHEMA`）が同一でも fingerprint は
 > 変化し `E_MODEL_MISMATCH` になる。fingerprint には `tokenizers` のバージョン（`tokenizer_version`）
-> も含まれるため、`tokenizers` のメジャー/マイナー更新は通常この不一致を引き起こす。
+> も含まれるため、`tokenizers` の**メジャー/マイナー更新に限らずパッチ更新も含む任意の**
+> バージョン更新は fingerprint を変え得る。
 > 対応手順: (a) 影響のない変更か fingerprint 差の確認、(b) canonicalization 規則や対象フィールドを
 > 変えた場合のみ `TOKENIZER_FINGERPRINT_SCHEMA` を更新、(c) 利用者は `skb reindex` を実行する。
 > `tokenizer_version` / `tokenizer_fingerprint_schema` は `meta` に保存されるため `skb doctor`

@@ -10,8 +10,8 @@ pub trait Embed: Send + Sync {
 /// so that explicit `embedding.dimension` values are validated against it.
 pub const MOCK_EMBEDDER_DIMENSION: usize = 8;
 
-/// Maximum input tokens of the mock embedder (fixed, like the real bge-m3
-/// bound used by `resolve_embedding_settings`).
+/// Max input tokens detected by the mock embedder; explicit
+/// `embedding.max_input_tokens` values are validated against it.
 pub const MOCK_EMBEDDER_MAX_INPUT_TOKENS: usize = 8192;
 
 pub struct MockEmbedder {
