@@ -6,7 +6,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// Practical upper bound for `top_k`; also keeps `fetch_k = top_k * 3` small.
+/// Practical upper bound for search `top_k`: results are materialized in
+/// memory, and hybrid search fetches `top_k * 3` candidates. Shared by the
+/// request validation, the JSON Schema and the config validation.
 pub const MAX_TOP_K: usize = 1000;
 
 /// Maximum graph-expansion hop depth. Shared by the request validation and
@@ -64,6 +66,18 @@ pub struct SearchHit {
     pub chunk_idx: usize,
     pub content: String,
     pub score: f64,
+    /// Document title; always present for persisted chunks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Document source (path / url / inline); always present for persisted chunks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Query terms found in the chunk (keyword mode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub highlights: Option<Vec<String>>,
+    /// Entities that led to this hit via graph expansion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_entities: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -118,6 +132,7 @@ async fn vector_search(
     let emb_str = serde_json::to_string(&query_emb).unwrap_or_default();
     let sql = format!(
         "SELECT content, idx, meta::id(document) AS document, \
+         document.title AS title, document.source AS source, \
          vector::similarity::cosine(embedding, {emb_str}) AS score \
          FROM chunk WHERE embedding <|{top_k},40|> {emb_str} \
          ORDER BY score DESC LIMIT {top_k}"
@@ -132,26 +147,27 @@ async fn vector_search(
         .take(0)
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("vector take: {e}")))?;
 
-    rows_to_hits(&rows)
+    rows_to_hits(&rows, None)
 }
 
 async fn keyword_search(db: &Db, query: &str, top_k: usize) -> Result<Vec<SearchHit>, SkbError> {
-    let escaped = query.replace('\'', "''");
-    let sql = format!(
-        "SELECT content, idx, meta::id(document) AS document, search::score(0) AS score \
-         FROM chunk WHERE content @@ '{escaped}' ORDER BY score DESC LIMIT {top_k}"
-    );
+    let sql = "SELECT content, idx, meta::id(document) AS document, \
+         document.title AS title, document.source AS source, search::score(0) AS score \
+         FROM chunk WHERE content @0@ $q ORDER BY score DESC LIMIT $top";
 
     let mut r = db
         .db
-        .query(&sql)
+        .query(sql)
+        .bind(("q", query.to_string()))
+        .bind(("top", top_k as i64))
         .await
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("keyword: {e}")))?;
     let rows: Vec<serde_json::Value> = r
         .take(0)
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("keyword take: {e}")))?;
 
-    rows_to_hits(&rows)
+    let highlights = match_terms(query);
+    rows_to_hits(&rows, Some(&highlights))
 }
 
 async fn hybrid_search(
@@ -176,8 +192,10 @@ async fn hybrid_search(
     let vsql = format!(
         "SELECT content, idx, meta::id(id) AS chunk_id, \
          meta::id(document) AS document, \
+         document.title AS title, document.source AS source, \
          vector::similarity::cosine(embedding, {emb_str}) AS score \
-         FROM chunk WHERE embedding <|{fetch_k},40|> {emb_str}"
+         FROM chunk WHERE embedding <|{fetch_k},40|> {emb_str} \
+         ORDER BY score DESC LIMIT {fetch_k}"
     );
     let mut r = db
         .db
@@ -189,79 +207,158 @@ async fn hybrid_search(
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("hybrid vec take: {e}")))?;
 
     // Keyword results
-    let escaped = query.replace('\'', "''");
-    let ksql = format!(
-        "SELECT content, idx, meta::id(id) AS chunk_id, \
-         meta::id(document) AS document, search::score(0) AS score \
-         FROM chunk WHERE content @@ '{escaped}' ORDER BY score DESC LIMIT {fetch_k}"
-    );
+    let ksql = "SELECT content, idx, meta::id(id) AS chunk_id, \
+         meta::id(document) AS document, \
+         document.title AS title, document.source AS source, search::score(0) AS score \
+         FROM chunk WHERE content @0@ $q ORDER BY score DESC LIMIT $fetch";
     let mut r = db
         .db
-        .query(&ksql)
+        .query(ksql)
+        .bind(("q", query.to_string()))
+        .bind(("fetch", fetch_k as i64))
         .await
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("hybrid kw: {e}")))?;
     let krows: Vec<serde_json::Value> = r
         .take(0)
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("hybrid kw take: {e}")))?;
 
-    // RRF merge
+    // RRF merge. keyword_matched marks chunks matched by the keyword leg so
+    // only those receive highlights; pure vector hits stay None.
+    struct RankedHit {
+        score: f64,
+        content: String,
+        idx: usize,
+        document: String,
+        title: Option<String>,
+        source: Option<String>,
+        keyword_matched: bool,
+    }
     let rrf_k = rrf_k.max(1) as f64;
-    let mut scores: HashMap<String, (f64, String, usize, String)> = HashMap::new();
+    let mut scores: HashMap<String, RankedHit> = HashMap::new();
 
     for (rank, row) in vrows.iter().enumerate() {
-        let id = row["id"].as_str().unwrap_or("").to_string();
-        let content = row["content"].as_str().unwrap_or("").to_string();
-        let idx = row["idx"].as_u64().unwrap_or(0) as usize;
-        let doc = row["document"].as_str().unwrap_or("").to_string();
+        let id = row["chunk_id"].as_str().unwrap_or("").to_string();
         let rrf = 1.0 / (rrf_k + (rank as f64 + 1.0));
-        scores
-            .entry(id)
-            .and_modify(|e| e.0 += rrf)
-            .or_insert((rrf, content, idx, doc));
+        scores.entry(id).or_insert(RankedHit {
+            score: rrf,
+            content: row["content"].as_str().unwrap_or("").to_string(),
+            idx: row["idx"].as_u64().unwrap_or(0) as usize,
+            document: row["document"].as_str().unwrap_or("").to_string(),
+            title: row["title"].as_str().map(|s| s.to_string()),
+            source: row["source"].as_str().map(|s| s.to_string()),
+            keyword_matched: false,
+        });
     }
 
+    let highlights = match_terms(query);
     for (rank, row) in krows.iter().enumerate() {
-        let id = row["id"].as_str().unwrap_or("").to_string();
-        let content = row["content"].as_str().unwrap_or("").to_string();
-        let idx = row["idx"].as_u64().unwrap_or(0) as usize;
-        let doc = row["document"].as_str().unwrap_or("").to_string();
+        let id = row["chunk_id"].as_str().unwrap_or("").to_string();
         let rrf = 1.0 / (rrf_k + (rank as f64 + 1.0));
-        scores
-            .entry(id)
-            .and_modify(|e| e.0 += rrf)
-            .or_insert((rrf, content, idx, doc));
+        if let Some(e) = scores.get_mut(&id) {
+            e.score += rrf;
+            e.keyword_matched = true;
+        } else {
+            scores.insert(
+                id,
+                RankedHit {
+                    score: rrf,
+                    content: row["content"].as_str().unwrap_or("").to_string(),
+                    idx: row["idx"].as_u64().unwrap_or(0) as usize,
+                    document: row["document"].as_str().unwrap_or("").to_string(),
+                    title: row["title"].as_str().map(|s| s.to_string()),
+                    source: row["source"].as_str().map(|s| s.to_string()),
+                    keyword_matched: true,
+                },
+            );
+        }
     }
 
     let mut sorted: Vec<_> = scores.into_iter().collect();
     sorted.sort_by(|a, b| {
-        b.1 .0
-            .partial_cmp(&a.1 .0)
+        // Deterministic ordering: equal RRF scores fall back to the chunk id
+        // so truncate(top_k) keeps the same hits regardless of HashMap
+        // iteration order.
+        b.1.score
+            .partial_cmp(&a.1.score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
     });
     sorted.truncate(top_k);
 
     Ok(sorted
         .into_iter()
-        .map(|(_, (score, content, idx, doc))| SearchHit {
-            document_id: doc,
-            chunk_idx: idx,
-            content,
-            score,
+        .map(|(_, hit)| {
+            let content = hit.content;
+            // Only keyword-matched chunks get highlights, and only for terms
+            // actually present in this chunk's body; vector-only hits keep
+            // None (spec §6).
+            let highlights = if hit.keyword_matched {
+                let content_lower = content.to_lowercase();
+                let filtered: Vec<String> = highlights
+                    .iter()
+                    .filter(|t| content_lower.contains(t.as_str()))
+                    .cloned()
+                    .collect();
+                Some(filtered)
+            } else {
+                None
+            };
+            SearchHit {
+                document_id: hit.document,
+                chunk_idx: hit.idx,
+                content,
+                score: hit.score,
+                title: hit.title,
+                source: hit.source,
+                highlights,
+                matched_entities: None,
+            }
         })
         .collect())
 }
 
-fn rows_to_hits(rows: &[serde_json::Value]) -> Result<Vec<SearchHit>, SkbError> {
+fn rows_to_hits(
+    rows: &[serde_json::Value],
+    highlights: Option<&Vec<String>>,
+) -> Result<Vec<SearchHit>, SkbError> {
     let mut hits = Vec::new();
     for row in rows {
+        let content = row["content"].as_str().unwrap_or("").to_string();
+        // Only terms actually present in this chunk's content are highlighted
+        // (the query terms were computed globally, not per hit).
+        let hit_highlights: Option<Vec<String>> = highlights.map(|terms| {
+            let content_lower = content.to_lowercase();
+            terms
+                .iter()
+                .filter(|t| content_lower.contains(t.as_str()))
+                .cloned()
+                .collect()
+        });
         hits.push(SearchHit {
             document_id: row["document"].as_str().unwrap_or("").to_string(),
             chunk_idx: row["idx"].as_u64().unwrap_or(0) as usize,
-            content: row["content"].as_str().unwrap_or("").to_string(),
+            content,
             score: row["score"].as_f64().unwrap_or(0.0),
+            title: row["title"].as_str().map(|s| s.to_string()),
+            source: row["source"].as_str().map(|s| s.to_string()),
+            highlights: hit_highlights,
+            matched_entities: None,
         });
     }
     Ok(hits)
+}
+
+/// The query terms that a keyword search can highlight: whitespace/punctuation
+/// separated words of at least two characters (Unicode chars, not bytes).
+fn match_terms(query: &str) -> Vec<String> {
+    let mut terms: Vec<String> = query
+        .split(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
+        .filter(|t| t.chars().count() >= 2)
+        .map(|t| t.to_lowercase())
+        .collect();
+    terms.sort();
+    terms.dedup();
+    terms
 }
 
 /// Post-filter hits by matching document fields (title/source/source_type/...).

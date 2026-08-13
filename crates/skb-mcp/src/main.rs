@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, GetPromptRequestParams,
@@ -25,12 +25,23 @@ use tokio::sync::Mutex;
 
 pub struct SkbServer {
     kb: Arc<Mutex<KnowledgeBase>>,
+    reindexing: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Resets the reindexing flag on drop (including on panic/cancellation).
+struct ReindexGuard(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for ReindexGuard {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
 }
 
 impl SkbServer {
     pub fn new(kb: KnowledgeBase) -> Self {
         Self {
             kb: Arc::new(Mutex::new(kb)),
+            reindexing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 }
@@ -91,32 +102,45 @@ impl ServerHandler for SkbServer {
         request: ReadResourceRequestParams,
         _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
     ) -> Result<ReadResourceResponse, rmcp::ErrorData> {
-        let kb = self.kb.lock().await;
         let uri = request.uri.clone();
         let contents: Vec<ResourceContents> = if uri == "skb://documents" {
             // Bound the response: accumulate at most MAX_DOCUMENTS_RESOURCE
             // entries so a large store cannot exhaust memory or produce an
-            // unbounded payload (spec §8.3). Fetch one extra page to learn
-            // whether truncation actually occurred; `truncated` is reported
-            // inside a valid JSON payload so clients can parse the resource.
+            // unbounded payload (spec §8.3). The kb lock is acquired per page
+            // so it is never held across the paginated await calls.
             const MAX_DOCUMENTS_RESOURCE: usize = 10_000;
             let mut docs: Vec<skb_core::crud::DocumentSummary> = Vec::new();
-            let mut offset = 0;
+            // Keyset cursor: resume strictly after the last document of the
+            // previous page (created_at + unique id ordering) so pages never
+            // duplicate or skip rows while the store changes.
+            let mut after: Option<(String, String)> = None;
             loop {
-                let page = kb
-                    .list_documents(&ListQuery {
+                let page = {
+                    let kb = self.kb.lock().await;
+                    kb.list_documents(&ListQuery {
                         limit: Some(100),
-                        offset: Some(offset),
-                        order: None,
+                        offset: None,
+                        order: Some(skb_core::crud::OrderBy::CreatedAsc),
+                        after: after.clone(),
                     })
                     .await
-                    .map_err(err_data)?;
+                    .map_err(err_data)?
+                };
+                if let Some(last) = page.last() {
+                    // DocumentSummary.id is `document:<key>`; the keyset cursor
+                    // compares raw record keys, so strip the prefix.
+                    let key = last
+                        .id
+                        .strip_prefix("document:")
+                        .unwrap_or(&last.id)
+                        .to_string();
+                    after = Some((last.created_at.clone(), key));
+                }
                 let page_len = page.len();
                 docs.extend(page);
                 if page_len < 100 || docs.len() > MAX_DOCUMENTS_RESOURCE {
                     break;
                 }
-                offset += 100;
             }
             let truncated = docs.len() > MAX_DOCUMENTS_RESOURCE;
             docs.truncate(MAX_DOCUMENTS_RESOURCE);
@@ -128,11 +152,13 @@ impl ServerHandler for SkbServer {
             .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
             vec![ResourceContents::text(body, uri)]
         } else if uri == "skb://stats" {
+            let kb = self.kb.lock().await;
             let stats = kb.stats().await.map_err(err_data)?;
             let body = serde_json::to_string_pretty(&stats)
                 .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
             vec![ResourceContents::text(body, uri)]
         } else if let Some(id) = uri.strip_prefix("skb://documents/") {
+            let kb = self.kb.lock().await;
             let doc = kb
                 .get_document(&GetDocumentRequest {
                     id: id.to_string(),
@@ -198,9 +224,9 @@ impl ServerHandler for SkbServer {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, rmcp::ErrorData> {
-        let result = self.handle_tool(request).await;
+        let result = self.handle_tool(request, &context).await;
         match result {
             Ok(val) => Ok(CallToolResult::success(vec![text_content(&val)]).into()),
             Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(e)]).into()),
@@ -303,8 +329,35 @@ fn all_tools() -> Result<Vec<ToolDef>, rmcp::ErrorData> {
 struct NoParams {}
 
 impl SkbServer {
-    async fn handle_tool(&self, req: CallToolRequestParams) -> Result<Value, String> {
+    async fn handle_tool(
+        &self,
+        req: CallToolRequestParams,
+        context: &rmcp::service::RequestContext<RoleServer>,
+    ) -> Result<Value, String> {
         let args = req.arguments.unwrap_or_default();
+        // The reindexing claim happens BEFORE the kb lock so a concurrent
+        // skb_reindex is rejected immediately, and other tools are rejected
+        // while a reindex runs (they would otherwise block on the lock).
+        let reindex_guard = if req.name == "skb_reindex" {
+            if self
+                .reindexing
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                )
+                .is_err()
+            {
+                return Err("a reindex is already in progress".to_string());
+            }
+            Some(ReindexGuard(self.reindexing.clone()))
+        } else {
+            if self.reindexing.load(std::sync::atomic::Ordering::Acquire) {
+                return Err("a reindex is in progress; retry after it completes".to_string());
+            }
+            None
+        };
         let kb = self.kb.lock().await;
 
         match req.name.as_ref() {
@@ -378,14 +431,107 @@ impl SkbServer {
                     .map_err(|e| format!("{e}"))
             }
             "skb_reindex" => {
-                let params: ReindexRequest = serde_json::from_value(Value::Object(args))
-                    .map_err(|e| valid_err(&format!("invalid reindex parameters: {e}")))?;
-                kb.reindex(&params)
-                    .await
-                    .map(|r| serde_json::to_value(r).unwrap_or_default())
-                    .map_err(|e| format!("{e}"))
+                // The reindexing flag was claimed (and the guard created)
+                // before the kb lock above; release the kb guard so
+                // handle_reindex reacquires it.
+                drop(kb);
+                let _guard = reindex_guard;
+                self.handle_reindex(Value::Object(args), context).await
             }
             name => Err(format!("unknown tool: {name}")),
+        }
+    }
+
+    /// Run `skb_reindex` with throttled, ordered progress notifications.
+    async fn handle_reindex(
+        &self,
+        args: serde_json::Value,
+        context: &rmcp::service::RequestContext<RoleServer>,
+    ) -> Result<Value, String> {
+        let kb = self.kb.lock().await;
+        let params: ReindexRequest = serde_json::from_value(args)
+            .map_err(|e| valid_err(&format!("invalid reindex parameters: {e}")))?;
+        // Throttle progress notifications so a slow client cannot accumulate
+        // an unbounded number of in-flight sends: emit at most one per
+        // PROGRESS_EVERY documents, always the final one. A bounded channel +
+        // one forwarding task keeps callback order; the forwarder is awaited
+        // after reindex so the final done == total notification is delivered
+        // before returning.
+        const PROGRESS_EVERY: usize = 10;
+        let progress_handle: Option<(
+            Box<skb_core::reindex::ProgressFn>,
+            tokio::task::JoinHandle<()>,
+        )> = context.meta.get_progress_token().map(|token| {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<(usize, usize)>(32);
+            let peer2 = context.peer.clone();
+            let token2 = token.clone();
+            let forwarder = tokio::spawn(async move {
+                // Only strictly increasing progress is forwarded: duplicate or
+                // non-increasing values are discarded. Track the highest
+                // total seen; when the channel closes, a final done == total
+                // notification is completed on the forwarder side so it can
+                // never be lost to a full channel.
+                let mut max_sent = 0usize;
+                let mut last_total = 0usize;
+                while let Some((done, total)) = rx.recv().await {
+                    last_total = last_total.max(total);
+                    if done <= max_sent {
+                        continue;
+                    }
+                    max_sent = done;
+                    let notification = rmcp::model::Notification::new(
+                        rmcp::model::ProgressNotificationParam::new(token2.clone(), done as f64)
+                            .with_total(total as f64),
+                    );
+                    let _ = peer2
+                        .send_notification(rmcp::model::ServerNotification::ProgressNotification(
+                            notification,
+                        ))
+                        .await;
+                }
+                // Only forward the completion value when it is strictly
+                // greater than what was already sent, so a duplicate or lower
+                // final value is never emitted.
+                if last_total > max_sent && last_total > 0 {
+                    let notification = rmcp::model::Notification::new(
+                        rmcp::model::ProgressNotificationParam::new(token2, last_total as f64)
+                            .with_total(last_total as f64),
+                    );
+                    let _ = peer2
+                        .send_notification(rmcp::model::ServerNotification::ProgressNotification(
+                            notification,
+                        ))
+                        .await;
+                }
+            });
+            let callback: Box<skb_core::reindex::ProgressFn> =
+                Box::new(move |done: usize, total: usize| {
+                    if done != total && !done.is_multiple_of(PROGRESS_EVERY) {
+                        return;
+                    }
+                    let _ = tx.try_send((done, total));
+                });
+            (callback, forwarder)
+        });
+        match progress_handle {
+            Some((progress, forwarder)) => {
+                let r = kb
+                    .reindex(&params, Some(progress.as_ref()))
+                    .await
+                    .map(|r| serde_json::to_value(r).unwrap_or_default())
+                    .map_err(|e| format!("{e}"));
+                // Drop the callback (closes the channel), then await the
+                // forwarder so the final progress notification is sent
+                // before the tool returns.
+                drop(progress);
+                let _ = forwarder.await;
+                r
+            }
+            None => kb
+                .reindex(&params, None)
+                .await
+                .map(|r| serde_json::to_value(r).unwrap_or_default())
+                .map_err(|e| format!("{e}")),
         }
     }
 }
@@ -399,9 +545,18 @@ async fn main() -> Result<()> {
 
     // Match the CLI: Config::load() returning a default for a missing config
     // file is fine, but parse errors and invalid SKB_* environment values must
-    // stop startup instead of being silently replaced with defaults.
-    let config = Config::load()?;
-    let kb = KnowledgeBase::open(config).await?;
+    // stop startup. Propagate the anyhow error with its file-path context.
+    let config = Config::load().context("failed to load config")?;
+    // In a model/tokenizer mismatch state, start anyway so `skb_reindex`
+    // can rebuild the database (spec §9-5).
+    let kb = match KnowledgeBase::open(config.clone()).await {
+        Ok(kb) => kb,
+        Err(e) if e.code == skb_core::error::ErrorCode::ModelMismatch => {
+            tracing::warn!("model mismatch detected; starting for reindex");
+            KnowledgeBase::open_for_reindex(config).await?
+        }
+        Err(e) => return Err(e.into()),
+    };
     let server = SkbServer::new(kb);
 
     tracing::info!("MCP server starting (stdio)");
@@ -526,5 +681,29 @@ mod tests {
     fn reindex_request_preserves_explicit_dry_run() {
         let params: ReindexRequest = serde_json::from_value(json!({"dry_run": true})).unwrap();
         assert!(params.dry_run);
+    }
+
+    #[test]
+    fn reindex_guard_claims_and_releases_flag() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        assert!(flag
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok());
+        // A second claim while the first guard is alive is rejected.
+        let second = flag.compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        );
+        assert!(second.is_err(), "second skb_reindex must be rejected");
+        // Dropping the guard resets the flag.
+        drop(ReindexGuard(flag.clone()));
+        assert!(!flag.load(std::sync::atomic::Ordering::Acquire));
     }
 }

@@ -31,8 +31,10 @@ pub const TOKENIZER_FINGERPRINT_SCHEMA: &str = "1";
 /// `tokenizers` crate version the fingerprint is bound to. Keep in sync with
 /// `crates/skb-core/Cargo.toml`; bumping `tokenizers` (or the serializer)
 /// changes the canonical JSON output, so a fingerprint mismatch is expected and
-/// users must `skb reindex` (§5.4 rule 3).
-pub const TOKENIZER_CRATE_VERSION: &str = "0.23";
+/// users must `skb reindex` (§5.4 rule 3). This is the EXACT locked version
+/// from Cargo.lock (not the truncated "0.23" requirement), so the fingerprint
+/// records the precise crate revision; bump it together with Cargo.lock.
+pub const TOKENIZER_CRATE_VERSION: &str = "0.23.1";
 
 pub struct KnowledgeBase {
     db: Db,
@@ -42,7 +44,22 @@ pub struct KnowledgeBase {
 }
 
 impl KnowledgeBase {
+    /// Open the knowledge base, refusing to operate when the stored
+    /// model/dimension/tokenizer no longer match the configuration
+    /// (`E_MODEL_MISMATCH`, spec §5.4). Use [`KnowledgeBase::open_for_reindex`]
+    /// to rebuild after such a change.
     pub async fn open(config: Config) -> Result<Self, SkbError> {
+        Self::open_inner(config, false).await
+    }
+
+    /// Open the knowledge base even when the stored model/dimension/tokenizer
+    /// mismatch the configuration, so that `reindex` can rebuild it
+    /// (spec §9-5: management path from the mismatch state).
+    pub async fn open_for_reindex(config: Config) -> Result<Self, SkbError> {
+        Self::open_inner(config, true).await
+    }
+
+    async fn open_inner(config: Config, allow_mismatch: bool) -> Result<Self, SkbError> {
         let db = Db::open(&config).await?;
 
         let tokenizer_path = resolve_tokenizer_path(&config)?;
@@ -78,37 +95,39 @@ impl KnowledgeBase {
             config.resolve_embedding_settings(embedder.dimension(), embedder.max_input_tokens())?;
 
         let dimension = embedder.dimension();
-
-        // Before touching the schema: a pre-existing store must agree on the
-        // embedding dimension, otherwise db.migrate would redefine the
-        // embedding field / HNSW index on top of mismatched data. A mismatch
-        // returns E_MODEL_MISMATCH without modifying schema, fields, indexes,
-        // or metadata (spec §5.4 rule 2).
-        let info: Vec<serde_json::Value> = db
-            .db
-            .query("INFO FOR DB")
-            .await
-            .map_err(|e| SkbError::new(ErrorCode::Db, format!("open info: {e}")))?
-            .take(0)
-            .map_err(|e| SkbError::new(ErrorCode::Db, format!("open info take: {e}")))?;
-        let has_meta = info
-            .first()
-            .and_then(|v| v["tables"].as_object())
-            .map(|t| t.contains_key("meta"))
-            .unwrap_or(false);
-        if has_meta {
-            if let Some(stored_dim) = db.get_meta("embedding_dimension").await? {
-                let stored_dim: usize = stored_dim.parse().map_err(|_| {
-                    SkbError::new(
-                        ErrorCode::Db,
-                        "stored embedding_dimension meta is not a number",
-                    )
-                })?;
-                if stored_dim != dimension {
+        // Compare the stored model/dimension BEFORE migrate so a mismatch never
+        // modifies the schema, field, index or meta (spec §9-5). A brand-new
+        // database has no meta table yet and takes the initialization path.
+        let is_new = db.is_new_database().await?;
+        if !is_new && !allow_mismatch {
+            // A reindex interrupted between the transition and update_metas
+            // leaves the in-progress marker ("dim" = dimension transition,
+            // "meta" = metadata/tokenizer rebuild); refuse normal opens so
+            // the store is never used half-rebuilt (spec §9-5).
+            let in_progress = db.get_meta("reindex_in_progress").await?;
+            if in_progress.as_deref().is_some_and(|v| !v.is_empty()) {
+                return Err(SkbError::new(
+                    ErrorCode::ModelMismatch,
+                    "a reindex is in progress or was interrupted; run `skb reindex` to complete it",
+                ));
+            }
+            if let Some(ref stored) = db.get_meta("embedding_model").await? {
+                if stored != &config.embedding.model {
                     return Err(SkbError::new(
                         ErrorCode::ModelMismatch,
                         format!(
-                            "config dimension: '{dimension}', stored: '{stored_dim}'. Run reindex to switch models.",
+                            "config: '{}', stored: '{}'. Run reindex to switch models.",
+                            config.embedding.model, stored
+                        ),
+                    ));
+                }
+            }
+            if let Some(ref stored) = db.get_meta("embedding_dimension").await? {
+                if stored != &dimension.to_string() {
+                    return Err(SkbError::new(
+                        ErrorCode::ModelMismatch,
+                        format!(
+                            "config dimension: '{dimension}', stored: '{stored}'. Run reindex to rebuild."
                         ),
                     ));
                 }
@@ -117,27 +136,7 @@ impl KnowledgeBase {
 
         db.migrate(dimension).await?;
 
-        let stored_model = db.get_meta("embedding_model").await?;
-        if let Some(ref stored) = stored_model {
-            if stored != &config.embedding.model {
-                return Err(SkbError::new(
-                    ErrorCode::ModelMismatch,
-                    format!(
-                        "config: '{}', stored: '{}'. Run reindex to switch models.",
-                        config.embedding.model, stored
-                    ),
-                ));
-            }
-            // Backfill embedding_max_input_tokens for stores created before the
-            // key existed; it is read by doctor and dimension/mismatch checks.
-            if db.get_meta("embedding_max_input_tokens").await?.is_none() {
-                db.set_meta(
-                    "embedding_max_input_tokens",
-                    &config.embedding.max_input_tokens.to_string(),
-                )
-                .await?;
-            }
-        } else {
+        if is_new {
             db.set_meta("embedding_model", &config.embedding.model)
                 .await?;
             db.set_meta("embedding_dimension", &dimension.to_string())
@@ -148,13 +147,42 @@ impl KnowledgeBase {
             )
             .await?;
             db.set_meta("schema_version", "1").await?;
+        } else if !allow_mismatch {
+            // Backfill metadata for stores created before the keys existed;
+            // read by doctor and dimension/mismatch checks. Existing values
+            // are preserved (the mismatch check above already refuses to
+            // operate when they disagree with the config). In allow_mismatch
+            // mode (open_for_reindex) nothing is written: model/dimension/
+            // max_input are recorded only after a successful reindex.
+            if db.get_meta("embedding_model").await?.is_none() {
+                db.set_meta("embedding_model", &config.embedding.model)
+                    .await?;
+            }
+            if db.get_meta("embedding_dimension").await?.is_none() {
+                db.set_meta("embedding_dimension", &dimension.to_string())
+                    .await?;
+            }
+            if db.get_meta("embedding_max_input_tokens").await?.is_none() {
+                db.set_meta(
+                    "embedding_max_input_tokens",
+                    &config.embedding.max_input_tokens.to_string(),
+                )
+                .await?;
+            }
         }
 
         // Tokenizer fingerprint: compute, then compare against the stored
-        // fingerprint (spec §5.4 rule 3). A mismatch requires a reindex.
+        // fingerprint (spec §5.4 rule 3). A mismatch requires a reindex;
+        // the reindex path records the new fingerprint instead.
         let tokenizer_source = tokenizer_source_for(&config);
         let tokenizer_meta = tokenizer_fingerprint(&tokenizer_source, &tokenizer.config_json()?)?;
-        sync_tokenizer_meta(&db, &config, &tokenizer_source, &tokenizer_meta).await?;
+        if !allow_mismatch {
+            sync_tokenizer_meta(&db, &config, &tokenizer_source, &tokenizer_meta).await?;
+        }
+        // In allow_mismatch mode (open_for_reindex) the stored metadata is left
+        // untouched: only a successful reindex may write the new fingerprint,
+        // so a store that is opened for reindex but never rebuilt still fails
+        // the normal `open` with E_MODEL_MISMATCH (spec §9-5).
 
         tracing::info!(model=%config.embedding.model, dim=dimension, "KnowledgeBase opened");
 
@@ -188,6 +216,7 @@ impl KnowledgeBase {
         if req.top_k.is_none() {
             req.top_k = Some(self.config.search.top_k);
         }
+        let top_k = req.top_k.unwrap_or(10);
         let mut resp = search::search(
             &self.db,
             self.embedder.as_ref(),
@@ -197,8 +226,30 @@ impl KnowledgeBase {
         .await?;
 
         if graph_expand > 0 && !resp.hits.is_empty() {
-            let expanded = graph::expand_search_hits(&self.db, &resp.hits, graph_expand).await?;
+            // Enrich original hits with their chunk's entities, then merge the
+            // expanded hits and re-rank everything by score (spec §6).
+            let (expanded, origin_entities) =
+                graph::expand_search_hits(&self.db, &resp.hits, graph_expand).await?;
+            for hit in resp.hits.iter_mut() {
+                let entities = origin_entities
+                    .get(&format!("{}/{}", hit.document_id, hit.chunk_idx))
+                    .cloned()
+                    .unwrap_or_default();
+                if !entities.is_empty() {
+                    hit.matched_entities = Some(entities);
+                }
+            }
             resp.hits.extend(expanded);
+            resp.hits.sort_by(|a, b| {
+                // Score descending, then (document_id, chunk_idx) ascending so
+                // equal scores keep a deterministic order before truncation.
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.document_id.cmp(&b.document_id))
+                    .then_with(|| a.chunk_idx.cmp(&b.chunk_idx))
+            });
+            resp.hits.truncate(top_k);
         }
 
         Ok(resp)
@@ -224,8 +275,51 @@ impl KnowledgeBase {
         crud::stats(&self.db, self.embedder.as_ref()).await
     }
 
-    pub async fn doctor(&self) -> Result<String, SkbError> {
+    pub async fn doctor(&self) -> Result<crate::crud::DoctorReport, SkbError> {
         crud::doctor(&self.db, self.embedder.as_ref(), self.tokenizer.as_ref()).await
+    }
+
+    /// Execute raw SurrealQL (CLI-only escape hatch; never exposed via MCP,
+    /// spec §11.1). Returns the JSON result of every statement.
+    pub async fn query_surql(&self, surql: &str) -> Result<serde_json::Value, SkbError> {
+        if surql.trim().is_empty() {
+            return Err(SkbError::new(
+                ErrorCode::Validation,
+                "query must not be empty",
+            ));
+        }
+        let r = self
+            .db
+            .db
+            .query(surql)
+            .await
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("query: {e}")))?;
+        // Statement-level errors must surface (e.g. a bad query), not be
+        // swallowed as end-of-list: check() validates every statement and
+        // returns the (reusable) response.
+        let mut r = r
+            .check()
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("query check: {e}")))?;
+        // Iterate the fixed statement count so statement positions stay
+        // aligned: Value::None is a valid result (e.g. a RETURN-less
+        // statement) and is appended as null; take failures are real errors.
+        let mut statements: Vec<serde_json::Value> = Vec::new();
+        let count = r.num_statements();
+        for idx in 0..count {
+            match r.take::<surrealdb::types::Value>(idx) {
+                Ok(value) if value != surrealdb::types::Value::None => {
+                    statements.push(value.into_json_value());
+                }
+                Ok(_) => statements.push(serde_json::Value::Null),
+                Err(e) => {
+                    return Err(SkbError::new(
+                        ErrorCode::Db,
+                        format!("query take statement {idx}: {e}"),
+                    ));
+                }
+            }
+        }
+        Ok(serde_json::json!({ "statements": statements }))
     }
 
     // ── Graph ──
@@ -266,13 +360,15 @@ impl KnowledgeBase {
     pub async fn reindex(
         &self,
         req: &reindex::ReindexRequest,
+        progress: Option<&reindex::ProgressFn>,
     ) -> Result<reindex::ReindexResult, SkbError> {
         reindex::reindex(
             &self.db,
-            self.embedder.as_ref(),
+            self.embedder.clone(),
             self.tokenizer.as_ref(),
             &self.config,
             req,
+            progress,
         )
         .await
     }
@@ -336,12 +432,26 @@ pub(crate) fn tokenizer_fingerprint(
         .and_then(|v| v.as_str())
         .unwrap_or("unknown")
         .to_string();
+    // Recursively sort all object keys so the hash is independent of JSON key
+    // order (nested values from the tokenizers crate may arrive in arbitrary
+    // order).
+    fn sort_keys(value: serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Object(map) => {
+                serde_json::Value::Object(map.into_iter().map(|(k, v)| (k, sort_keys(v))).collect())
+            }
+            serde_json::Value::Array(arr) => {
+                serde_json::Value::Array(arr.into_iter().map(sort_keys).collect())
+            }
+            other => other,
+        }
+    }
     let canonical = serde_json::to_string(&serde_json::json!({
         "schema": TOKENIZER_FINGERPRINT_SCHEMA,
         "tokenizers": TOKENIZER_CRATE_VERSION,
         "source": source,
         "algorithm": algorithm,
-        "config": config,
+        "config": sort_keys(config.clone()),
     }))
     .map_err(|e| {
         SkbError::new(
@@ -389,7 +499,8 @@ pub(crate) async fn sync_tokenizer_meta(
 }
 
 /// Persist the tokenizer metadata unconditionally (used after a successful
-/// reindex, spec §5.4 rule 3).
+/// reindex, spec §5.4 rule 3). Generic over the store so it can run inside a
+/// transaction.
 pub(crate) async fn save_tokenizer_meta<S: crate::db::MetaStore>(
     store: &S,
     config: &Config,
@@ -427,6 +538,20 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn tokenizer_crate_version_matches_lockfile() {
+        // Build-time guard: TOKENIZER_CRATE_VERSION must match the LOCKED
+        // tokenizers version so a dependency update cannot leave the
+        // fingerprint version stale (a bump changes the fingerprint and
+        // triggers E_MODEL_MISMATCH).
+        let lockfile = include_str!("../../../Cargo.lock");
+        let needle = format!("name = \"tokenizers\"\nversion = \"{TOKENIZER_CRATE_VERSION}\"");
+        assert!(
+            lockfile.contains(&needle),
+            "TOKENIZER_CRATE_VERSION ({TOKENIZER_CRATE_VERSION}) must match Cargo.lock"
+        );
+    }
 
     fn is_upload_source(name: &str) -> bool {
         matches!(name, "path" | "url" | "content" | "content_base64")
@@ -510,10 +635,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&kb.config().storage.path);
     }
 
+    /// In-process reopening of the same SurrealKv path needs the previous
+    /// connection's router task to finish the datastore shutdown (file lock).
+    async fn settle_db_lock() {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+
     /// Write a minimal but valid `tokenizer.json` (single-token BPE) for
     /// fingerprint tests; `word` changes the vocabulary so fingerprints differ.
     fn write_fixture_tokenizer(path: &std::path::Path, word: &str) {
         use tokenizers::models::bpe::BPE;
+        use tokenizers::pre_tokenizers::whitespace::WhitespaceSplit;
         use tokenizers::Tokenizer;
 
         let mut vocab = ahash::AHashMap::default();
@@ -524,7 +656,10 @@ mod tests {
             .unk_token("<unk>".to_string())
             .build()
             .unwrap();
-        let tok = Tokenizer::new(bpe);
+        let mut tok = Tokenizer::new(bpe);
+        // Word-based splitting keeps heading lines in one token run (per-char
+        // fallback tokens would split "## Beta" across chunks).
+        tok.with_pre_tokenizer(Some(WhitespaceSplit));
         std::fs::write(path, serde_json::to_string(&tok).unwrap()).unwrap();
     }
 
@@ -551,6 +686,465 @@ mod tests {
             }
         }
         Err(last.expect("ATTEMPTS is non-zero"))
+    }
+
+    #[tokio::test]
+    async fn test_graph_expansion_n_hop_with_rerank() {
+        let kb = setup().await;
+        let path = kb.config().storage.path.clone();
+
+        kb.upload(UploadRequest {
+            path: None,
+            url: None,
+            content: Some(
+                "[[Alpha]] project has unique zzzkeyword content about the alpha engine.".into(),
+            ),
+            content_base64: None,
+            title: Some("doc-a".into()),
+            tags: None,
+            metadata: None,
+            force: None,
+        })
+        .await
+        .unwrap();
+        kb.upload(UploadRequest {
+            path: None,
+            url: None,
+            content: Some(
+                "[[Beta]] project documents the beta engine with related details.".into(),
+            ),
+            content_base64: None,
+            title: Some("doc-b".into()),
+            tags: None,
+            metadata: None,
+            force: None,
+        })
+        .await
+        .unwrap();
+
+        // Alpha mentions in doc A's chunks become entities; relate Alpha -> Beta.
+        kb.link_entities(&LinkInfo {
+            from: "Alpha".into(),
+            to: "Beta".into(),
+            relation: "related".into(),
+            weight: Some(1.0),
+        })
+        .await
+        .unwrap();
+
+        let resp = kb
+            .search(SearchRequest {
+                query: "unique zzzkeyword alpha engine".into(),
+                mode: Some(SearchMode::Hybrid),
+                top_k: Some(10),
+                graph_expand: Some(2),
+                filter: None,
+            })
+            .await
+            .unwrap();
+
+        // Doc A is the direct hit and must rank above the graph-expanded doc B.
+        assert!(!resp.hits.is_empty());
+        assert!(resp.hits[0].title.as_deref() == Some("doc-a"));
+        let doc_a = &resp.hits[0];
+        assert!(
+            doc_a
+                .matched_entities
+                .as_deref()
+                .is_some_and(|e| e.iter().any(|n| n == "Alpha")),
+            "direct hit must carry its chunk's entities"
+        );
+        let doc_b = resp
+            .hits
+            .iter()
+            .find(|h| h.title.as_deref() == Some("doc-b"));
+        let doc_b = doc_b.expect("doc B must be found via 2-hop expansion");
+        assert!(
+            doc_b
+                .matched_entities
+                .as_deref()
+                .is_some_and(|e| e.iter().any(|n| n == "Beta")),
+            "expanded hit must record the connecting entity"
+        );
+        assert!(
+            doc_b.score < resp.hits[0].score,
+            "re-rank must keep direct hits first"
+        );
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[tokio::test]
+    async fn test_chunk_heading_persisted() {
+        let kb = setup().await;
+        let path = kb.config().storage.path.clone();
+        let content = format!(
+            "# Overview\n\n{}\n\n## Details\n\n{}",
+            "intro text for the overview section. ".repeat(60),
+            "detailed body text. ".repeat(60),
+        );
+
+        kb.upload(UploadRequest {
+            path: None,
+            url: None,
+            content: Some(content),
+            content_base64: None,
+            title: Some("headings".into()),
+            tags: None,
+            metadata: None,
+            force: None,
+        })
+        .await
+        .unwrap();
+
+        let docs = kb
+            .list_documents(&ListQuery {
+                limit: Some(10),
+                offset: Some(0),
+                order: None,
+                after: None,
+            })
+            .await
+            .unwrap();
+        let doc = kb
+            .get_document(&GetDocumentRequest {
+                id: docs[0].id.clone(),
+                include_chunks: Some(true),
+            })
+            .await
+            .unwrap();
+        let chunks = doc.chunks.unwrap();
+        assert!(chunks.len() >= 2);
+        assert!(
+            chunks
+                .iter()
+                .any(|c| c.heading.as_deref() == Some("Overview")),
+            "overview section must keep its heading"
+        );
+        assert!(
+            chunks
+                .iter()
+                .any(|c| c.heading.as_deref() == Some("Details")),
+            "details section must keep its heading"
+        );
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[tokio::test]
+    async fn test_search_response_has_title_source_and_highlights() {
+        let kb = setup().await;
+        let path = kb.config().storage.path.clone();
+
+        kb.upload(UploadRequest {
+            path: None,
+            url: None,
+            content: Some("full text search highlights the query words here".into()),
+            content_base64: None,
+            title: Some("highlight-doc".into()),
+            tags: None,
+            metadata: None,
+            force: None,
+        })
+        .await
+        .unwrap();
+
+        let kw = kb
+            .search(SearchRequest {
+                query: "highlights query".into(),
+                mode: Some(SearchMode::Keyword),
+                top_k: Some(5),
+                graph_expand: None,
+                filter: None,
+            })
+            .await
+            .unwrap();
+        assert!(!kw.hits.is_empty());
+        let hit = &kw.hits[0];
+        assert_eq!(hit.title.as_deref(), Some("highlight-doc"));
+        assert!(hit.source.is_some());
+        let hl = hit
+            .highlights
+            .as_ref()
+            .expect("keyword hits have highlights");
+        assert!(hl.contains(&"highlights".to_string()));
+        assert!(hl.contains(&"query".to_string()));
+
+        let vec = kb
+            .search(SearchRequest {
+                query: "highlights".into(),
+                mode: Some(SearchMode::Vector),
+                top_k: Some(5),
+                graph_expand: None,
+                filter: None,
+            })
+            .await
+            .unwrap();
+        assert!(vec.hits[0].title.is_some());
+        assert!(
+            vec.hits[0].highlights.is_none(),
+            "vector mode has no highlights"
+        );
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// Embedder that reports one dimension but emits vectors of another —
+    /// used to force a chunk-write failure inside the reindex transaction.
+    struct WrongDimEmbedder {
+        declared: usize,
+        actual: usize,
+    }
+
+    impl Embed for WrongDimEmbedder {
+        fn dimension(&self) -> usize {
+            self.declared
+        }
+        fn max_input_tokens(&self) -> usize {
+            8192
+        }
+        fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, SkbError> {
+            Ok(texts.iter().map(|_| vec![0.0f32; self.actual]).collect())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_model_mismatch_blocks_open_and_reindex_recovers() {
+        let n = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::path::PathBuf::from(format!("./target/skb-test-mm-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tok_path = dir.join("tokenizer.json");
+        write_fixture_tokenizer(&tok_path, "alpha");
+
+        let mut config_a = Config::default();
+        config_a.embedding.onnx_path = "mock".to_string();
+        config_a.embedding.dimension = 8;
+        config_a.embedding.model = "model-a".to_string();
+        config_a.embedding.tokenizer = tok_path.display().to_string();
+        config_a.storage.path = dir.join("db");
+
+        let kb = KnowledgeBase::open(config_a.clone()).await.unwrap();
+        kb.upload(UploadRequest {
+            path: None,
+            url: None,
+            content: Some("some document body".into()),
+            content_base64: None,
+            title: Some("doc".into()),
+            tags: None,
+            metadata: None,
+            force: None,
+        })
+        .await
+        .unwrap();
+        drop(kb);
+        settle_db_lock().await;
+
+        // Same database, different model: normal open refuses to operate.
+        let mut config_b = config_a.clone();
+        config_b.embedding.model = "model-b".to_string();
+        let err = open_expecting_error(config_b.clone()).await;
+        assert!(matches!(err.code, ErrorCode::ModelMismatch));
+        settle_db_lock().await;
+
+        // The management path can open and rebuild.
+        let kb = KnowledgeBase::open_for_reindex(config_b.clone())
+            .await
+            .unwrap();
+        let result = kb
+            .reindex(&reindex::ReindexRequest::default(), None)
+            .await
+            .unwrap();
+        assert_eq!(result.documents_processed, 1);
+        drop(kb);
+        settle_db_lock().await;
+
+        // After the rebuild the new model opens normally.
+        KnowledgeBase::open(config_b).await.unwrap();
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_dimension_change_redefines_schema_and_recovers() {
+        let n = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::path::PathBuf::from(format!("./target/skb-test-dimchg-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tok_path = dir.join("tokenizer.json");
+        write_fixture_tokenizer(&tok_path, "alpha");
+
+        let mut config = Config::default();
+        config.embedding.onnx_path = "mock".to_string();
+        config.embedding.dimension = 8;
+        config.embedding.tokenizer = tok_path.display().to_string();
+        config.storage.path = dir.join("db");
+
+        let kb = KnowledgeBase::open(config.clone()).await.unwrap();
+        kb.upload(UploadRequest {
+            path: None,
+            url: None,
+            content: Some("a document with some content".into()),
+            content_base64: None,
+            title: Some("doc".into()),
+            tags: None,
+            metadata: None,
+            force: None,
+        })
+        .await
+        .unwrap();
+
+        // Reindex with a 16-dimension embedder: schema must be redefined.
+        let dim16 = MockEmbedder { dimension: 16 };
+        let result = reindex::reindex(
+            kb.db(),
+            std::sync::Arc::new(dim16),
+            kb.tokenizer().as_ref(),
+            kb.config(),
+            &reindex::ReindexRequest::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.documents_processed, 1);
+        let stored_dim = kb.db().get_meta("embedding_dimension").await.unwrap();
+        assert_eq!(stored_dim.as_deref(), Some("16"));
+        drop(kb);
+        settle_db_lock().await;
+
+        // A normal open with the old 8-dim config now reports a mismatch.
+        let err = open_expecting_error(config.clone()).await;
+        assert!(matches!(err.code, ErrorCode::ModelMismatch));
+        settle_db_lock().await;
+
+        // Rebuild back to 8 via the reindex path, then normal open works again.
+        let kb = KnowledgeBase::open_for_reindex(config.clone())
+            .await
+            .unwrap();
+        let result = kb
+            .reindex(&reindex::ReindexRequest::default(), None)
+            .await
+            .unwrap();
+        assert_eq!(result.documents_processed, 1);
+        drop(kb);
+        settle_db_lock().await;
+        KnowledgeBase::open(config).await.unwrap();
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_dimension_change_interruption_is_detectable_and_recovers() {
+        let n = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::path::PathBuf::from(format!("./target/skb-test-dimrb-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tok_path = dir.join("tokenizer.json");
+        write_fixture_tokenizer(&tok_path, "alpha");
+
+        let mut config = Config::default();
+        config.embedding.onnx_path = "mock".to_string();
+        config.embedding.dimension = 8;
+        config.embedding.tokenizer = tok_path.display().to_string();
+        config.storage.path = dir.join("db");
+
+        let kb = KnowledgeBase::open(config.clone()).await.unwrap();
+        kb.upload(UploadRequest {
+            path: None,
+            url: None,
+            content: Some("a document with some content".into()),
+            content_base64: None,
+            title: Some("doc".into()),
+            tags: None,
+            metadata: None,
+            force: None,
+        })
+        .await
+        .unwrap();
+
+        // Declared 16 (drives the schema transition) but emits 8-dim vectors:
+        // the rebuild fails after the transition committed.
+        let broken = WrongDimEmbedder {
+            declared: 16,
+            actual: 8,
+        };
+        let err = reindex::reindex(
+            kb.db(),
+            std::sync::Arc::new(broken),
+            kb.tokenizer().as_ref(),
+            kb.config(),
+            &reindex::ReindexRequest::default(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err.code, ErrorCode::Db));
+        drop(kb);
+        settle_db_lock().await;
+
+        // The interrupted state is detectable: a plain open with the old
+        // config must refuse to operate.
+        let err = open_expecting_error(config.clone()).await;
+        assert!(matches!(err.code, ErrorCode::ModelMismatch));
+        settle_db_lock().await;
+
+        // Re-running reindex through the management path completes the
+        // rebuild back to dimension 8, then normal open works again.
+        let kb = KnowledgeBase::open_for_reindex(config.clone())
+            .await
+            .unwrap();
+        let result = kb
+            .reindex(&reindex::ReindexRequest::default(), None)
+            .await
+            .unwrap();
+        assert_eq!(result.documents_processed, 1);
+        drop(kb);
+        settle_db_lock().await;
+        KnowledgeBase::open(config).await.unwrap();
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_reindex_reports_progress() {
+        let kb = setup().await;
+        let path = kb.config().storage.path.clone();
+        for i in 0..2 {
+            kb.upload(UploadRequest {
+                path: None,
+                url: None,
+                content: Some(format!("document number {i} with body text")),
+                content_base64: None,
+                title: Some(format!("doc-{i}")),
+                tags: None,
+                metadata: None,
+                force: None,
+            })
+            .await
+            .unwrap();
+        }
+
+        let updates: std::sync::Arc<std::sync::Mutex<Vec<(usize, usize)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let progress = {
+            let updates = updates.clone();
+            move |done: usize, total: usize| {
+                updates.lock().unwrap().push((done, total));
+            }
+        };
+        let result = kb
+            .reindex(&reindex::ReindexRequest::default(), Some(&progress))
+            .await
+            .unwrap();
+        assert_eq!(result.documents_processed, 2);
+
+        let updates = updates.lock().unwrap();
+        assert!(!updates.is_empty(), "progress callback must be invoked");
+        let (last_done, last_total) = *updates.last().unwrap();
+        assert_eq!(last_total, 2);
+        assert_eq!(last_done, 2);
+
+        let _ = std::fs::remove_dir_all(&path);
     }
 
     #[tokio::test]
@@ -619,6 +1213,60 @@ mod tests {
             // final reopen; the persistent mismatch surfaces as the last error.
             let mut config_b = config_a;
             config_b.embedding.tokenizer = tok_b.display().to_string();
+            let err = match open_retrying(config_b).await {
+                Ok(_) => panic!("expected open to fail with a mismatch"),
+                Err(e) => e,
+            };
+            assert!(matches!(err.code, ErrorCode::ModelMismatch));
+        });
+        drop(rt);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_for_reindex_without_rebuild_still_mismatches() {
+        // Opening in allow_mismatch mode must NOT write the new fingerprint:
+        // if the store is never rebuilt, the next normal open still reports
+        // E_MODEL_MISMATCH so stale chunks are never used silently (spec §9-5).
+        let n = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::path::PathBuf::from(format!("./target/skb-test-mismatch-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tok_a = dir.join("tokenizer-a.json");
+        let tok_b = dir.join("tokenizer-b.json");
+        write_fixture_tokenizer(&tok_a, "alpha");
+        write_fixture_tokenizer(&tok_b, "beta");
+
+        let mut config_a = Config::default();
+        config_a.embedding.onnx_path = "mock".to_string();
+        config_a.embedding.dimension = 8;
+        config_a.embedding.tokenizer = tok_a.display().to_string();
+        config_a.storage.path = dir.join("db");
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            // First open with tokenizer-a: fingerprint persisted.
+            open_retrying(config_a.clone()).await.unwrap();
+
+            // open_for_reindex with tokenizer-b succeeds in allow_mismatch mode.
+            let mut config_b = config_a.clone();
+            config_b.embedding.tokenizer = tok_b.display().to_string();
+            // Absorb the same transient file-lock race as open_retrying.
+            let mut opened = None;
+            for _ in 0..8 {
+                match KnowledgeBase::open_for_reindex(config_b.clone()).await {
+                    Ok(kb) => {
+                        opened = Some(kb);
+                        break;
+                    }
+                    Err(_) => tokio::time::sleep(std::time::Duration::from_millis(150)).await,
+                }
+            }
+            opened.expect("open_for_reindex must succeed");
+
+            // But the new fingerprint was NOT recorded: a normal open still
+            // reports E_MODEL_MISMATCH (rebuild required).
             let err = match open_retrying(config_b).await {
                 Ok(_) => panic!("expected open to fail with a mismatch"),
                 Err(e) => e,
@@ -852,6 +1500,7 @@ mod tests {
                 limit: Some(10),
                 offset: Some(0),
                 order: None,
+                after: None,
             })
             .await
             .unwrap();
@@ -893,6 +1542,7 @@ mod tests {
                 limit: Some(10),
                 offset: Some(0),
                 order: None,
+                after: None,
             })
             .await
             .unwrap();
@@ -931,6 +1581,7 @@ mod tests {
                 limit: Some(10),
                 offset: Some(0),
                 order: None,
+                after: None,
             })
             .await
             .unwrap();
@@ -986,7 +1637,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(sres.mode, SearchMode::Hybrid);
+        // Both documents must surface as distinct hits (regression: hybrid RRF
+        // used to merge every row under an empty chunk id).
         assert!(!sres.hits.is_empty());
+        let titles: Vec<Option<&str>> = sres.hits.iter().map(|h| h.title.as_deref()).collect();
+        assert!(titles.contains(&Some("doc1")), "hits: {titles:?}");
+        assert!(titles.contains(&Some("doc2")), "hits: {titles:?}");
 
         let _ = std::fs::remove_dir_all(&path);
     }
@@ -1041,8 +1697,9 @@ mod tests {
         assert!(one_of
             .iter()
             .any(|e| e["required"] == serde_json::json!(["content_base64"])));
-        // Each oneOf branch must null out the alternative input sources so the
-        // branches are mutually exclusive (spec §12.3, one source only).
+        // Each oneOf branch must null out ALL the alternative input sources so
+        // the branches are mutually exclusive across path/url/content/
+        // content_base64 (spec §12.3, one source only).
         for e in one_of.iter() {
             let required = e["required"].as_array().unwrap();
             let required_name = required[0].as_str().unwrap();
@@ -1050,8 +1707,10 @@ mod tests {
                 .as_object()
                 .unwrap()
                 .iter()
-                .filter(|(name, _)| {
-                    name.as_str() != required_name && is_upload_source(name.as_str())
+                .filter(|(name, schema)| {
+                    name.as_str() != required_name
+                        && is_upload_source(name.as_str())
+                        && schema["type"] == serde_json::json!("null")
                 })
                 .collect::<Vec<_>>();
             assert_eq!(
@@ -1059,8 +1718,12 @@ mod tests {
                 3,
                 "branch {required_name} must null 3 sources"
             );
-            for (_, schema) in nulled {
-                assert_eq!(schema["type"], serde_json::json!("null"));
+            for (name, schema) in nulled {
+                assert_eq!(
+                    schema["type"],
+                    serde_json::json!("null"),
+                    "branch {required_name}: {name}"
+                );
             }
         }
     }
@@ -1070,6 +1733,45 @@ mod tests {
         let schema = schemars::schema_for!(GraphQueryRequest);
         let value = serde_json::to_value(&schema).unwrap();
         assert_eq!(value["required"], serde_json::json!(["from"]));
+    }
+
+    #[tokio::test]
+    async fn test_section_hierarchy_part_of_direction() {
+        let kb = setup().await;
+        let path = kb.config().storage.path.clone();
+
+        kb.upload(UploadRequest {
+            path: None,
+            url: None,
+            content: Some("# Alpha\n\nbody\n\n## Beta\n\nmore body\n".into()),
+            content_base64: None,
+            title: Some("hierarchy".into()),
+            tags: None,
+            metadata: None,
+            force: None,
+        })
+        .await
+        .unwrap();
+
+        // Beta is part of Alpha: the edge must point Beta ->part-of-> Alpha.
+        let result = kb
+            .graph_query(&GraphQueryRequest {
+                from: "Beta".into(),
+                relation: Some("part-of".into()),
+                depth: Some(1),
+                limit: Some(10),
+            })
+            .await
+            .unwrap();
+        assert!(
+            result.edges.iter().any(|e| {
+                e.from == "entity:⟨Beta⟩" && e.to == "entity:⟨Alpha⟩" && e.relation == "part-of"
+            }),
+            "expected Beta ->part-of-> Alpha, got {:?}",
+            result.edges
+        );
+
+        let _ = std::fs::remove_dir_all(&path);
     }
 
     #[tokio::test]
@@ -1098,6 +1800,7 @@ mod tests {
                 limit: Some(10),
                 offset: Some(0),
                 order: None,
+                after: None,
             })
             .await
             .unwrap();
@@ -1159,7 +1862,7 @@ mod tests {
         assert!(multi_hop.nodes.iter().any(|node| node.name == "C"));
 
         let reindexed = kb
-            .reindex(&reindex::ReindexRequest::default())
+            .reindex(&reindex::ReindexRequest::default(), None)
             .await
             .unwrap();
         assert_eq!(reindexed.documents_processed, 1);

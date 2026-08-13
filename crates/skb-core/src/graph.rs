@@ -465,86 +465,263 @@ fn start_record_id(value: &str) -> Result<RecordId, SkbError> {
     entity_record_id(key)
 }
 
-/// Expand search results by following entity mentions.
-/// For each search hit, find entities mentioned by its chunk,
-/// then find other chunks that mention the same entities.
+/// Expand search results by following the graph (spec §6): each hit's chunk
+/// mentions entities (hop 1); `related_to` edges extend the frontier for
+/// `max_expand - 1` further hops; chunks mentioning any frontier entity are
+/// returned with a hop-decayed score and the connecting entity recorded in
+/// `matched_entities`.
+///
+/// Returns the expanded hits plus, for each original hit, the entities its
+/// chunk mentions (keyed `"<document_id>/<chunk_idx>"`).
 pub async fn expand_search_hits(
     db: &Db,
     hits: &[crate::search::SearchHit],
     max_expand: usize,
-) -> Result<Vec<crate::search::SearchHit>, SkbError> {
+) -> Result<
+    (
+        Vec<crate::search::SearchHit>,
+        std::collections::HashMap<String, Vec<String>>,
+    ),
+    SkbError,
+> {
+    use crate::search::SearchHit;
     if max_expand == 0 || hits.is_empty() {
-        return Ok(vec![]);
+        return Ok((vec![], std::collections::HashMap::new()));
     }
 
     let mut expanded = Vec::new();
+    let mut origin_entities: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    let mut seen_chunks: std::collections::HashSet<(String, usize)> = hits
+        .iter()
+        .map(|h| (h.document_id.clone(), h.chunk_idx))
+        .collect();
 
-    for hit in hits.iter().take(3) {
-        let _chunk_id = format!("chunk:{}", hit.chunk_idx);
-        // Find entities mentioned by this chunk via document context
-        // Since chunk IDs are auto-generated, we need to find actual chunks
-        let sql = format!(
-            "SELECT ->mentions->entity.name AS e, ->mentions->entity.kind AS k \
-             FROM chunk WHERE idx = {} AND meta::id(document) = '{}'",
-            hit.chunk_idx,
-            hit.document_id.replace('\'', "\\'")
-        );
-        let mut r = db
-            .db
-            .query(&sql)
-            .await
-            .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand: {e}")))?;
-        let rows: Vec<serde_json::Value> = r
-            .take(0)
-            .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand take: {e}")))?;
+    // Direct-hit entity metadata is recorded for EVERY hit, while graph
+    // expansion is bounded to the top EXPAND_ORIGIN_LIMIT hits so dense
+    // result sets stay cheap.
+    const EXPAND_ORIGIN_LIMIT: usize = 3;
+    const FRONTIER_MAX: usize = 100;
 
-        for row in rows.iter() {
-            for ename in to_string_vec(&row["e"]) {
-                // Find other chunks mentioning this entity
-                let esql = format!(
-                    "SELECT content, idx, meta::id(document) AS document, 1.0 AS score \
-                     FROM chunk WHERE '{}' IN ->mentions->entity.name \
-                     LIMIT {max_expand}",
-                    ename.replace('\'', "\\'")
-                );
-                let mut r = db
-                    .db
-                    .query(&esql)
-                    .await
-                    .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand2: {e}")))?;
-                let erows: Vec<serde_json::Value> = r
-                    .take(0)
-                    .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand2 take: {e}")))?;
+    // Hop 1 for all hits in ONE batched query, using direct RecordId
+    // comparison (no string-based document matching). document_id in search
+    // results is the raw key; rebuild the `document:<key>` record id for the
+    // chunk's document link. The (document, idx) pair filter is applied in
+    // Rust so an IN x IN cross product cannot match wrong pairs.
+    let wanted: std::collections::HashSet<(String, usize)> = hits
+        .iter()
+        .map(|h| (h.document_id.clone(), h.chunk_idx))
+        .collect();
+    // document_id is the raw key; build each record id with RecordId::new
+    // (like crud::document_record_id) so escaped keys are preserved instead
+    // of being dropped by a parse/filter path.
+    let unique_docs: Vec<RecordId> = hits
+        .iter()
+        .map(|h| RecordId::new("document", h.document_id.clone()))
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    let sql = "SELECT meta::id(document) AS document, idx, ->mentions->entity.name AS e \
+               FROM chunk WHERE document IN $docs";
+    let mut r = db
+        .db
+        .query(sql)
+        .bind(("docs", unique_docs))
+        .await
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand: {e}")))?;
+    let rows: Vec<serde_json::Value> = r
+        .take(0)
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand take: {e}")))?;
 
-                for erow in erows.iter() {
-                    let document_id = erow["document"].as_str().unwrap_or("").to_string();
-                    let chunk_idx = erow["idx"].as_u64().unwrap_or(0) as usize;
-                    // Skip chunks already present in the original hits.
-                    if hits
-                        .iter()
-                        .any(|h| h.document_id == document_id && h.chunk_idx == chunk_idx)
-                    {
-                        continue;
-                    }
-                    expanded.push(crate::search::SearchHit {
-                        document_id,
-                        chunk_idx,
-                        content: erow["content"].as_str().unwrap_or("").to_string(),
-                        score: erow["score"].as_f64().unwrap_or(0.1),
-                    });
-                }
-            }
+    // Bucket entities by hit (document, idx); the bucket key matches the
+    // origin_entities key format used by the caller.
+    let mut by_hit: std::collections::HashMap<(String, usize), Vec<String>> =
+        std::collections::HashMap::new();
+    for row in rows.iter() {
+        let doc = row["document"].as_str().unwrap_or("").to_string();
+        let idx = row["idx"].as_u64().unwrap_or(0) as usize;
+        if !wanted.contains(&(doc.clone(), idx)) {
+            continue;
+        }
+        for ename in to_string_vec(&row["e"]) {
+            by_hit.entry((doc.clone(), idx)).or_default().push(ename);
         }
     }
 
+    for (hit_idx, hit) in hits.iter().enumerate() {
+        let origin_score = hit.score.max(0.0);
+        let do_expand = hit_idx < EXPAND_ORIGIN_LIMIT && max_expand > 0;
+
+        let mut frontier: Vec<(String, f64)> = Vec::new(); // (entity, decay)
+        let hit_entities = by_hit
+            .remove(&(hit.document_id.clone(), hit.chunk_idx))
+            .unwrap_or_default();
+        for ename in hit_entities {
+            // Decay below 1.0 so expanded results can never tie direct
+            // hits in the re-rank (spec §6).
+            frontier.push((ename.clone(), 0.95_f64));
+            origin_entities
+                .entry(format!("{}/{}", hit.document_id, hit.chunk_idx))
+                .or_default()
+                .push(ename);
+        }
+
+        if !do_expand {
+            continue;
+        }
+
+        // Cap each hop's frontier so a dense graph cannot issue unbounded
+        // related_to queries (request-level bound on query fan-out). Sort by
+        // entity name ascending first so the truncation is deterministic,
+        // matching the later frontier truncations.
+        if frontier.len() > FRONTIER_MAX {
+            frontier.sort_by(|a, b| a.0.cmp(&b.0));
+            frontier.truncate(FRONTIER_MAX);
+        }
+
+        // Hops 2..: follow related_to edges with distance decay. Each hop is
+        // one batched query (IN $names) instead of one query per entity.
+        let mut visited: HashSet<String> = HashSet::new();
+        for hop in 2..=max_expand {
+            let mut next: Vec<(String, f64)> = Vec::new();
+            // First collect the not-yet-visited entities, then register them
+            // — side effects and selection are separate steps.
+            let mut hop_names: Vec<String> = Vec::new();
+            for (e, _) in frontier.iter() {
+                if visited.insert(e.clone()) {
+                    hop_names.push(e.clone());
+                }
+            }
+            if hop_names.is_empty() {
+                // No unvisited entities remain: further hops would be
+                // identical, so expansion terminates.
+                break;
+            }
+            let decay = 1.0 / hop as f64;
+            let esql = "SELECT name, ->related_to->entity.name AS n \
+                        FROM entity WHERE name IN $names";
+            let mut r = db
+                .db
+                .query(esql)
+                .bind(("names", hop_names))
+                .await
+                .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand hop: {e}")))?;
+            let erows: Vec<serde_json::Value> = r
+                .take(0)
+                .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand hop take: {e}")))?;
+            for erow in erows.iter() {
+                for nname in to_string_vec(&erow["n"]) {
+                    next.push((nname, decay));
+                }
+            }
+            // Cap the frontier at the end of each hop so a dense graph
+            // cannot grow it unboundedly across hops (request-level bound).
+            // Sort by decay descending, then entity name ascending, so
+            // truncation keeps the closest entities deterministically.
+            frontier.extend(next);
+            if frontier.len() > FRONTIER_MAX {
+                frontier.sort_by(|a, b| {
+                    b.1.partial_cmp(&a.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.0.cmp(&b.0))
+                });
+                frontier.truncate(FRONTIER_MAX);
+            }
+        }
+
+        // Dedup the frontier by entity name, keeping the best (closest hop =
+        // highest decay) score, so the chunk query below runs once per entity.
+        let mut best: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+        for (entity, decay) in frontier {
+            best.entry(entity)
+                .and_modify(|d| {
+                    if decay > *d {
+                        *d = decay;
+                    }
+                })
+                .or_insert(decay);
+        }
+        // Same request-level fan-out bound: the chunk-query loop below must
+        // not exceed the cap either. Sort by decay descending, then entity
+        // name ascending, so truncation keeps the closest entities regardless
+        // of HashMap iteration order.
+        let mut frontier: Vec<(String, f64)> = best.into_iter().collect();
+        frontier.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        frontier.truncate(FRONTIER_MAX);
+
+        // Chunks mentioning any frontier entity; scores are the origin hit's
+        // score decayed by hop distance (spec §6 re-rank). All frontier
+        // entities are resolved in one batched query to avoid N+1 round trips.
+        // The predicate runs through the mentions edge on entity (selective:
+        // candidate chunks are filtered before LIMIT, not scanned and cut).
+        let names: Vec<String> = frontier.iter().map(|(e, _)| e.clone()).collect();
+        let decay_map: std::collections::HashMap<String, f64> = frontier.into_iter().collect();
+        // Start from the indexed entity.name values and traverse the mentions
+        // edge BACK to the matching chunks (selective: entity rows are
+        // filtered by the indexed name before any chunk work happens, and the
+        // LIMIT applies to the resulting chunks).
+        let esql = "SELECT content, idx, meta::id(document) AS document, \
+                    document.title AS title, document.source AS source, \
+                    name AS e \
+                    FROM chunk WHERE ->mentions->entity.name IN $names \
+                    LIMIT 200";
+        let mut r = db
+            .db
+            .query(esql)
+            .bind(("names", names))
+            .await
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand2: {e}")))?;
+        let erows: Vec<serde_json::Value> = r
+            .take(0)
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand2 take: {e}")))?;
+
+        for erow in erows.iter() {
+            let document_id = erow["document"].as_str().unwrap_or("").to_string();
+            let chunk_idx = erow["idx"].as_u64().unwrap_or(0) as usize;
+            if !seen_chunks.insert((document_id.clone(), chunk_idx)) {
+                continue;
+            }
+            let matched = to_string_vec(&erow["e"]);
+            // Missing-decay fallback stays below 1.0 so an expanded result
+            // can never tie a direct hit in the re-rank (spec §6). When no
+            // entity is available, matched_entities stays None instead of
+            // fabricating an empty name.
+            let (decay, entity) = matched
+                .iter()
+                .filter_map(|e| decay_map.get(e).map(|d| (d, e.clone())))
+                .max_by(|a, b| a.0.partial_cmp(b.0).unwrap_or(std::cmp::Ordering::Equal))
+                .unwrap_or((&0.95, matched.into_iter().next().unwrap_or_default()));
+            let matched_entities = if entity.is_empty() {
+                None
+            } else {
+                Some(vec![entity])
+            };
+            expanded.push(SearchHit {
+                document_id,
+                chunk_idx,
+                content: erow["content"].as_str().unwrap_or("").to_string(),
+                score: origin_score * *decay,
+                title: erow["title"].as_str().map(|s| s.to_string()),
+                source: erow["source"].as_str().map(|s| s.to_string()),
+                highlights: None,
+                matched_entities,
+            });
+        }
+    }
+
+    // No count truncation here: `max_expand` is the hop depth and the caller
+    // (KnowledgeBase::search) trims the merged list to top_k (spec §6).
     expanded.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    expanded.truncate(max_expand);
 
-    Ok(expanded)
+    Ok((expanded, origin_entities))
 }
 
 /// Normalize a SurrealQL value into a list of strings (a single value, a string
@@ -560,9 +737,28 @@ fn to_string_vec(v: &serde_json::Value) -> Vec<String> {
     }
 }
 
+/// Extracts entities from document text. The default implementation is
+/// rule-based; an LLM-backed extractor can replace it later (spec §5.3).
+pub trait EntityExtractor: Send + Sync {
+    fn extract(&self, content: &str) -> Vec<EntityInfo>;
+}
+
+/// Default rule-based extractor (spec §5.3): Markdown links, WikiLinks,
+/// frontmatter tags/aliases, inline tags and headings.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RuleBasedExtractor;
+
+impl EntityExtractor for RuleBasedExtractor {
+    fn extract(&self, content: &str) -> Vec<EntityInfo> {
+        extract_entities(content)
+    }
+}
+
 /// Extract entities from document text using rule-based extraction:
 /// - Markdown links: [text](link)
+/// - WikiLinks: [[target]] / [[target|alias]]
 /// - Tags in YAML frontmatter: tags: [a, b, c]
+/// - Aliases in YAML frontmatter: aliases: [x, y]
 /// - Inline tags: #tag
 /// - Headings: ## Section Name
 pub fn extract_entities(content: &str) -> Vec<EntityInfo> {
@@ -579,6 +775,41 @@ pub fn extract_entities(content: &str) -> Vec<EntityInfo> {
         });
     }
 
+    // WikiLinks: [[target]] or [[target|alias]]
+    let wiki_re = regex::Regex::new(r"\[\[([^\]|]+)(?:\|([^\]]+))?\]\]").unwrap();
+    for cap in wiki_re.captures_iter(content) {
+        let name = cap
+            .get(2)
+            .map(|m| m.as_str())
+            .filter(|a| !a.trim().is_empty())
+            .or_else(|| cap.get(1).map(|m| m.as_str()))
+            .unwrap_or("")
+            .trim();
+        if !name.is_empty() {
+            entities.push(EntityInfo {
+                name: name.to_string(),
+                kind: "reference".into(),
+                description: None,
+            });
+        }
+    }
+
+    // YAML frontmatter: tags and aliases.
+    for tag in frontmatter_list(content, "tags") {
+        entities.push(EntityInfo {
+            name: tag,
+            kind: "tag".into(),
+            description: None,
+        });
+    }
+    for alias in frontmatter_list(content, "aliases") {
+        entities.push(EntityInfo {
+            name: alias,
+            kind: "alias".into(),
+            description: None,
+        });
+    }
+
     // Inline tags: #tag (preceded by space, start-of-line, or punct)
     // Uses word boundary: \b#tag matches when # is at word boundary
     let tag_re = regex::Regex::new(r"(?:^|\s)#([a-zA-Z][\w-]{1,})").unwrap();
@@ -591,20 +822,191 @@ pub fn extract_entities(content: &str) -> Vec<EntityInfo> {
         });
     }
 
-    // Headings: ^#{1,6}\s+(.+)
-    let heading_re = regex::Regex::new(r"(?m)^#{1,6}\s+(.+)").unwrap();
-    for cap in heading_re.captures_iter(content) {
-        let heading = cap.get(1).map(|m| m.as_str()).unwrap_or("");
-        if heading.len() > 2 {
-            entities.push(EntityInfo {
-                name: heading.trim().to_string(),
-                kind: "section".into(),
-                description: None,
-            });
+    // Headings: ^#{1,6}\s+(.+) outside fenced code blocks (shared fence-aware
+    // detection with the chunking logic in tokenize.rs).
+    let heading_re = regex::Regex::new(r"^#{1,6}\s+(.+)").unwrap();
+    for off in crate::tokenize::heading_starts(content) {
+        let rest = &content[off..];
+        let line = rest.split('\n').next().unwrap_or(rest);
+        if let Some(cap) = heading_re.captures(line.trim_start()) {
+            let heading = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+            if heading.chars().count() > 2 {
+                entities.push(EntityInfo {
+                    name: heading.trim().to_string(),
+                    kind: "section".into(),
+                    description: None,
+                });
+            }
         }
     }
 
+    dedup_entities(entities)
+}
+
+/// Read a list value (`[a, b]` or `- item` lines) for `key` from a YAML
+/// frontmatter block at the top of the document.
+fn frontmatter_list(content: &str, key: &str) -> Vec<String> {
+    let Some(body) = frontmatter_body(content) else {
+        return vec![];
+    };
+    let mut out = Vec::new();
+    let mut in_list = false;
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("---") {
+            break;
+        }
+        // Bullet items are handled BEFORE key parsing: a value like
+        // "- name: x" contains a colon but is a list item, not a key line.
+        if let Some(rest) = trimmed.strip_prefix('-') {
+            let item = rest.trim();
+            if in_list && !item.is_empty() {
+                out.push(item.to_string());
+            }
+            // A bullet before any target key simply starts nothing; bullets
+            // continue the current list without resetting it.
+            continue;
+        }
+        if let Some((k, rest)) = trimmed.split_once(':') {
+            let is_target = k.trim() == key;
+            let rest = rest.trim();
+            if is_target {
+                in_list = true;
+                if let Some(items) = parse_inline_list(rest) {
+                    out.extend(items);
+                    in_list = false;
+                }
+                continue;
+            }
+            // Any other key ends the current list: the following bullets
+            // belong to that key's value, not to the one we are collecting.
+            in_list = false;
+        } else {
+            in_list = false;
+        }
+    }
+    out
+}
+
+fn parse_inline_list(rest: &str) -> Option<Vec<String>> {
+    let rest = rest.trim();
+    if !rest.starts_with('[') || !rest.ends_with(']') {
+        return None;
+    }
+    Some(
+        rest[1..rest.len() - 1]
+            .split(',')
+            .map(|item| item.trim().trim_matches('"').trim_matches('\'').to_string())
+            .filter(|item| !item.is_empty())
+            .collect(),
+    )
+}
+
+/// The text between the leading `---` markers, if present.
+fn frontmatter_body(content: &str) -> Option<&str> {
+    let rest = content.strip_prefix("---")?;
+    let end = rest.find("\n---")?;
+    Some(&rest[..end])
+}
+
+fn dedup_entities(entities: Vec<EntityInfo>) -> Vec<EntityInfo> {
+    let mut seen = std::collections::HashSet::new();
     entities
+        .into_iter()
+        .filter(|e| seen.insert((e.name.clone(), e.kind.clone())))
+        .collect()
+}
+
+/// Sections with their markdown level, in document order.
+pub struct Section {
+    pub name: String,
+    pub level: u32,
+}
+
+/// Extract heading sections with levels for hierarchy linking.
+pub fn extract_sections(content: &str) -> Vec<Section> {
+    let mut sections = Vec::new();
+    let heading_re = regex::Regex::new(r"^(#{1,6})\s+(.+)").unwrap();
+    // Fence-aware detection shared with the chunking logic in tokenize.rs:
+    // heading-like lines inside ``` / ~~~ blocks are ignored.
+    for off in crate::tokenize::heading_starts(content) {
+        let rest = &content[off..];
+        let line = rest.split('\n').next().unwrap_or(rest);
+        if let Some(cap) = heading_re.captures(line.trim_start()) {
+            let level = cap.get(1).map(|m| m.as_str().len()).unwrap_or(1) as u32;
+            let name = cap.get(2).map(|m| m.as_str().trim()).unwrap_or("");
+            if name.chars().count() > 2 {
+                sections.push(Section {
+                    name: name.to_string(),
+                    level,
+                });
+            }
+        }
+    }
+    sections
+}
+
+/// Link heading sections into a `related_to(relation = "part-of")` hierarchy:
+/// each section becomes part of the nearest preceding section with a lower
+/// level (spec §5.3). Entities are upserted as `kind = "section"`.
+pub(crate) async fn link_section_hierarchy(
+    tx: &surrealdb::method::Transaction<surrealdb::engine::local::Db>,
+    content: &str,
+) -> Result<(), SkbError> {
+    let mut stack: Vec<(String, u32)> = Vec::new();
+    for section in extract_sections(content) {
+        while let Some((_, level)) = stack.last() {
+            if *level < section.level {
+                break;
+            }
+            stack.pop();
+        }
+        if let Some((parent, _)) = stack.last() {
+            let upsert_sql = "INSERT INTO entity (id, name, kind, description) \
+                              VALUES ($id, $name, $kind, $description) \
+                              ON DUPLICATE KEY UPDATE description = $description";
+            // Both endpoints of the part-of edge are sections; upsert the
+            // parent (ancestor) and the child (current section) so the child
+            // exists as an entity even when it is a leaf with no descendants.
+            for (name, id) in [
+                (parent.clone(), entity_record_id(parent)?),
+                (section.name.clone(), entity_record_id(&section.name)?),
+            ] {
+                tx.query(upsert_sql)
+                    .bind(("id", id))
+                    .bind(("name", name))
+                    .bind(("kind", "section"))
+                    .bind(("description", ""))
+                    .await
+                    .map_err(|e| SkbError::new(ErrorCode::Db, format!("section upsert: {e}")))?
+                    .check()
+                    .map_err(|e| {
+                        SkbError::new(ErrorCode::Db, format!("section upsert check: {e}"))
+                    })?;
+            }
+            // Idempotent edge: `RELATE` always creates a new edge, so remove
+            // EVERY existing part-of edge where this child is the `in`
+            // endpoint first — a child that changed its nearest parent (e.g.
+            // a restructured document) must not keep a stale edge to the old
+            // ancestor. Section entities are global (shared across
+            // documents), so the dedup is per child.
+            // Direction: the child section is part of its ancestor, so the
+            // edge points child -> part-of -> parent.
+            tx.query(
+                "DELETE FROM related_to WHERE relation = 'part-of' \
+                 AND in = $child; \
+                 RELATE $child->related_to->$parent SET relation = 'part-of', weight = 1.0",
+            )
+            .bind(("child", entity_record_id(&section.name)?))
+            .bind(("parent", entity_record_id(parent)?))
+            .await
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("section link: {e}")))?
+            .check()
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("section link check: {e}")))?;
+        }
+        stack.push((section.name, section.level));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -701,6 +1103,88 @@ mod tests {
                 })
             ));
         }
+    }
+
+    #[test]
+    fn extracts_markdown_links_and_tags() {
+        let entities = extract_entities("# Doc\n\nSee [HNSW](https://h.w) and #graph");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"HNSW"));
+        assert!(names.contains(&"graph"));
+        assert!(entities
+            .iter()
+            .any(|e| e.kind == "section" && e.name == "Doc"));
+    }
+
+    #[test]
+    fn extracts_wikilinks_with_alias() {
+        let entities = extract_entities("Read [[SurrealDB]] and [[Vector Search|vect]]");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"SurrealDB"));
+        assert!(names.contains(&"vect"));
+        assert!(
+            entities.iter().all(|e| e.kind == "reference"),
+            "wiki links must be references"
+        );
+    }
+
+    #[test]
+    fn extracts_frontmatter_tags_and_aliases() {
+        let content = "---\ntags: [rust, database]\naliases:\n  - surrealkb\n---\nbody";
+        let entities = extract_entities(content);
+        let tags: Vec<&str> = entities
+            .iter()
+            .filter(|e| e.kind == "tag")
+            .map(|e| e.name.as_str())
+            .collect();
+        let aliases: Vec<&str> = entities
+            .iter()
+            .filter(|e| e.kind == "alias")
+            .map(|e| e.name.as_str())
+            .collect();
+        assert!(tags.contains(&"rust"));
+        assert!(tags.contains(&"database"));
+        assert!(aliases.contains(&"surrealkb"));
+    }
+
+    #[test]
+    fn frontmatter_list_stops_at_other_keys() {
+        // A bare key (`aliases:`) must end the tags list: the aliases bullets
+        // must not leak into the tags result (regression).
+        let content = "---\ntags:\n  - a\naliases:\n  - b\n  - c\ndescription: x\n---\nbody";
+        assert_eq!(frontmatter_list(content, "tags"), vec!["a"]);
+        assert_eq!(frontmatter_list(content, "aliases"), vec!["b", "c"]);
+    }
+
+    #[test]
+    fn extract_dedups_entities() {
+        let entities = extract_entities("[[A]] [A](x) #tag #tag");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names.iter().filter(|n| **n == "A").count(), 1);
+        assert_eq!(names.iter().filter(|n| **n == "tag").count(), 1);
+    }
+
+    #[test]
+    fn extracts_section_levels() {
+        let sections = extract_sections("# Alpha\n## Beta\n### Gamma\n## Delta\n");
+        let pairs: Vec<(String, u32)> = sections.into_iter().map(|s| (s.name, s.level)).collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("Alpha".to_string(), 1),
+                ("Beta".to_string(), 2),
+                ("Gamma".to_string(), 3),
+                ("Delta".to_string(), 2),
+            ]
+        );
+    }
+
+    #[test]
+    fn rule_based_extractor_implements_trait() {
+        let extractor = RuleBasedExtractor;
+        let entities = extractor.extract("[[WikiLink]]");
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0].name, "WikiLink");
     }
 
     #[test]

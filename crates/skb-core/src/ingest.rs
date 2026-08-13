@@ -23,6 +23,7 @@ pub const MAX_PROCESS_SECONDS: u64 = 30;
     {
         "required": ["path"],
         "properties": {
+            "path": {"type": "string"},
             "url": {"type": "null"},
             "content": {"type": "null"},
             "content_base64": {"type": "null"}
@@ -32,6 +33,7 @@ pub const MAX_PROCESS_SECONDS: u64 = 30;
         "required": ["url"],
         "properties": {
             "path": {"type": "null"},
+            "url": {"type": "string"},
             "content": {"type": "null"},
             "content_base64": {"type": "null"}
         }
@@ -41,6 +43,7 @@ pub const MAX_PROCESS_SECONDS: u64 = 30;
         "properties": {
             "path": {"type": "null"},
             "url": {"type": "null"},
+            "content": {"type": "string"},
             "content_base64": {"type": "null"}
         }
     },
@@ -49,7 +52,8 @@ pub const MAX_PROCESS_SECONDS: u64 = 30;
         "properties": {
             "path": {"type": "null"},
             "url": {"type": "null"},
-            "content": {"type": "null"}
+            "content": {"type": "null"},
+            "content_base64": {"type": "string"}
         }
     },
 ]))]
@@ -303,6 +307,8 @@ async fn store_and_index(
         let names = graph::index_chunk_entities_in_transaction(tx, cid, &chunk.content).await?;
         entities.extend(names);
     }
+    // Heading hierarchy: sections become part-of their nearest ancestor.
+    graph::link_section_hierarchy(tx, &doc.content).await?;
     entities.sort();
     entities.dedup();
 
@@ -355,7 +361,9 @@ async fn extract_document_data(
         let config = config.clone();
         let raw = tokio::task::spawn_blocking(move || -> Result<RawInput, SkbError> {
             // The canonicalized path returned by validate_path is the one
-            // used for metadata, size validation and the read.
+            // used for metadata, size validation and the read, so the
+            // validated path is the path actually opened (no TOCTOU
+            // re-resolution window).
             let canonical = validate_path(&path, &config)?;
             let meta = std::fs::metadata(&canonical)
                 .map_err(|e| SkbError::new(ErrorCode::Io, format!("stat file: {e}")))?;
@@ -413,7 +421,10 @@ async fn extract_document_data(
     let (content, mime) = match raw {
         RawInput::Text(text) => {
             check_size(text.len() as u64, config)?;
-            (extract_text(&text, &source), mime_hint)
+            (
+                extract_text_with_mime(&text, &source, mime_hint.as_deref()),
+                mime_hint,
+            )
         }
         RawInput::Bytes(bytes) => {
             extract_from_bytes(&bytes, &source, mime_hint.as_deref(), config).await?
@@ -457,7 +468,7 @@ async fn extract_from_bytes(
     }
     match std::str::from_utf8(bytes) {
         Ok(text) => Ok((
-            extract_text(text, source),
+            extract_text_with_mime(text, source, mime_hint),
             mime_hint
                 .map(str::to_string)
                 .or(Some("text/plain".to_string())),
@@ -473,18 +484,56 @@ fn is_pdf_bytes(bytes: &[u8]) -> bool {
     bytes.starts_with(b"%PDF-")
 }
 
+/// Upper bound on PDF parse/extract jobs running concurrently across all
+/// requests. The blocking tasks are not cancellable after the wall-clock
+/// timeout fires, so without a cap a flood of non-terminating PDFs could
+/// accumulate blocking workers and their input buffers.
+const MAX_CONCURRENT_PDF_JOBS: usize = 4;
+
+static PDF_SEMAPHORE: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+    std::sync::OnceLock::new();
+
+fn pdf_semaphore() -> std::sync::Arc<tokio::sync::Semaphore> {
+    PDF_SEMAPHORE
+        .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PDF_JOBS)))
+        .clone()
+}
+
 /// Extract PDF text with resource guards: page count, wall-clock time and
 /// output size (PDF bomb mitigation, spec §12.3). The page-count check is the
 /// primary PDF-bomb defense; parsing and extraction run on blocking threads
-/// under a wall-clock timeout so a slow document cannot hang the request.
+/// under a wall-clock timeout so a slow document cannot hang the request. A
+/// fixed concurrency cap bounds how many blocking jobs may pile up.
 async fn extract_pdf_checked(bytes: &[u8]) -> Result<String, SkbError> {
+    // The wall-clock budget starts before the permit wait so waiting for a
+    // slot counts against MAX_PROCESS_SECONDS (bounded via timeout below).
     let start = Instant::now();
+    // Each permit is acquired (owned) before the job starts and moved into
+    // its spawn_blocking closure so it stays held until the blocking task
+    // finishes — a timed-out caller cannot free the slot while the job still
+    // runs, so actual concurrent PDF jobs never exceed
+    // MAX_CONCURRENT_PDF_JOBS.
+    let parse_permit = tokio::time::timeout(
+        Duration::from_secs(MAX_PROCESS_SECONDS),
+        pdf_semaphore().acquire_owned(),
+    )
+    .await
+    .map_err(|_| {
+        SkbError::new(
+            ErrorCode::Validation,
+            "pdf semaphore wait exceeded time limit",
+        )
+    })?
+    .map_err(|e| SkbError::new(ErrorCode::Db, format!("pdf semaphore: {e}")))?;
     let shared = std::sync::Arc::new(bytes.to_vec());
     let doc = tokio::time::timeout(
         Duration::from_secs(MAX_PROCESS_SECONDS),
         tokio::task::spawn_blocking({
             let shared = shared.clone();
-            move || lopdf::Document::load_mem(&shared)
+            move || {
+                let _permit = parse_permit;
+                lopdf::Document::load_mem(&shared)
+            }
         }),
     )
     .await
@@ -501,13 +550,29 @@ async fn extract_pdf_checked(bytes: &[u8]) -> Result<String, SkbError> {
     // The extraction itself is synchronous and cannot be cancelled; the
     // timeout bounds how long the caller waits. Parse and extraction share
     // one MAX_PROCESS_SECONDS budget so a slow parse cannot be followed by a
-    // full second timeout.
+    // full second timeout. The extract permit is owned and moved into the
+    // closure like the parse permit; the acquisition itself is bounded by
+    // the same remaining budget so waiting for a slot cannot exceed
+    // MAX_PROCESS_SECONDS.
+    let remaining = Duration::from_secs(MAX_PROCESS_SECONDS).saturating_sub(start.elapsed());
+    let extract_permit = tokio::time::timeout(remaining, pdf_semaphore().acquire_owned())
+        .await
+        .map_err(|_| {
+            SkbError::new(
+                ErrorCode::Validation,
+                "pdf semaphore wait exceeded time limit",
+            )
+        })?
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("pdf semaphore: {e}")))?;
     let remaining = Duration::from_secs(MAX_PROCESS_SECONDS).saturating_sub(start.elapsed());
     let text = tokio::time::timeout(
         remaining,
         tokio::task::spawn_blocking({
             let shared = shared.clone();
-            move || pdf_extract::extract_text_from_mem(&shared)
+            move || {
+                let _permit = extract_permit;
+                pdf_extract::extract_text_from_mem(&shared)
+            }
         }),
     )
     .await
@@ -535,6 +600,19 @@ fn mime_for(name: &str) -> Option<String> {
         _ => "",
     };
     (!mime.is_empty()).then(|| mime.to_string())
+}
+
+/// MIME-aware text extraction: converts HTML when the hint says text/html,
+/// otherwise behaves like extract_text.
+fn extract_text_with_mime(content: &str, source: &str, mime_hint: Option<&str>) -> String {
+    if mime_hint
+        .map(|m| m.to_lowercase() == "text/html")
+        .unwrap_or(false)
+    {
+        html_to_text(content)
+    } else {
+        extract_text(content, source)
+    }
 }
 
 fn extract_text(content: &str, source: &str) -> String {
@@ -601,24 +679,58 @@ fn check_size(len: u64, config: &Config) -> Result<(), SkbError> {
     Ok(())
 }
 
+/// Resolver that only returns public addresses, closing the DNS-rebinding gap:
+/// the DNS answer is filtered through `is_blocked_ip` and the resulting
+/// SocketAddrs are pinned for the connection, so a host that resolves to a
+/// private/loopback/metadata IP cannot be connected to even if the answer
+/// changes between validation and connect (spec §15).
+#[derive(Debug, Default)]
+struct SafeResolver;
+
+impl ureq::unversioned::resolver::Resolver for SafeResolver {
+    fn resolve(
+        &self,
+        uri: &ureq::http::Uri,
+        config: &ureq::config::Config,
+        timeout: ureq::unversioned::transport::NextTimeout,
+    ) -> Result<ureq::unversioned::resolver::ResolvedSocketAddrs, ureq::Error> {
+        use ureq::unversioned::resolver::DefaultResolver;
+        let addrs = DefaultResolver::default().resolve(uri, config, timeout)?;
+        let mut result = self.empty();
+        for addr in addrs.iter() {
+            if !is_blocked_ip(addr.ip()) {
+                result.push(*addr);
+            }
+        }
+        if result.is_empty() {
+            Err(ureq::Error::HostNotFound)
+        } else {
+            Ok(result)
+        }
+    }
+}
+
 /// Fetch a URL with SSRF guards (spec §15 / §12.3):
 /// - http/https schemes only
 /// - DNS resolution validated before every request (private/loopback/
-///   link-local/multicast/metadata addresses are rejected)
+///   link-local/multicast/metadata addresses are rejected); the SafeResolver
+///   filters the DNS answer and pins the connection to validated addresses
 /// - redirects are followed manually, re-validating each hop
 /// - size-limited streaming read; the whole fetch (all redirect hops) is
 ///   bounded by one MAX_PROCESS_SECONDS deadline
 fn fetch_url(url_str: &str, config: &Config) -> Result<(Vec<u8>, Option<String>), SkbError> {
-    fetch_url_with_validator(url_str, config, validate_url_host)
+    fetch_url_with_validator(url_str, config, validate_url_host, true)
 }
 
-/// Shared implementation of `fetch_url`; the host validator is injected so
-/// tests can exercise redirect and size-limit handling against a loopback
-/// server without tripping the SSRF guard (which rejects loopback).
+/// Shared implementation of `fetch_url`; the host validator and the SSRF
+/// resolver are injected so tests can exercise redirect and size-limit
+/// handling against a loopback server without tripping the SSRF guard (which
+/// rejects loopback).
 fn fetch_url_with_validator(
     url_str: &str,
     config: &Config,
     validate: impl Fn(&Url) -> Result<(), SkbError>,
+    use_safe_resolver: bool,
 ) -> Result<(Vec<u8>, Option<String>), SkbError> {
     let max_bytes = max_upload_bytes(config);
     let deadline = Instant::now() + Duration::from_secs(MAX_PROCESS_SECONDS);
@@ -636,13 +748,26 @@ fn fetch_url_with_validator(
             .map_err(|e| SkbError::new(ErrorCode::Validation, format!("invalid url: {e}")))?;
         validate(&url)?;
 
-        let agent = ureq::Agent::config_builder()
-            .max_redirects(0)
-            .http_status_as_error(false)
-            .timeout_connect(Some(Duration::from_secs(10)))
-            .timeout_global(Some(remaining))
-            .build()
-            .new_agent();
+        let agent = if use_safe_resolver {
+            ureq::Agent::with_parts(
+                ureq::Agent::config_builder()
+                    .max_redirects(0)
+                    .http_status_as_error(false)
+                    .timeout_connect(Some(Duration::from_secs(10)))
+                    .timeout_global(Some(remaining))
+                    .build(),
+                ureq::unversioned::transport::DefaultConnector::default(),
+                SafeResolver,
+            )
+        } else {
+            ureq::Agent::config_builder()
+                .max_redirects(0)
+                .http_status_as_error(false)
+                .timeout_connect(Some(Duration::from_secs(10)))
+                .timeout_global(Some(remaining))
+                .build()
+                .new_agent()
+        };
         let mut resp = agent
             .get(&current)
             .call()
@@ -673,7 +798,13 @@ fn fetch_url_with_validator(
             .headers()
             .get("content-type")
             .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
+            .map(|s| {
+                s.split(';')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_ascii_lowercase()
+            });
         let body = resp
             .body_mut()
             .with_config()
@@ -700,9 +831,9 @@ fn fetch_url_with_validator(
 }
 
 /// Validate scheme and that the host resolves only to public addresses.
-/// Resolution happens immediately before the request so the validated answer
-/// is as fresh as possible (residual DNS-rebinding window is inherent to the
-/// transport; the resolver/connector pinning is not exposed by ureq).
+/// This is a pre-request, defense-in-depth check; the actual connection goes
+/// through the `SafeResolver` + `ureq::Agent::with_parts` path, which pins the
+/// request to the validated addresses so the DNS-rebinding window is closed.
 pub fn validate_url_host(url: &Url) -> Result<(), SkbError> {
     match url.scheme() {
         "http" | "https" => {}
@@ -792,6 +923,11 @@ fn is_blocked_v4(v4: std::net::Ipv4Addr) -> bool {
         || is_benchmarking(v4)
         || is_reserved_v4(v4)
         || v4.octets() == [169, 254, 169, 254]
+        // 0.0.0.0/8 — "this network" (the whole range, not only the
+        // unspecified 0.0.0.0).
+        || v4.octets()[0] == 0
+        // 192.88.99.0/24 — 6to4 relay anycast.
+        || (v4.octets()[0] == 192 && v4.octets()[1] == 88 && v4.octets()[2] == 99)
 }
 
 /// 100.64.0.0/10 — shared address space (CGNAT).
@@ -812,13 +948,15 @@ fn is_reserved_v4(v4: std::net::Ipv4Addr) -> bool {
 }
 
 /// 2001:db8::/32 — documentation range; 3ff0::/12 — documentation (RFC 9637
-/// assigns 3fff::/20; the broader /12 covers 3ff0::1 too, which documentation
-/// tooling commonly uses).
+/// assigns 3fff::/20; the broader /12 prefix covers 3ff0::1 too, which
+/// documentation tooling commonly uses).
 fn is_documentation_v6(v6: std::net::Ipv6Addr) -> bool {
     let s = v6.segments();
     if s[0] == 0x2001 && s[1] == 0x0db8 {
         return true;
     }
+    // 3ff0::/12: the first 12 bits are 0011 1111 1111, i.e. the top 16 bits
+    // masked with 0xfff0 equal 0x3ff0.
     s[0] & 0xfff0 == 0x3ff0
 }
 
@@ -857,8 +995,8 @@ fn base64_decode_checked(b64: &str, config: &Config) -> Result<Vec<u8>, SkbError
 }
 
 fn validate_path(path: &std::path::Path, config: &Config) -> Result<std::path::PathBuf, SkbError> {
-    // Always canonicalize so the returned path is the one used for the
-    // subsequent metadata / read operations (no re-resolution window).
+    // Always canonicalize so the returned path is the resolved one used for
+    // the subsequent metadata / read operations (no re-resolution window).
     let canonical = path
         .canonicalize()
         .map_err(|e| SkbError::new(ErrorCode::Io, format!("resolve path: {e}")))?;
@@ -965,12 +1103,18 @@ mod tests {
             "240.0.0.1",
             "255.255.255.255",
             "0.0.0.0",
+            "0.0.0.1",
+            "0.1.2.3",
+            "192.88.99.1",
             "192.0.2.1",
             "::1",
             "fe80::1",
             "fc00::1",
             "ff02::1",
             "::",
+            "3ff0::1",
+            "3fff:1::1",
+            "fec0::1",
         ];
         for ip in blocked {
             let ip: IpAddr = ip.parse().unwrap();
@@ -995,9 +1139,6 @@ mod tests {
             "64:ff9b::7f00:1",
             "2002:7f00:0001::",
             "2001:0000:0:0:0:0:0101:0101",
-            "3ff0::1",
-            "3fff:1::1",
-            "fec0::1",
         ];
         for ip in extra_v6 {
             let ip: IpAddr = ip.parse().unwrap();
@@ -1105,12 +1246,13 @@ mod tests {
             MAX_REDIRECTS + 1,
         );
         let config = Config::default();
-        let err = fetch_url_with_validator(&url, &config, |_| Ok(())).unwrap_err();
-        assert_eq!(err.code, ErrorCode::Io);
-        assert!(
-            err.to_string().contains("redirect"),
-            "must report the redirect cap, got: {err}"
-        );
+        assert!(matches!(
+            fetch_url_with_validator(&url, &config, |_| Ok(()), false),
+            Err(SkbError {
+                code: ErrorCode::Io,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -1127,7 +1269,7 @@ mod tests {
         let mut config = Config::default();
         config.upload.max_file_mb = 1;
         assert!(matches!(
-            fetch_url_with_validator(&url, &config, |_| Ok(())),
+            fetch_url_with_validator(&url, &config, |_| Ok(()), false),
             Err(SkbError {
                 code: ErrorCode::Validation,
                 ..

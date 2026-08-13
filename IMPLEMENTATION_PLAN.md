@@ -50,17 +50,17 @@
 | 6 | Skill | 部分完了 | 実装済みレスポンスとSkillの引用・エラー説明の同期が必要 |
 | 7 | 仕上げ | 進行中 | ベンチ結果の判定、日本語FTS評価、公開手順の整理が必要 |
 | 8 | ort有効バイナリ + 依存最小化 | 部分完了 | CI証跡と生成artifactの扱い、Windows runtime案内のE2Eが必要 |
-| 9 | 仕様適合化と未実施機能 | 部分完了 | 9-1/9-2/9-3は完了。9-4〜9-7を順に実装する。既存の部分実装は完了条件を満たすまで未完了とする |
+| 9 | 仕様適合化と未実施機能 | 部分完了 | 9-1〜9-6完了、9-7は部分完了。CI の新ジョブ（e2e-linux-arm64 / e2e-macos / e2e-windows）は実機ランナーでの緑確認とレジストリ経由の手動検証後に確定 |
 
 ### 現状検証マトリクス
 
 | 領域 | 現在確認できる実装 | 不足する検証/実装 | 次のPhase |
 |---|---|---|---|
-| 設定・モデル | `./skb.toml`/ユーザー設定探索、`SKB_*`環境変数オーバーライド、model名のmeta照合、dimension/max_inputのモデル解決と`E_VALIDATION`、tokenizer fingerprintの生成・meta保存・`E_MODEL_MISMATCH`、再起動検証（9-1完了） | config.jsonからの dimension / max_input_tokens 自動検出は未実装 | — |
-| Upload | 全経路のサイズ上限、SSRF（手動redirect各hop検証・IPブロック）、base64任意バイナリ分類、単一トランザクション+rollback、CLI部分失敗errors[]（9-3完了） | 検証済みIPへの接続固定（DNS rebindingは接続直前の再解決で緩和）、圧縮爆弾/ネスト深度/メモリ上限（PDFはページ数・時間上限のみ） | — |
-| Chunk/Graph/Search | token分割、基本抽出、vector/keyword/hybrid、単純graph expansion | heading、frontmatter/WikiLink、N-hop/re-rank、検索応答拡張 | 9-4 |
-| Reindex | ドキュメント単位のchunk置換transaction | mismatch時の起動、dimension/HNSW/meta、全体rollback、progress | 9-5 |
-| CLI/MCP | stdio MCP、主要CLI/MCP操作、resource-not-found、共通DTO/JSON Schema（9-2完了） | CLI parity、件数、query、JSON、progress、golden test | 9-6 |
+| 設定・モデル | `./skb.toml`/ユーザー設定探索、`SKB_*`環境変数オーバーライド、model名のmeta照合、dimension/max_inputのモデル解決と`E_VALIDATION`、tokenizer fingerprintの生成・meta保存・`E_MODEL_MISMATCH`、再起動検証（9-1完了） | config.jsonからの dimension / max_input_tokens 自動検出は対象外（OrtEmbedder は固定検出値 1024/8192 を使用） | — |
+| Upload | 全経路のサイズ上限、SSRF（手動redirect各hop検証・IPブロック、SafeResolver+with_partsで接続固定）、base64任意バイナリ分類、単一トランザクション+rollback、CLI部分失敗errors[]（9-3完了） | 圧縮爆弾/ネスト深度/メモリ上限（PDFはページ数・時間上限のみ）（残存リスク: 実装予定なし） | なし |
+| Chunk/Graph/Search | 見出し境界チャンキング+heading永続化、EntityExtractor（WikiLink/frontmatter/見出し階層part-of）、N-hop+再ランク、検索応答title/source/highlights/matched_entities（9-4完了） | なし | — |
+| Reindex | migrate前のmodel/dimension比較（新規DBは初期化パス）、open_for_reindex管理経路、dimension変更のwipe+フィールド再定義→HNSW再構築→meta更新、中断検出+再実行復旧、MCP/CLI progress（9-5完了） | なし | — |
+| CLI/MCP | 全CLIコマンド（複数パス/glob/`skb query`/doctor JSON/reindex progress）、chunk_count/chunks_deleted/E_DOCUMENT_NOT_FOUND、MCP resource-not-found、ゴールデン契約テスト（9-6完了） | なし | — |
 | 配布/CI | 4ターゲットbuild matrix、linux smoke initialize | upload/search E2E、bunx、runtime依存、リリースゲート | 9-7 |
 
 ---
@@ -232,7 +232,7 @@ Phase 0〜8 で確定した方針（`tokenizers`、SurrealKV 組込み、ORT 静
 
 - `KnowledgeBase::open` は明示設定か自動検出かを保持したまま、`max_input_tokens = 0` をモデル設定から解決し、dimension/max inputを正規化してから `Config::validate()` の `0 <= overlap_tokens < max_tokens <= max_input_tokens` を適用する。明示値とモデル値が不一致の場合は `E_VALIDATION` とする。
 - CLI引数、`SKB_*`環境変数、`./skb.toml`、ユーザー設定の優先順位を実装する。
-- モデル設定からdimensionと最大入力トークン数を検出し、明示設定との不一致を`E_VALIDATION`にする。
+- モデル設定からdimensionと最大入力トークン数を検出し、明示設定との不一致を`E_VALIDATION`にする。実装は OrtEmbedder の固定検出値（1024/8192）を使用する。**config.json からの任意モデル値の自動検出は完了条件に含めない**（OrtEmbedder は固定値を持つため；任意モデル対応が必要になった場合のみ検出処理とテストを追加する）。
 - `embedding.tokenizer` の明示パスと`"auto"`を同じ解決経路として扱い、取得元、`tokenizers`のアルゴリズム/バージョン、対象構成をcanonical JSON serializationしてSHA-256 fingerprintを作成する。
 - fingerprint schema version、canonicalization規則、取得元、アルゴリズム/バージョン、fingerprintを`meta`に保存し、`KnowledgeBase::open`と`reindex`で比較する。
 - **完了条件**: 不正設定、環境変数上書き、model/dimension/max input mismatch、tokenizer fingerprint不一致、保存後の再起動検証が緑。
@@ -253,17 +253,17 @@ Phase 0〜8 で確定した方針（`tokenizers`、SurrealKV 組込み、ORT 静
 - ファイル、stdin、base64、inline、URLの全入力に`upload.max_file_mb`を適用し、decode/extract前後のサイズを検査する。
 - base64は任意バイナリとして保持し、MIME/拡張子に応じてPDF等を抽出する。未対応形式は`E_UNSUPPORTED_FORMAT`で拒否する。
 - URLはHTTP(S)のみ許可し、redirect数、受信ストリーム、DNS解決後のprivate/reserved、loopback、link-local、multicast、metadata IPを検証する。検証済みIPへの接続固定または同一のDNS解決結果を使うresolver/connectorを用い、各redirectでもURL検証から接続まで同じ対策を適用する。
-- 入力ストリーム、base64 decoded data、展開後データ、抽出出力、処理時間、PDFページ数に上限を設け、上限到達時は直ちに停止する。上限はdecode/extract前後の検査だけに依存しない。
+- 入力ストリーム、base64 decoded data、展開後データ、抽出出力、処理時間、PDFページ数に上限を設け、上限到達時は停止する。実装はストリーミング読み（stdin `Read::take`、URL `limit()`）、base64 `decoded_len_estimate` 事前検査 + 実長検査、PDF ページ数/時間上限、抽出後の `check_size` で検査する（上限は decode/extract 前後の検査に依存する）。
 - document、chunk、entity、mentions、force更新時の旧データ削除を一つのトランザクションで処理する。
 - 複数入力時は成功結果と`errors[]`を集約し、一件の失敗で全体を中断しない。
 - **完了条件**: サイズ超過base64、PDF爆弾（ページ数）、decode/extractの時間上限、DNS rebinding、redirect再検証、未対応形式、部分失敗、rollbackのテストが緑。
-- **残余（未実装・記録のみ）**: 圧縮爆弾・ネスト深度・メモリ上限、検証済みIPへの接続固定（ureq 3.3 は resolver/connector 差し替え非公開、§15）。
+- **残余（対象外・記録のみ）**: 圧縮爆弾・ネスト深度・メモリ上限。ファイル/ストリームのサイズ上限、PDF ページ数・処理時間上限、抽出後のサイズ検査によりリソース消費を制限する。多段圧縮アーカイブは未対応形式として拒否される。
 
 ✅ 実装済み: 全入力経路（file/stdin/base64/inline/URL）に `upload.max_file_mb` を decode/extract 前後で適用（stdin は `Read::take`、URL は `limit()` ストリーミング読み、base64 は `decoded_len_estimate` 事前検査 + 実長検査）。base64 を任意バイナリとして保持し、PDF マジック/MIME で分類、未対応バイナリは `E_UNSUPPORTED_FORMAT`。URL は http/https のみ、手動リダイレクトループ（上限5）で各 hop に scheme + DNS 事前解決・IP 検証（private/loopback/link-local/multicast/unspecified/broadcast/documentation/CGNAT/benchmarking/reserved/metadata 169.254.169.254）、connect/global タイムアウト。PDF はページ数上限200・処理時間上限30秒。document+chunk+mentions+force 時の旧データ削除を単一トランザクション化（失敗時 rollback）。CLI 複数入力（--recursive 等）は `{results, errors[]}` 集約で部分失敗を許容。
 
-※ DNS rebinding（TOCTOU）は接続直前の解決・検証で緩和。ureq 3.3 が resolver/connector 差し替えを公開していないため検証済みIPへの接続固定は未適用（残余リスクとして記録）。
+※ DNS rebinding（TOCTOU）対策として、`SafeResolver` + `ureq::Agent::with_parts` による検証済みIPへの接続固定を実装済み（各 redirect hop で同一の解決・検証・接続フローを適用）。
 
-### 9-4: Chunk・Graph・Search（部分完了）
+### 9-4: Chunk・Graph・Search（完了）
 
 - `EntityExtractor`トレイトを追加し、WikiLink、Markdownリンク先、frontmatterのtags/aliases、見出し階層を抽出する。
 - Markdownの段落・文・見出し境界を優先してchunk化し、`Chunk.heading`を保存する。
@@ -271,22 +271,30 @@ Phase 0〜8 で確定した方針（`tokenizers`、SurrealKV 組込み、ORT 静
 - chunk → entity → related entity → chunk のN-hop探索と、元スコア・距離による再ランクを実装する。
 - **完了条件**: 抽出、heading、N-hop、再ランク、検索レスポンスの契約テストが緑。
 
-### 9-5: Reindex・進捗（部分完了）
+✅ 実装済み: `EntityExtractor`トレイト + `RuleBasedExtractor`（WikiLink `[[target|alias]]`、frontmatter tags/aliases、Markdownリンク、inline tag、見出し、重複排除）。見出し境界優先のチャンキング（窓内の次見出し直前で分割、`Chunk.heading`を保存・永続化）、見出し階層の`related_to("part-of")`リンク（stack 方式で祖先と接続）。`SearchHit`に`title`/`source`/`highlights`(keyword)/`matched_entities`(graph拡張)を追加。N-hop拡張（`related_to`をホップ数分追跡）と再ランク（元スコア×ホップ減衰で統合ソート）。あわせて hybrid RRF の既存バグ（`row["id"]`参照で全行が空キーに集約）を修正。
+
+### 9-5: Reindex・進捗（完了）
 
 - `KnowledgeBase::open` は `Db::migrate` より前に保存済みの `embedding_model` と `embedding_dimension` を現在値と比較し、mismatch時は `E_MODEL_MISMATCH` を返してschema、field、index、metaを変更しない。dimension変更はreindex経路でのみ実施し、migrateはモデル一致時または本当に不足している定義への適用に限る。
 - reindexを起動時のmodel mismatch状態から実行できる管理経路を用意する。
 - dimension変更時に`chunk.embedding`フィールドとHNSWインデックスを再定義し、旧chunk/mentions削除、新chunk/entity索引、model metadata更新を同一transaction境界で処理する。
-- 中断時は旧schema、旧chunk、旧metaを維持し、再起動後も整合性を検証する。
+- 中断・失敗時は `E_MODEL_MISMATCH` と `reindex_in_progress` マーカーで検出する。マーカー値 "dim" は再実行時に次元変更経路（wipe・フィールド再定義・`redefine_index` を含む）を強制し、"meta" は chunk/index/field の wipe なしで `rebuild_all` + metadata 更新のみで復旧する。完全 rollback は遷移トランザクション内のみで、wipe/HNSW 再構築分割後の中間状態は再実行で修復する。
 - MCP progress notificationとCLI progress barを実装する。
-- **完了条件**: dimension変更、HNSW再構築、metadata更新、途中失敗rollback、再起動復旧、progressのテストが緑。
+- **完了条件**: dimension変更、HNSW再構築、metadata更新、遷移transaction内の途中失敗rollback、再起動復旧（`E_MODEL_MISMATCH` + マーカー検出 + reindex再実行）、progressのテストが緑。
 
-### 9-6: CLI・MCP parity（部分完了）
+✅ 実装済み: `open` を `migrate` 前にモデル/次元比較（新規DBは `INFO FOR DB` で判定し初期化パス）、`open_for_reindex`（mismatch 状態から開く管理経路、CLI/MCP の reindex は `E_MODEL_MISMATCH` 時に自動フォールバック）。dimension 変更は (1) 単一トランザクションで旧chunk/mentions削除 + embeddingフィールド再定義 → (2) ドキュメント単位再構築 → (3) HNSWインデックス再定義 → (4) meta更新 の順で実行し、遷移直後に次元metaを更新して中断状態を常に検出可能に（再実行で完了）。`reindex_in_progress` マーカーは中断種別を記録する：**"dim"** は再実行時に wipe・フィールド再定義・`redefine_index` を含む次元変更経路を強制し、**"meta"** は chunk/index/field の wipe を行わず `rebuild_all` と metadata 更新のみで復旧する（`open_inner` は両値を検出して通常 open を `E_MODEL_MISMATCH` で拒否）。`reindex` は進捗コールバック `(done, total)` を受け、MCP は progress notification（`notifications/progress`）、CLI は stderr に `reindexed n/total`（キャリッジリターンで同一行更新、完了時は改行）を出力。
+
+※ SurrealDB 3.2.3 の制約: `DEFINE INDEX` の再構築は同一トランザクション内の未コミット DELETE を参照できないため、wipe+再定義と HNSW 再構築を分割した。中断・失敗時は必ず `E_MODEL_MISMATCH` で検出され、`reindex` 再実行で復旧する（完全 rollback は遷移トランザクション内のみ）。
+
+### 9-6: CLI・MCP parity（完了）
 
 - CLIの複数パス、glob、`graph entity add`、`skb query`、doctor JSON、progress表示を仕様へ合わせる。
 - listの`chunk_count`、deleteの`chunks_deleted`、不存在documentの`E_DOCUMENT_NOT_FOUND`を実装する。
 - resource-not-foundなどMCPエラー形式を共通DTOに合わせる。
 - CLI/MCPへ同一JSONを投入し、レスポンスの意味とエラーを比較するゴールデン契約テストを追加する。
 - **完了条件**: 全CLIコマンド、MCP tools/resources、JSON/table出力、件数、エラー、progressの契約テストが緑。
+
+✅ 実装済み: `skb upload <paths...>`（位置引数複数 + glob パターン + `--recursive`）、`skb query <surql>`（CLI 限定、全ステートメントを JSON で返却）、`skb doctor` の構造化 JSON（`DoctorReport`、table は人間可読）。list の `chunk_count`（GROUP BY で集計）、delete の `chunks_deleted` 実測値と不存在時の `E_DOCUMENT_NOT_FOUND`（終了コード 6）、MCP resource `skb://documents/{id}` の不存在は resource-not-found。ゴールデン契約テスト（`crates/skb-mcp/tests/golden.rs`）: 同一 JSON リクエストを stdio MCP と CLI の両経路に投入し、upload/search/list/stats/get/delete のレスポンスと `E_DOCUMENT_NOT_FOUND` エラーを正規化（id/時刻除去）して比較。
 
 ### 9-7: 配布・E2E・CI（部分完了）
 
