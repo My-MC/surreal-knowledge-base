@@ -144,10 +144,10 @@ impl Db {
             .map_err(|e| SkbError::new(ErrorCode::Db, format!("migrate check: {e}")))?;
         // chunk_document_idx assumes (document, idx) is unique; a legacy store
         // with duplicates would silently corrupt index lookups (graph
-        // expansion, deletes), so abort startup instead of building the index
-        // on top of bad data. Runs after the schema so `chunk` exists even on
-        // a fresh store (the index is non-UNIQUE, so the schema itself never
-        // fails on duplicates).
+        // expansion, deletes), so abort startup on duplicates. Runs after the
+        // schema and index are applied (the index is non-UNIQUE, so applying
+        // it first never fails on duplicates; the duplicate check then runs
+        // against the applied store).
         let dup_sql = "SELECT document, idx FROM \
                        (SELECT document, idx, count() AS c FROM chunk \
                         GROUP BY document, idx) WHERE c > 1 LIMIT 10";
