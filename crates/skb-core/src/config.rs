@@ -147,6 +147,21 @@ impl std::str::FromStr for SearchMode {
     }
 }
 
+impl std::str::FromStr for StorageMode {
+    type Err = crate::error::SkbError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "embedded" => Ok(StorageMode::Embedded),
+            "remote" => Ok(StorageMode::Remote),
+            other => Err(crate::error::SkbError::new(
+                crate::error::ErrorCode::Validation,
+                format!("unknown storage mode: {other}"),
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UploadConfig {
@@ -188,6 +203,20 @@ impl Config {
         if let Some(v) = env_opt("SKB_STORAGE_PATH")? {
             self.storage.path = PathBuf::from(v);
         }
+        if let Some(v) = env_opt("SKB_STORAGE_MODE")? {
+            self.storage.mode = v
+                .parse::<StorageMode>()
+                .with_context(|| format!("SKB_STORAGE_MODE invalid, got '{v}'"))?;
+        }
+        if let Some(v) = env_opt("SKB_STORAGE_URL")? {
+            self.storage.url = Some(v);
+        }
+        if let Some(v) = env_opt("SKB_STORAGE_USERNAME")? {
+            self.storage.username = Some(v);
+        }
+        if let Some(v) = env_opt("SKB_STORAGE_PASSWORD")? {
+            self.storage.password = Some(v);
+        }
         if let Some(v) = env_opt("SKB_STORAGE_NAMESPACE")? {
             self.storage.namespace = v;
         }
@@ -203,35 +232,53 @@ impl Config {
         if let Some(v) = env_opt("SKB_EMBEDDING_TOKENIZER")? {
             self.embedding.tokenizer = v;
         }
-        if let Some(v) = env_parse::<usize>("SKB_EMBEDDING_DIMENSION")? {
-            self.embedding.dimension = v;
+        if let Some(v) = env_opt("SKB_EMBEDDING_DIMENSION")? {
+            self.embedding.dimension = v
+                .parse()
+                .with_context(|| format!("SKB_EMBEDDING_DIMENSION must be a number, got '{v}'"))?;
         }
-        if let Some(v) = env_parse::<usize>("SKB_EMBEDDING_MAX_INPUT_TOKENS")? {
-            self.embedding.max_input_tokens = v;
+        if let Some(v) = env_opt("SKB_EMBEDDING_MAX_INPUT_TOKENS")? {
+            self.embedding.max_input_tokens = v.parse().with_context(|| {
+                format!("SKB_EMBEDDING_MAX_INPUT_TOKENS must be a number, got '{v}'")
+            })?;
         }
         if let Some(v) = env_opt("SKB_EMBEDDING_DEVICE")? {
             self.embedding.device = v;
         }
-        if let Some(v) = env_parse::<usize>("SKB_EMBEDDING_BATCH_SIZE")? {
-            self.embedding.batch_size = v;
+        if let Some(v) = env_opt("SKB_EMBEDDING_BATCH_SIZE")? {
+            self.embedding.batch_size = v
+                .parse()
+                .with_context(|| format!("SKB_EMBEDDING_BATCH_SIZE must be a number, got '{v}'"))?;
         }
-        if let Some(v) = env_parse::<usize>("SKB_CHUNKING_MAX_TOKENS")? {
-            self.chunking.max_tokens = v;
+        if let Some(v) = env_opt("SKB_CHUNKING_MAX_TOKENS")? {
+            self.chunking.max_tokens = v
+                .parse()
+                .with_context(|| format!("SKB_CHUNKING_MAX_TOKENS must be a number, got '{v}'"))?;
         }
-        if let Some(v) = env_parse::<usize>("SKB_CHUNKING_OVERLAP_TOKENS")? {
-            self.chunking.overlap_tokens = v;
+        if let Some(v) = env_opt("SKB_CHUNKING_OVERLAP_TOKENS")? {
+            self.chunking.overlap_tokens = v.parse().with_context(|| {
+                format!("SKB_CHUNKING_OVERLAP_TOKENS must be a number, got '{v}'")
+            })?;
         }
         if let Some(v) = env_opt("SKB_SEARCH_DEFAULT_MODE")? {
-            self.search.default_mode = v.parse::<SearchMode>()?;
+            self.search.default_mode = v
+                .parse::<SearchMode>()
+                .with_context(|| format!("SKB_SEARCH_DEFAULT_MODE invalid, got '{v}'"))?;
         }
-        if let Some(v) = env_parse::<usize>("SKB_SEARCH_TOP_K")? {
-            self.search.top_k = v;
+        if let Some(v) = env_opt("SKB_SEARCH_TOP_K")? {
+            self.search.top_k = v
+                .parse()
+                .with_context(|| format!("SKB_SEARCH_TOP_K must be a number, got '{v}'"))?;
         }
-        if let Some(v) = env_parse::<usize>("SKB_SEARCH_RRF_K")? {
-            self.search.rrf_k = v;
+        if let Some(v) = env_opt("SKB_SEARCH_RRF_K")? {
+            self.search.rrf_k = v
+                .parse()
+                .with_context(|| format!("SKB_SEARCH_RRF_K must be a number, got '{v}'"))?;
         }
-        if let Some(v) = env_parse::<u64>("SKB_UPLOAD_MAX_FILE_MB")? {
-            self.upload.max_file_mb = v;
+        if let Some(v) = env_opt("SKB_UPLOAD_MAX_FILE_MB")? {
+            self.upload.max_file_mb = v
+                .parse()
+                .with_context(|| format!("SKB_UPLOAD_MAX_FILE_MB must be a number, got '{v}'"))?;
         }
         if let Some(v) = env_opt("SKB_UPLOAD_ALLOWED_DIRS")? {
             let dirs: Vec<PathBuf> = v
@@ -240,8 +287,9 @@ impl Config {
                 .filter(|p| !p.as_os_str().is_empty())
                 .collect();
             if dirs.is_empty() {
-                // Present but all entries empty would silently disable the
-                // allowed-directories restriction; reject the configuration.
+                // Present but all entries empty (empty string, commas,
+                // whitespace) would silently disable the allowed-directories
+                // restriction; reject the configuration.
                 anyhow::bail!(
                     "SKB_UPLOAD_ALLOWED_DIRS must list at least one directory, got '{v}'"
                 );
@@ -390,21 +438,6 @@ fn env_opt(key: &str) -> anyhow::Result<Option<String>> {
         Ok(value) => Ok(Some(value)),
         Err(std::env::VarError::NotPresent) => Ok(None),
         Err(std::env::VarError::NotUnicode(_)) => Err(anyhow::anyhow!("{key} must be unicode")),
-    }
-}
-
-/// Fetch a numeric `SKB_*` value and parse it, attaching contextual error
-/// messages. Shared by all numeric environment overrides.
-fn env_parse<T>(key: &str) -> anyhow::Result<Option<T>>
-where
-    T: std::str::FromStr,
-{
-    match env_opt(key)? {
-        Some(v) => match v.parse::<T>() {
-            Ok(value) => Ok(Some(value)),
-            Err(_) => Err(anyhow::anyhow!("{key} must be a number, got '{v}'")),
-        },
-        None => Ok(None),
     }
 }
 
@@ -567,14 +600,36 @@ mod tests {
     }
 
     #[test]
-    fn env_override_beats_default_config() {
+    fn load_works_without_config_file_when_env_set() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let _model = EnvGuard::set("SKB_EMBEDDING_MODEL", "env-only-model");
-        // Exercise the env-override path directly (Config::default() + env),
-        // independent of any ./skb.toml that may exist in the caller's cwd:
-        // the env value must win over the default config.
-        let mut config = Config::default();
-        config.apply_env_overrides().unwrap();
+        // Run Config::load() from an isolated cwd with no config file: it must
+        // fall back to defaults and apply the environment override.
+        let original = std::env::current_dir().unwrap();
+        let isolated =
+            std::path::PathBuf::from(format!("./target/skb-config-test-{}", std::process::id()));
+        std::fs::create_dir_all(&isolated).unwrap();
+        std::env::set_current_dir(&isolated).unwrap();
+        let _cwd_guard = CwdGuard::new(original);
+        let config = Config::load().unwrap();
+        let _ = std::fs::remove_dir_all(&isolated);
         assert_eq!(config.embedding.model, "env-only-model");
+    }
+
+    /// Restores the original current directory on drop, including on panic.
+    struct CwdGuard {
+        original: std::path::PathBuf,
+    }
+
+    impl CwdGuard {
+        fn new(original: std::path::PathBuf) -> Self {
+            Self { original }
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.original);
+        }
     }
 }

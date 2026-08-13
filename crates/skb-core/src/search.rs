@@ -11,13 +11,17 @@ use std::collections::HashMap;
 /// request validation, the JSON Schema and the config validation.
 pub const MAX_TOP_K: usize = 1000;
 
+/// Maximum graph-expansion hop depth. Shared by the request validation and
+/// the JSON Schema so the two cannot drift.
+pub const MAX_GRAPH_EXPAND: usize = 5;
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SearchRequest {
     pub query: String,
     pub mode: Option<SearchMode>,
     #[schemars(range(min = 1, max = MAX_TOP_K))]
     pub top_k: Option<usize>,
-    #[schemars(range(min = 0, max = 5))]
+    #[schemars(range(min = 0, max = MAX_GRAPH_EXPAND))]
     pub graph_expand: Option<usize>,
     pub filter: Option<HashMap<String, String>>,
 }
@@ -45,10 +49,10 @@ impl SearchRequest {
             }
         }
         if let Some(depth) = self.graph_expand {
-            if depth > 5 {
+            if depth > MAX_GRAPH_EXPAND {
                 return Err(SkbError::new(
                     ErrorCode::Validation,
-                    "graph_expand must be at most 5",
+                    format!("graph_expand must be at most {MAX_GRAPH_EXPAND}"),
                 ));
             }
         }
@@ -125,12 +129,7 @@ async fn vector_search(
         .next()
         .ok_or_else(|| SkbError::new(ErrorCode::Embedding, "no embedding"))?;
 
-    let emb_str = serde_json::to_string(&query_emb).map_err(|e| {
-        SkbError::new(
-            ErrorCode::Embedding,
-            format!("serialize query embedding: {e}"),
-        )
-    })?;
+    let emb_str = serde_json::to_string(&query_emb).unwrap_or_default();
     let sql = format!(
         "SELECT content, idx, meta::id(document) AS document, \
          document.title AS title, document.source AS source, \
@@ -154,7 +153,7 @@ async fn vector_search(
 async fn keyword_search(db: &Db, query: &str, top_k: usize) -> Result<Vec<SearchHit>, SkbError> {
     let sql = "SELECT content, idx, meta::id(document) AS document, \
          document.title AS title, document.source AS source, search::score(0) AS score \
-         FROM chunk WHERE content @@ $q ORDER BY score DESC LIMIT $top";
+         FROM chunk WHERE content @0@ $q ORDER BY score DESC LIMIT $top";
 
     let mut r = db
         .db
@@ -187,15 +186,9 @@ async fn hybrid_search(
         .into_iter()
         .next()
         .ok_or_else(|| SkbError::new(ErrorCode::Embedding, "no embedding"))?;
-    let emb_str = serde_json::to_string(&query_emb).map_err(|e| {
-        SkbError::new(
-            ErrorCode::Embedding,
-            format!("serialize query embedding: {e}"),
-        )
-    })?;
+    let emb_str = serde_json::to_string(&query_emb).unwrap_or_default();
 
-    // Vector results: explicit ordering by the computed score (descending)
-    // and a fetch_k limit so RRF ranks a deterministic, bounded candidate set.
+    // Vector results
     let vsql = format!(
         "SELECT content, idx, meta::id(id) AS chunk_id, \
          meta::id(document) AS document, \
@@ -217,7 +210,7 @@ async fn hybrid_search(
     let ksql = "SELECT content, idx, meta::id(id) AS chunk_id, \
          meta::id(document) AS document, \
          document.title AS title, document.source AS source, search::score(0) AS score \
-         FROM chunk WHERE content @@ $q ORDER BY score DESC LIMIT $fetch";
+         FROM chunk WHERE content @0@ $q ORDER BY score DESC LIMIT $fetch";
     let mut r = db
         .db
         .query(ksql)
@@ -229,7 +222,8 @@ async fn hybrid_search(
         .take(0)
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("hybrid kw take: {e}")))?;
 
-    // RRF merge
+    // RRF merge. keyword_matched marks chunks matched by the keyword leg so
+    // only those receive highlights; pure vector hits stay None.
     struct RankedHit {
         score: f64,
         content: String,
@@ -281,9 +275,13 @@ async fn hybrid_search(
 
     let mut sorted: Vec<_> = scores.into_iter().collect();
     sorted.sort_by(|a, b| {
+        // Deterministic ordering: equal RRF scores fall back to the chunk id
+        // so truncate(top_k) keeps the same hits regardless of HashMap
+        // iteration order.
         b.1.score
             .partial_cmp(&a.1.score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
     });
     sorted.truncate(top_k);
 
@@ -298,7 +296,7 @@ async fn hybrid_search(
                 let content_lower = content.to_lowercase();
                 let filtered: Vec<String> = highlights
                     .iter()
-                    .filter(|t| content_lower.contains(&t.to_lowercase()))
+                    .filter(|t| content_lower.contains(t.as_str()))
                     .cloned()
                     .collect();
                 Some(filtered)
@@ -332,7 +330,7 @@ fn rows_to_hits(
             let content_lower = content.to_lowercase();
             terms
                 .iter()
-                .filter(|t| content_lower.contains(&t.to_lowercase()))
+                .filter(|t| content_lower.contains(t.as_str()))
                 .cloned()
                 .collect()
         });

@@ -22,13 +22,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Upload a document
+    /// Upload documents (multiple paths, glob patterns, --recursive for dirs)
     Upload {
+        #[arg(help = "files or glob patterns to upload")]
+        paths: Vec<String>,
         #[arg(long)]
-        path: Option<String>,
-        #[arg(long, conflicts_with = "path")]
         url: Option<String>,
-        #[arg(long, conflicts_with_all = ["path", "url"])]
+        #[arg(long)]
         stdin: bool,
         #[arg(long)]
         title: Option<String>,
@@ -40,7 +40,7 @@ enum Commands {
         metadata: Option<String>,
         #[arg(long, help = "upload all files under a directory path")]
         recursive: bool,
-        #[arg(long, conflicts_with_all = ["path", "url"], requires = "stdin", help = "read base64-encoded content from stdin")]
+        #[arg(long, conflicts_with_all = ["paths", "url"], requires = "stdin", help = "read base64-encoded content from stdin")]
         base64: bool,
     },
     /// Search documents
@@ -88,6 +88,8 @@ enum Commands {
         #[arg(long, help = "report what a reindex would do without mutating")]
         dry_run: bool,
     },
+    /// Execute raw SurrealQL (advanced; not available via MCP)
+    Query { surql: String },
     /// Configuration management
     Config {
         #[command(subcommand)]
@@ -146,7 +148,13 @@ fn output(val: &impl serde::Serialize, format: &str) -> Result<()> {
                 println!("{t}");
             }
         }
-        f => anyhow::bail!("unknown format: {f}"),
+        f => {
+            return Err(skb_core::error::SkbError::new(
+                skb_core::error::ErrorCode::Validation,
+                format!("unknown format: {f}"),
+            )
+            .into());
+        }
     }
     Ok(())
 }
@@ -155,7 +163,16 @@ fn output(val: &impl serde::Serialize, format: &str) -> Result<()> {
 fn collect_files(dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
+    // Canonicalized visited directories: a symlink pointing at an ancestor
+    // would otherwise loop forever. Directories are recorded (and skipped if
+    // already seen) before being pushed onto the stack.
+    let mut visited: std::collections::HashSet<std::path::PathBuf> =
+        std::collections::HashSet::new();
     while let Some(cur) = stack.pop() {
+        let canonical = cur.canonicalize().unwrap_or_else(|_| cur.clone());
+        if !visited.insert(canonical) {
+            continue;
+        }
         for entry in std::fs::read_dir(&cur)? {
             let entry = entry?;
             let path = entry.path();
@@ -242,6 +259,7 @@ async fn run(cli: &Cli) -> Result<u8> {
                     limit: Some(*limit),
                     offset: Some(*offset),
                     order,
+                    after: None,
                 })
                 .await?;
             output(&docs, &fmt)?;
@@ -258,7 +276,11 @@ async fn run(cli: &Cli) -> Result<u8> {
         }
         Commands::Delete { id, yes } => {
             if !yes {
-                anyhow::bail!("use --yes to confirm deletion of {id}");
+                return Err(skb_core::error::SkbError::new(
+                    skb_core::error::ErrorCode::Validation,
+                    format!("use --yes to confirm deletion of {id}"),
+                )
+                .into());
             }
             let kb = KnowledgeBase::open(cfg()?).await?;
             let result = kb
@@ -274,10 +296,48 @@ async fn run(cli: &Cli) -> Result<u8> {
         Commands::Doctor => {
             let kb = KnowledgeBase::open(cfg()?).await?;
             let report = kb.doctor().await?;
-            println!("{report}");
+            if fmt == "json" {
+                output(&report, &fmt)?;
+            } else {
+                println!("=== SKB Doctor ===");
+                println!(
+                    "DB connection: {}",
+                    if report.db_connected {
+                        "[OK]"
+                    } else {
+                        "[FAIL]"
+                    }
+                );
+                println!("Embedding dim: {}", report.embedding_dimension);
+                println!("Tokenizer vocab: {}", report.tokenizer_vocab);
+                println!("Model: {}", report.model);
+                println!("Schema ver: {}", report.schema_version);
+                println!("Tokenizer ver: {}", report.tokenizer_version);
+                println!(
+                    "Fingerprint schema: {}",
+                    report.tokenizer_fingerprint_schema
+                );
+                for error in &report.errors {
+                    println!("[ERROR] {error}");
+                }
+                if report.is_healthy() {
+                    println!("Status: healthy");
+                } else {
+                    println!("Status: {} problem(s) found", report.errors.len());
+                }
+            }
+            // An unhealthy report exits non-zero so scripts can react.
+            if !report.is_healthy() {
+                return Ok(1);
+            }
+        }
+        Commands::Query { surql } => {
+            let kb = KnowledgeBase::open(cfg()?).await?;
+            let result = kb.query_surql(surql).await?;
+            output(&result, &fmt)?;
         }
         Commands::Upload {
-            path,
+            paths,
             url,
             stdin,
             title,
@@ -294,30 +354,92 @@ async fn run(cli: &Cli) -> Result<u8> {
                 .transpose()?
                 .unwrap_or_default();
 
-            // Expand a directory path into individual files when --recursive.
-            // A URL input takes precedence: `--url --recursive` (no --path)
-            // follows the single-URL upload flow instead of erroring.
-            let mut paths: Vec<String> = Vec::new();
-            if *recursive && url.is_none() {
-                if let Some(p) = path {
-                    let p = std::path::Path::new(p);
-                    if p.is_dir() {
-                        for entry in collect_files(p)? {
-                            paths.push(entry.display().to_string());
-                        }
-                    } else {
-                        paths.push(p.display().to_string());
-                    }
-                } else {
-                    anyhow::bail!("--recursive requires --path to a directory");
-                }
-            } else if let Some(p) = path {
-                paths.push(p.clone());
+            // Exactly one input source may be given (spec §12.3); a conflict
+            // between --stdin, --url, and paths is rejected before any
+            // expansion or work.
+            let active_sources = [*stdin, url.is_some(), !paths.is_empty()]
+                .into_iter()
+                .filter(|present| *present)
+                .count();
+            if active_sources > 1 {
+                return Err(skb_core::error::SkbError::new(
+                    skb_core::error::ErrorCode::Validation,
+                    "specify exactly one of --stdin, --url, or paths, not several".to_string(),
+                )
+                .into());
             }
 
-            let build = |p: Option<String>, c: Option<String>, b64: Option<String>| UploadRequest {
+            // Expand positional paths: glob patterns, and directories when
+            // --recursive (spec §12.2: 複数・glob・--recursive).
+            // The output shape depends on the ORIGINAL input form: glob
+            // patterns and multiple positional inputs are multi-input
+            // uploads ({results, errors} envelope), even when a glob matches
+            // exactly one file; only one explicitly provided path keeps the
+            // direct UploadResult shape.
+            let mut expanded: Vec<String> = Vec::new();
+            // Multi-input envelope whenever multiple paths are given OR a
+            // --recursive directory expansion is requested (even if it yields
+            // exactly one file).
+            let mut multi_input = paths.len() > 1 || (*recursive && !paths.is_empty());
+            for pattern in paths {
+                if pattern.contains(['*', '?', '[']) {
+                    multi_input = true;
+                    let entries = glob::glob(pattern)
+                        .map_err(|e| anyhow::anyhow!("invalid glob '{pattern}': {e}"))?;
+                    let mut matched = false;
+                    for entry in entries {
+                        let path = entry.map_err(|e| anyhow::anyhow!("glob '{pattern}': {e}"))?;
+                        matched = true;
+                        if *recursive && path.is_dir() {
+                            for file in collect_files(&path)? {
+                                expanded.push(file.display().to_string());
+                            }
+                        } else if path.is_file() {
+                            expanded.push(path.display().to_string());
+                        }
+                    }
+                    if !matched {
+                        return Err(skb_core::error::SkbError::new(
+                            skb_core::error::ErrorCode::Validation,
+                            format!("no files match '{pattern}'"),
+                        )
+                        .into());
+                    }
+                } else {
+                    let path = std::path::Path::new(pattern);
+                    if *recursive && path.is_dir() {
+                        for file in collect_files(path)? {
+                            expanded.push(file.display().to_string());
+                        }
+                    } else if path.is_dir() {
+                        return Err(skb_core::error::SkbError::new(
+                            skb_core::error::ErrorCode::Validation,
+                            "no files to upload: input is a directory; use --recursive".to_string(),
+                        )
+                        .into());
+                    } else {
+                        expanded.push(pattern.clone());
+                    }
+                }
+            }
+            // A glob matching only directories (non-recursive) leaves `expanded`
+            // empty even though the user did provide inputs; report that with a
+            // dedicated message instead of the misleading "no input" error.
+            if !paths.is_empty() && expanded.is_empty() {
+                return Err(skb_core::error::SkbError::new(
+                    skb_core::error::ErrorCode::Validation,
+                    "no files to upload: matched entries are directories; use --recursive"
+                        .to_string(),
+                )
+                .into());
+            }
+
+            let build = |p: Option<String>,
+                         u: Option<String>,
+                         c: Option<String>,
+                         b64: Option<String>| UploadRequest {
                 path: p,
-                url: url.clone(),
+                url: u,
                 content: c,
                 content_base64: b64,
                 title: title.clone(),
@@ -328,37 +450,36 @@ async fn run(cli: &Cli) -> Result<u8> {
 
             if *stdin {
                 // Bound stdin reads by upload.max_file_mb (spec §12.3).
-                // Base64 input can be up to 4/3 of the decoded size, so the
-                // read cap is scaled for the base64 branch; the byte-length
-                // validation below still rejects any input whose DECODED size
-                // would exceed max.
+                // Both branches share one read + byte-size validation + UTF-8
+                // conversion; only the build argument differs (base64 vs
+                // content).
                 let max = kb.config().upload.max_file_mb.saturating_mul(1024 * 1024);
-                let read_cap = if *base64 {
-                    max.saturating_mul(4).saturating_div(3).saturating_add(1)
-                } else {
-                    max.saturating_add(1)
-                };
+                let read_cap = max.saturating_add(1);
                 let mut raw = Vec::new();
                 std::io::stdin().take(read_cap).read_to_end(&mut raw)?;
                 if raw.len() as u64 > max {
-                    anyhow::bail!("stdin exceeds upload.max_file_mb");
+                    return Err(skb_core::error::SkbError::new(
+                        skb_core::error::ErrorCode::Validation,
+                        "stdin exceeds upload.max_file_mb".to_string(),
+                    )
+                    .into());
                 }
                 let content = String::from_utf8(raw)?;
                 let result = if *base64 {
-                    kb.upload(build(None, None, Some(content))).await?
+                    kb.upload(build(None, None, None, Some(content))).await?
                 } else {
-                    kb.upload(build(None, Some(content), None)).await?
+                    kb.upload(build(None, None, Some(content), None)).await?
                 };
                 output(&result, &fmt)?;
-            } else if paths.len() > 1 {
+            } else if expanded.len() > 1 || multi_input {
                 // Multi-input uploads: successful uploads are committed and
                 // returned in `results`, failures are aggregated in `errors`
                 // (spec §12.3). A single input keeps the direct UploadResult
                 // shape with top-level document_id/status fields.
                 let mut results: Vec<serde_json::Value> = Vec::new();
                 let mut errors: Vec<serde_json::Value> = Vec::new();
-                for p in paths {
-                    match kb.upload(build(Some(p.clone()), None, None)).await {
+                for p in expanded {
+                    match kb.upload(build(Some(p.clone()), None, None, None)).await {
                         Ok(result) => results.push(serde_json::to_value(result)?),
                         Err(e) => errors.push(serde_json::json!({
                             "input": p,
@@ -384,19 +505,21 @@ async fn run(cli: &Cli) -> Result<u8> {
                     let _ = std::io::stdout().flush();
                     return Ok(1);
                 }
-            } else if let Some(p) = paths.first() {
-                // Single collected input: use the discovered file (recursive
-                // expansions with exactly one file included), never the
-                // original directory path.
-                let result = kb.upload(build(Some(p.clone()), None, None)).await?;
-                output(&result, &fmt)?;
             } else if url.is_some() {
-                // URL-only upload: no path input; build with an empty path so
-                // the URL is preserved and upload proceeds.
-                let result = kb.upload(build(None, None, None)).await?;
+                // Single URL upload keeps the direct UploadResult shape.
+                let result = kb.upload(build(None, url.clone(), None, None)).await?;
+                output(&result, &fmt)?;
+            } else if expanded.len() == 1 {
+                // Single input keeps the direct UploadResult shape.
+                let p = expanded.into_iter().next().expect("len == 1");
+                let result = kb.upload(build(Some(p), None, None, None)).await?;
                 output(&result, &fmt)?;
             } else {
-                anyhow::bail!("no files to upload");
+                return Err(skb_core::error::SkbError::new(
+                    skb_core::error::ErrorCode::Validation,
+                    "no input: provide paths, --url, or --stdin".to_string(),
+                )
+                .into());
             }
         }
         Commands::Search {
@@ -411,10 +534,18 @@ async fn run(cli: &Cli) -> Result<u8> {
                 .iter()
                 .map(|kv| {
                     kv.split_once('=').map_or_else(
-                        || anyhow::bail!("invalid filter '{kv}'; expected KEY=VALUE"),
+                        || {
+                            Err(skb_core::error::SkbError::new(
+                                skb_core::error::ErrorCode::Validation,
+                                format!("invalid filter '{kv}'; expected KEY=VALUE"),
+                            ))
+                        },
                         |(k, v)| {
                             if k.is_empty() {
-                                anyhow::bail!("invalid filter '{kv}'; key must not be empty")
+                                return Err(skb_core::error::SkbError::new(
+                                    skb_core::error::ErrorCode::Validation,
+                                    format!("invalid filter '{kv}'; key must not be empty"),
+                                ));
                             }
                             Ok((k.to_string(), v.to_string()))
                         },
@@ -486,30 +617,22 @@ async fn run(cli: &Cli) -> Result<u8> {
         Commands::Reindex { dry_run } => {
             // A model/dimension/tokenizer mismatch blocks normal open; reindex
             // is the management path out of that state (spec §9-5).
-            // open_or_for_reindex retries transient file-lock races from the
-            // first failed open and falls back to open_for_reindex on mismatch.
             let config = cfg()?;
-            let kb = skb_core::KnowledgeBase::open_or_for_reindex(config).await?;
-            let req = skb_core::reindex::ReindexRequest { dry_run: *dry_run };
-            // Live \r-based progress only on a terminal; for piped stderr
-            // (CI logs) suppress intermediate updates. Track whether any TTY
-            // progress was actually emitted to decide on the trailing
-            // newline.
-            let stderr_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
-            let emitted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let emitted_cb = emitted.clone();
-            let progress = move |done: usize, total: usize| {
-                if stderr_tty {
-                    emitted_cb.store(true, std::sync::atomic::Ordering::Relaxed);
-                    eprint!("\rreindexed {done}/{total}");
-                    let _ = std::io::Write::flush(&mut std::io::stderr());
+            let kb = match KnowledgeBase::open(config.clone()).await {
+                Ok(kb) => kb,
+                Err(e) if e.code == skb_core::error::ErrorCode::ModelMismatch => {
+                    KnowledgeBase::open_for_reindex(config).await?
                 }
+                Err(e) => return Err(e.into()),
+            };
+            let req = skb_core::reindex::ReindexRequest { dry_run: *dry_run };
+            let progress = |done: usize, total: usize| {
+                eprint!("\rreindexed {done}/{total}");
+                let _ = std::io::Write::flush(&mut std::io::stderr());
             };
             let result = kb.reindex(&req, Some(&progress)).await?;
-            if emitted.load(std::sync::atomic::Ordering::Relaxed) {
+            if !*dry_run {
                 eprintln!();
-            } else if !*dry_run {
-                eprintln!("reindexed {} documents", result.documents_processed);
             }
             output(&result, &fmt)?;
         }
@@ -550,7 +673,11 @@ fn set_config(key: &str, value: &str) -> Result<()> {
 
     let parts: Vec<&str> = key.trim().split('.').filter(|s| !s.is_empty()).collect();
     if parts.is_empty() {
-        anyhow::bail!("invalid key: {key}");
+        return Err(skb_core::error::SkbError::new(
+            skb_core::error::ErrorCode::Validation,
+            format!("invalid key: {key}"),
+        )
+        .into());
     }
 
     // Walk (or create) nested tables for all but the last segment.
@@ -600,16 +727,7 @@ fn parse_scalar_item(raw: &str) -> toml_edit::Item {
 }
 
 fn cfg() -> Result<Config> {
-    // Map configuration-loading failures (TOML parse, invalid SKB_* numeric
-    // values, missing/invalid file) to E_CONFIG so the CLI reports the
-    // correct error code and exit status.
-    Config::load().map_err(|e| {
-        let err = skb_core::error::SkbError::new(
-            skb_core::error::ErrorCode::Config,
-            format!("failed to load config: {e:#}"),
-        );
-        anyhow::Error::from(err)
-    })
+    Config::load()
 }
 
 #[cfg(test)]
@@ -620,29 +738,11 @@ mod tests {
     #[test]
     fn upload_base64_requires_stdin() {
         assert!(Cli::try_parse_from(["skb", "upload", "--base64"]).is_err());
-        assert!(Cli::try_parse_from(["skb", "upload", "--base64", "--path", "a.md"]).is_err());
+        assert!(Cli::try_parse_from(["skb", "upload", "--base64", "a.md"]).is_err());
         assert!(
             Cli::try_parse_from(["skb", "upload", "--base64", "--url", "https://x.example/a"])
                 .is_err()
         );
         assert!(Cli::try_parse_from(["skb", "upload", "--base64", "--stdin"]).is_ok());
-    }
-
-    #[test]
-    fn upload_rejects_multiple_input_sources() {
-        assert!(Cli::try_parse_from(["skb", "upload", "--path", "a.md", "--stdin"]).is_err());
-        assert!(Cli::try_parse_from([
-            "skb",
-            "upload",
-            "--path",
-            "a.md",
-            "--url",
-            "https://x.example/a"
-        ])
-        .is_err());
-        assert!(
-            Cli::try_parse_from(["skb", "upload", "--url", "https://x.example/a", "--stdin"])
-                .is_err()
-        );
     }
 }

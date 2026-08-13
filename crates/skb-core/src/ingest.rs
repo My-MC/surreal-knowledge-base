@@ -130,6 +130,18 @@ pub async fn upload(
     req.validate()?;
     let force = req.force.unwrap_or(false);
     let doc = extract_document_data(req, config).await?;
+    let existed = doc_exists(db, &doc.sha256).await?;
+    if !force && existed {
+        return Ok(UploadResult {
+            document_id: None,
+            title: doc.title,
+            status: "skipped".into(),
+            chunks: 0,
+            tokens: 0,
+            sha256: doc.sha256,
+            entities: vec![],
+        });
+    }
 
     let chunks = tokenizer.chunk(
         &doc.content,
@@ -153,90 +165,39 @@ pub async fn upload(
     let embeddings = embed_batch(embedder, &texts, config.embedding.batch_size)?;
     let total_tokens: usize = chunks.iter().map(|c| c.token_count).sum();
 
-    // The transaction starts BEFORE the duplicate check so the lookup and the
-    // write share one transaction (a concurrent identical upload cannot both
-    // create the document). The begin -> check -> store -> commit sequence is
-    // retried as a whole on retryable SurrealKV write conflicts (a
-    // transaction cannot be re-committed; store_and_index is idempotent for a
-    // given (doc, chunks) pair).
-    const ATTEMPTS: usize = 8;
-    let mut last = None;
-    let mut delay = std::time::Duration::from_millis(50);
-    for attempt in 0..ATTEMPTS {
-        let tx = db
-            .db
-            .clone()
-            .begin()
-            .await
-            .map_err(|e| SkbError::new(ErrorCode::Db, format!("upload begin: {e}")))?;
-        let existed = match doc_id_by_sha(&tx, &doc.sha256).await {
-            Ok(Some(_)) => true,
-            Ok(None) => false,
-            Err(e) => {
-                let _ = tx.cancel().await;
-                return Err(e);
-            }
-        };
-        if !force && existed {
+    let tx = db
+        .db
+        .clone()
+        .begin()
+        .await
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("upload begin: {e}")))?;
+
+    let stored = store_and_index(&tx, &doc, &chunks, &embeddings, force && existed).await;
+    let (doc_id, entities) = match stored {
+        Ok(pair) => pair,
+        Err(e) => {
             let _ = tx.cancel().await;
-            return Ok(UploadResult {
-                document_id: None,
-                title: doc.title,
-                status: "skipped".into(),
-                chunks: 0,
-                tokens: 0,
-                sha256: doc.sha256,
-                entities: vec![],
-            });
+            return Err(e);
         }
+    };
 
-        let stored = store_and_index(&tx, &doc, &chunks, &embeddings, force && existed).await;
-        let (doc_id, entities) = match stored {
-            Ok(pair) => pair,
-            Err(e) => {
-                let _ = tx.cancel().await;
-                return Err(e);
-            }
-        };
+    tx.commit()
+        .await
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("upload commit: {e}")))?;
 
-        match tx.commit().await {
-            Ok(_) => {
-                return Ok(UploadResult {
-                    document_id: Some(doc_id),
-                    title: doc.title,
-                    status: if existed {
-                        "updated".into()
-                    } else {
-                        "created".into()
-                    },
-                    chunks: chunks.len(),
-                    tokens: total_tokens,
-                    sha256: doc.sha256,
-                    entities,
-                });
-            }
-            Err(e) if e.to_string().contains("Transaction write conflict") => {
-                last = Some(e);
-                if attempt + 1 < ATTEMPTS {
-                    tokio::time::sleep(delay).await;
-                    delay = delay
-                        .saturating_mul(2)
-                        .min(std::time::Duration::from_millis(800));
-                }
-            }
-            Err(e) => {
-                // commit consumed the transaction; nothing to cancel.
-                return Err(SkbError::new(ErrorCode::Db, format!("upload commit: {e}")));
-            }
-        }
-    }
-    Err(SkbError::new(
-        ErrorCode::Db,
-        format!(
-            "upload commit: {}",
-            last.map(|e| e.to_string()).unwrap_or_default()
-        ),
-    ))
+    Ok(UploadResult {
+        document_id: Some(doc_id),
+        title: doc.title,
+        status: if existed {
+            "updated".into()
+        } else {
+            "created".into()
+        },
+        chunks: chunks.len(),
+        tokens: total_tokens,
+        sha256: doc.sha256,
+        entities,
+    })
 }
 
 type LocalTransaction = surrealdb::method::Transaction<surrealdb::engine::local::Db>;
@@ -254,12 +215,8 @@ async fn store_and_index(
     let mut document_id: Option<String> = None;
     if replace_existing {
         // Preserve the document's id (upsert semantics, spec §4.2): update the
-        // existing record in place and only replace chunks/mentions. The
-        // existence check above ran in the same transaction, so a vanished
-        // record here is a genuine error.
-        let did = doc_id_by_sha(tx, &doc.sha256)
-            .await?
-            .ok_or_else(|| SkbError::new(ErrorCode::Db, "document vanished during upload"))?;
+        // existing record in place and only replace chunks/mentions.
+        let did = doc_id_by_sha(tx, &doc.sha256).await?;
         document_id = Some(format!("document:{did}"));
         let record = surrealdb::types::RecordId::new("document", did);
         tx.query(
@@ -351,26 +308,6 @@ async fn store_and_index(
         entities.extend(names);
     }
     // Heading hierarchy: sections become part-of their nearest ancestor.
-    // First remove every existing part-of edge whose child is a section
-    // mentioned by THIS document's chunks, so each child keeps only its
-    // current nearest parent (a force re-upload with a restructured document
-    // cannot leave stale edges to an old parent). Scoped via the chunk
-    // mentions edge so other documents' hierarchies are untouched even when
-    // they share section names.
-    for section in graph::extract_sections(&doc.content) {
-        tx.query(
-            "DELETE FROM related_to WHERE relation = 'part-of' \
-             AND in = $child \
-             AND $child IN array::flatten(SELECT VALUE ->mentions->entity \
-                                          FROM chunk WHERE document = $document)",
-        )
-        .bind(("child", graph::entity_record_id(&section.name)?))
-        .bind(("document", document.clone()))
-        .await
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("section edge cleanup: {e}")))?
-        .check()
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("section edge cleanup check: {e}")))?;
-    }
     graph::link_section_hierarchy(tx, &doc.content).await?;
     entities.sort();
     entities.dedup();
@@ -378,7 +315,7 @@ async fn store_and_index(
     Ok((doc_id, entities))
 }
 
-async fn doc_id_by_sha(tx: &LocalTransaction, sha256: &str) -> Result<Option<String>, SkbError> {
+async fn doc_id_by_sha(tx: &LocalTransaction, sha256: &str) -> Result<String, SkbError> {
     let mut r = tx
         .query("SELECT meta::id(id) AS did FROM document WHERE sha256 = $sha256 LIMIT 1")
         .bind(("sha256", sha256.to_string()))
@@ -389,10 +326,10 @@ async fn doc_id_by_sha(tx: &LocalTransaction, sha256: &str) -> Result<Option<Str
     let rows: Vec<serde_json::Value> = r
         .take(0)
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("doc lookup take: {e}")))?;
-    Ok(rows
-        .first()
+    rows.first()
         .and_then(|v| v["did"].as_str())
-        .map(|s| s.to_string()))
+        .map(|s| s.to_string())
+        .ok_or_else(|| SkbError::new(ErrorCode::Db, "document vanished during upload"))
 }
 
 fn record_key(doc_id: &str) -> Result<&str, SkbError> {
@@ -424,8 +361,9 @@ async fn extract_document_data(
         let config = config.clone();
         let raw = tokio::task::spawn_blocking(move || -> Result<RawInput, SkbError> {
             // The canonicalized path returned by validate_path is the one
-            // used for metadata and reads, so the validated path is the path
-            // actually opened (no TOCTOU re-resolution window).
+            // used for metadata, size validation and the read, so the
+            // validated path is the path actually opened (no TOCTOU
+            // re-resolution window).
             let canonical = validate_path(&path, &config)?;
             let meta = std::fs::metadata(&canonical)
                 .map_err(|e| SkbError::new(ErrorCode::Io, format!("stat file: {e}")))?;
@@ -483,7 +421,10 @@ async fn extract_document_data(
     let (content, mime) = match raw {
         RawInput::Text(text) => {
             check_size(text.len() as u64, config)?;
-            (extract_text(&text, &source), mime_hint)
+            (
+                extract_text_with_mime(&text, &source, mime_hint.as_deref()),
+                mime_hint,
+            )
         }
         RawInput::Bytes(bytes) => {
             extract_from_bytes(&bytes, &source, mime_hint.as_deref(), config).await?
@@ -527,7 +468,7 @@ async fn extract_from_bytes(
     }
     match std::str::from_utf8(bytes) {
         Ok(text) => Ok((
-            extract_text(text, source),
+            extract_text_with_mime(text, source, mime_hint),
             mime_hint
                 .map(str::to_string)
                 .or(Some("text/plain".to_string())),
@@ -549,10 +490,13 @@ fn is_pdf_bytes(bytes: &[u8]) -> bool {
 /// accumulate blocking workers and their input buffers.
 const MAX_CONCURRENT_PDF_JOBS: usize = 4;
 
-static PDF_SEMAPHORE: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+static PDF_SEMAPHORE: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+    std::sync::OnceLock::new();
 
-fn pdf_semaphore() -> &'static tokio::sync::Semaphore {
-    PDF_SEMAPHORE.get_or_init(|| tokio::sync::Semaphore::new(MAX_CONCURRENT_PDF_JOBS))
+fn pdf_semaphore() -> std::sync::Arc<tokio::sync::Semaphore> {
+    PDF_SEMAPHORE
+        .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PDF_JOBS)))
+        .clone()
 }
 
 /// Extract PDF text with resource guards: page count, wall-clock time and
@@ -561,35 +505,34 @@ fn pdf_semaphore() -> &'static tokio::sync::Semaphore {
 /// under a wall-clock timeout so a slow document cannot hang the request. A
 /// fixed concurrency cap bounds how many blocking jobs may pile up.
 async fn extract_pdf_checked(bytes: &[u8]) -> Result<String, SkbError> {
+    // The wall-clock budget starts before the permit wait so waiting for a
+    // slot counts against MAX_PROCESS_SECONDS (bounded via timeout below).
     let start = Instant::now();
-    let shared = std::sync::Arc::new(bytes.to_vec());
-    // The permit is acquired (async) before the job starts and moved into the
-    // spawn_blocking closure so it is held for the full lifetime of the
-    // blocking task — a timed-out caller cannot release the slot while the
-    // job still runs, so actual concurrent PDF jobs never exceed
+    // Each permit is acquired (owned) before the job starts and moved into
+    // its spawn_blocking closure so it stays held until the blocking task
+    // finishes — a timed-out caller cannot free the slot while the job still
+    // runs, so actual concurrent PDF jobs never exceed
     // MAX_CONCURRENT_PDF_JOBS.
-    let parse_permit = pdf_semaphore()
-        .acquire()
-        .await
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("pdf semaphore: {e}")))?;
-    // The permit wait consumed part of the shared wall-clock budget; the
-    // remaining time bounds the parse itself. If nothing is left, do not
-    // launch the blocking job at all.
-    let remaining = Duration::from_secs(MAX_PROCESS_SECONDS).saturating_sub(start.elapsed());
-    if remaining.is_zero() {
-        return Err(SkbError::new(
+    let parse_permit = tokio::time::timeout(
+        Duration::from_secs(MAX_PROCESS_SECONDS),
+        pdf_semaphore().acquire_owned(),
+    )
+    .await
+    .map_err(|_| {
+        SkbError::new(
             ErrorCode::Validation,
             "pdf semaphore wait exceeded time limit",
-        ));
-    }
+        )
+    })?
+    .map_err(|e| SkbError::new(ErrorCode::Db, format!("pdf semaphore: {e}")))?;
+    let shared = std::sync::Arc::new(bytes.to_vec());
     let doc = tokio::time::timeout(
-        remaining,
+        Duration::from_secs(MAX_PROCESS_SECONDS),
         tokio::task::spawn_blocking({
             let shared = shared.clone();
             move || {
                 let _permit = parse_permit;
                 lopdf::Document::load_mem(&shared)
-                    .map_err(|e| SkbError::new(ErrorCode::Io, format!("pdf parse: {e}")))
             }
         }),
     )
@@ -606,21 +549,22 @@ async fn extract_pdf_checked(bytes: &[u8]) -> Result<String, SkbError> {
     }
     // The extraction itself is synchronous and cannot be cancelled; the
     // timeout bounds how long the caller waits. Parse and extraction share
-    // one MAX_PROCESS_SECONDS budget. Each permit wait consumes part of the
-    // budget, so `remaining` is always computed from start.elapsed() AFTER
-    // the semaphore acquisition; an exhausted budget fails before the
-    // blocking job is launched.
-    let extract_permit = pdf_semaphore()
-        .acquire()
+    // one MAX_PROCESS_SECONDS budget so a slow parse cannot be followed by a
+    // full second timeout. The extract permit is owned and moved into the
+    // closure like the parse permit; the acquisition itself is bounded by
+    // the same remaining budget so waiting for a slot cannot exceed
+    // MAX_PROCESS_SECONDS.
+    let remaining = Duration::from_secs(MAX_PROCESS_SECONDS).saturating_sub(start.elapsed());
+    let extract_permit = tokio::time::timeout(remaining, pdf_semaphore().acquire_owned())
         .await
+        .map_err(|_| {
+            SkbError::new(
+                ErrorCode::Validation,
+                "pdf semaphore wait exceeded time limit",
+            )
+        })?
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("pdf semaphore: {e}")))?;
     let remaining = Duration::from_secs(MAX_PROCESS_SECONDS).saturating_sub(start.elapsed());
-    if remaining.is_zero() {
-        return Err(SkbError::new(
-            ErrorCode::Validation,
-            "pdf extraction exceeded time limit",
-        ));
-    }
     let text = tokio::time::timeout(
         remaining,
         tokio::task::spawn_blocking({
@@ -628,7 +572,6 @@ async fn extract_pdf_checked(bytes: &[u8]) -> Result<String, SkbError> {
             move || {
                 let _permit = extract_permit;
                 pdf_extract::extract_text_from_mem(&shared)
-                    .map_err(|e| SkbError::new(ErrorCode::Io, format!("pdf extract: {e}")))
             }
         }),
     )
@@ -657,6 +600,19 @@ fn mime_for(name: &str) -> Option<String> {
         _ => "",
     };
     (!mime.is_empty()).then(|| mime.to_string())
+}
+
+/// MIME-aware text extraction: converts HTML when the hint says text/html,
+/// otherwise behaves like extract_text.
+fn extract_text_with_mime(content: &str, source: &str, mime_hint: Option<&str>) -> String {
+    if mime_hint
+        .map(|m| m.to_lowercase() == "text/html")
+        .unwrap_or(false)
+    {
+        html_to_text(content)
+    } else {
+        extract_text(content, source)
+    }
 }
 
 fn extract_text(content: &str, source: &str) -> String {
@@ -723,24 +679,58 @@ fn check_size(len: u64, config: &Config) -> Result<(), SkbError> {
     Ok(())
 }
 
+/// Resolver that only returns public addresses, closing the DNS-rebinding gap:
+/// the DNS answer is filtered through `is_blocked_ip` and the resulting
+/// SocketAddrs are pinned for the connection, so a host that resolves to a
+/// private/loopback/metadata IP cannot be connected to even if the answer
+/// changes between validation and connect (spec §15).
+#[derive(Debug, Default)]
+struct SafeResolver;
+
+impl ureq::unversioned::resolver::Resolver for SafeResolver {
+    fn resolve(
+        &self,
+        uri: &ureq::http::Uri,
+        config: &ureq::config::Config,
+        timeout: ureq::unversioned::transport::NextTimeout,
+    ) -> Result<ureq::unversioned::resolver::ResolvedSocketAddrs, ureq::Error> {
+        use ureq::unversioned::resolver::DefaultResolver;
+        let addrs = DefaultResolver::default().resolve(uri, config, timeout)?;
+        let mut result = self.empty();
+        for addr in addrs.iter() {
+            if !is_blocked_ip(addr.ip()) {
+                result.push(*addr);
+            }
+        }
+        if result.is_empty() {
+            Err(ureq::Error::HostNotFound)
+        } else {
+            Ok(result)
+        }
+    }
+}
+
 /// Fetch a URL with SSRF guards (spec §15 / §12.3):
 /// - http/https schemes only
 /// - DNS resolution validated before every request (private/loopback/
-///   link-local/multicast/metadata addresses are rejected)
+///   link-local/multicast/metadata addresses are rejected); the SafeResolver
+///   filters the DNS answer and pins the connection to validated addresses
 /// - redirects are followed manually, re-validating each hop
 /// - size-limited streaming read; the whole fetch (all redirect hops) is
 ///   bounded by one MAX_PROCESS_SECONDS deadline
 fn fetch_url(url_str: &str, config: &Config) -> Result<(Vec<u8>, Option<String>), SkbError> {
-    fetch_url_with_validator(url_str, config, validate_url_host)
+    fetch_url_with_validator(url_str, config, validate_url_host, true)
 }
 
-/// Shared implementation of `fetch_url`; the host validator is injected so
-/// tests can exercise redirect and size-limit handling against a loopback
-/// server without tripping the SSRF guard (which rejects loopback).
+/// Shared implementation of `fetch_url`; the host validator and the SSRF
+/// resolver are injected so tests can exercise redirect and size-limit
+/// handling against a loopback server without tripping the SSRF guard (which
+/// rejects loopback).
 fn fetch_url_with_validator(
     url_str: &str,
     config: &Config,
     validate: impl Fn(&Url) -> Result<(), SkbError>,
+    use_safe_resolver: bool,
 ) -> Result<(Vec<u8>, Option<String>), SkbError> {
     let max_bytes = max_upload_bytes(config);
     let deadline = Instant::now() + Duration::from_secs(MAX_PROCESS_SECONDS);
@@ -758,13 +748,26 @@ fn fetch_url_with_validator(
             .map_err(|e| SkbError::new(ErrorCode::Validation, format!("invalid url: {e}")))?;
         validate(&url)?;
 
-        let agent = ureq::Agent::config_builder()
-            .max_redirects(0)
-            .http_status_as_error(false)
-            .timeout_connect(Some(Duration::from_secs(10)))
-            .timeout_global(Some(remaining))
-            .build()
-            .new_agent();
+        let agent = if use_safe_resolver {
+            ureq::Agent::with_parts(
+                ureq::Agent::config_builder()
+                    .max_redirects(0)
+                    .http_status_as_error(false)
+                    .timeout_connect(Some(Duration::from_secs(10)))
+                    .timeout_global(Some(remaining))
+                    .build(),
+                ureq::unversioned::transport::DefaultConnector::default(),
+                SafeResolver,
+            )
+        } else {
+            ureq::Agent::config_builder()
+                .max_redirects(0)
+                .http_status_as_error(false)
+                .timeout_connect(Some(Duration::from_secs(10)))
+                .timeout_global(Some(remaining))
+                .build()
+                .new_agent()
+        };
         let mut resp = agent
             .get(&current)
             .call()
@@ -795,7 +798,13 @@ fn fetch_url_with_validator(
             .headers()
             .get("content-type")
             .and_then(|v| v.to_str().ok())
-            .map(|s| s.split(';').next().unwrap_or("").trim().to_string());
+            .map(|s| {
+                s.split(';')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_ascii_lowercase()
+            });
         let body = resp
             .body_mut()
             .with_config()
@@ -822,9 +831,9 @@ fn fetch_url_with_validator(
 }
 
 /// Validate scheme and that the host resolves only to public addresses.
-/// Resolution happens immediately before the request so the validated answer
-/// is as fresh as possible (residual DNS-rebinding window is inherent to the
-/// transport; the resolver/connector pinning is not exposed by ureq).
+/// This is a pre-request, defense-in-depth check; the actual connection goes
+/// through the `SafeResolver` + `ureq::Agent::with_parts` path, which pins the
+/// request to the validated addresses so the DNS-rebinding window is closed.
 pub fn validate_url_host(url: &Url) -> Result<(), SkbError> {
     match url.scheme() {
         "http" | "https" => {}
@@ -884,6 +893,7 @@ pub fn is_blocked_ip(ip: IpAddr) -> bool {
                 || v6.is_unique_local()
                 || v6.is_unicast_link_local()
                 || is_documentation_v6(v6)
+                || is_site_local_v6(v6)
                 || is_nat64_v6(v6)
                 || is_6to4_v6(v6)
                 || is_teredo_v6(v6)
@@ -913,8 +923,8 @@ fn is_blocked_v4(v4: std::net::Ipv4Addr) -> bool {
         || is_benchmarking(v4)
         || is_reserved_v4(v4)
         || v4.octets() == [169, 254, 169, 254]
-        // 0.0.0.0/8 — "this network" (block the whole range, not only the
-        // unspecified address).
+        // 0.0.0.0/8 — "this network" (the whole range, not only the
+        // unspecified 0.0.0.0).
         || v4.octets()[0] == 0
         // 192.88.99.0/24 — 6to4 relay anycast.
         || (v4.octets()[0] == 192 && v4.octets()[1] == 88 && v4.octets()[2] == 99)
@@ -937,9 +947,22 @@ fn is_reserved_v4(v4: std::net::Ipv4Addr) -> bool {
     v4.octets()[0] >= 240
 }
 
-/// 2001:db8::/32 — documentation range.
+/// 2001:db8::/32 — documentation range; 3ff0::/12 — documentation (RFC 9637
+/// assigns 3fff::/20; the broader /12 prefix covers 3ff0::1 too, which
+/// documentation tooling commonly uses).
 fn is_documentation_v6(v6: std::net::Ipv6Addr) -> bool {
-    v6.segments()[0] == 0x2001 && v6.segments()[1] == 0x0db8
+    let s = v6.segments();
+    if s[0] == 0x2001 && s[1] == 0x0db8 {
+        return true;
+    }
+    // 3ff0::/12: the first 12 bits are 0011 1111 1111, i.e. the top 16 bits
+    // masked with 0xfff0 equal 0x3ff0.
+    s[0] & 0xfff0 == 0x3ff0
+}
+
+/// fec0::/10 — site-local (deprecated, still must be blocked).
+fn is_site_local_v6(v6: std::net::Ipv6Addr) -> bool {
+    v6.segments()[0] & 0xffc0 == 0xfec0
 }
 
 /// 64:ff9b::/96 — NAT64 well-known prefix (maps to IPv4 destinations).
@@ -961,11 +984,6 @@ fn is_teredo_v6(v6: std::net::Ipv6Addr) -> bool {
 
 fn base64_decode_checked(b64: &str, config: &Config) -> Result<Vec<u8>, SkbError> {
     use base64::Engine;
-    // Check the raw input length before allocating the whitespace-stripped
-    // copy, so an oversized payload is rejected without duplicating it.
-    // Whitespace only shrinks the payload, so the decoded-length estimate
-    // from the original length is a safe upper bound.
-    check_size(base64::decoded_len_estimate(b64.len()) as u64, config)?;
     let compact: String = b64.chars().filter(|c| !c.is_whitespace()).collect();
     let estimated = base64::decoded_len_estimate(compact.len());
     check_size(estimated as u64, config)?;
@@ -976,10 +994,6 @@ fn base64_decode_checked(b64: &str, config: &Config) -> Result<Vec<u8>, SkbError
     Ok(bytes)
 }
 
-/// Validate that `path` is inside an allowed directory and return the
-/// canonicalized path. Callers must use the returned path for the subsequent
-/// metadata / read operations so the validated path is the one actually read
-/// (no re-resolution window between validation and use).
 fn validate_path(path: &std::path::Path, config: &Config) -> Result<std::path::PathBuf, SkbError> {
     // Always canonicalize so the returned path is the resolved one used for
     // the subsequent metadata / read operations (no re-resolution window).
@@ -1014,6 +1028,21 @@ fn embed_batch(
         all.extend(embedder.embed_batch(chunk)?);
     }
     Ok(all)
+}
+
+async fn doc_exists(db: &Db, sha256: &str) -> Result<bool, SkbError> {
+    let query = "SELECT count() AS c FROM document WHERE sha256 = $sha256 GROUP ALL";
+    let mut r = db
+        .db
+        .query(query)
+        .bind(("sha256", sha256.to_string()))
+        .await
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("doc_exists: {e}")))?;
+    let rows: Vec<serde_json::Value> = r
+        .take(0)
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("doc_exists take: {e}")))?;
+    let count = rows.first().and_then(|v| v["c"].as_u64()).unwrap_or(0);
+    Ok(count > 0)
 }
 
 #[cfg(test)]
@@ -1074,6 +1103,7 @@ mod tests {
             "240.0.0.1",
             "255.255.255.255",
             "0.0.0.0",
+            "0.0.0.1",
             "0.1.2.3",
             "192.88.99.1",
             "192.0.2.1",
@@ -1082,6 +1112,9 @@ mod tests {
             "fc00::1",
             "ff02::1",
             "::",
+            "3ff0::1",
+            "3fff:1::1",
+            "fec0::1",
         ];
         for ip in blocked {
             let ip: IpAddr = ip.parse().unwrap();
@@ -1188,12 +1221,10 @@ mod tests {
     }
 
     /// Serve an HTTP response repeatedly on a loopback listener in a background
-    /// thread, returning the base URL. The response is shared with the thread
-    /// via Arc so it is reclaimed when the test ends.
-    fn serve_repeatedly(response: String, times: usize) -> String {
+    /// thread, returning the base URL.
+    fn serve_repeatedly(response: &'static str, times: usize) -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let response = std::sync::Arc::new(response);
         std::thread::spawn(move || {
             for stream in listener.incoming().take(times) {
                 let mut stream = stream.unwrap();
@@ -1211,12 +1242,12 @@ mod tests {
         // A 302 pointing back at itself never terminates; the manual redirect
         // loop must cap at MAX_REDIRECTS.
         let url = serve_repeatedly(
-            "HTTP/1.1 302 Found\r\nlocation: /self\r\ncontent-length: 0\r\n\r\n".to_string(),
+            "HTTP/1.1 302 Found\r\nlocation: /self\r\ncontent-length: 0\r\n\r\n",
             MAX_REDIRECTS + 1,
         );
         let config = Config::default();
         assert!(matches!(
-            fetch_url_with_validator(&url, &config, |_| Ok(())),
+            fetch_url_with_validator(&url, &config, |_| Ok(()), false),
             Err(SkbError {
                 code: ErrorCode::Io,
                 ..
@@ -1234,11 +1265,11 @@ mod tests {
             body.len(),
             body
         );
-        let url = serve_repeatedly(response, 1);
+        let url = serve_repeatedly(Box::leak(response.into_boxed_str()), 1);
         let mut config = Config::default();
         config.upload.max_file_mb = 1;
         assert!(matches!(
-            fetch_url_with_validator(&url, &config, |_| Ok(())),
+            fetch_url_with_validator(&url, &config, |_| Ok(()), false),
             Err(SkbError {
                 code: ErrorCode::Validation,
                 ..

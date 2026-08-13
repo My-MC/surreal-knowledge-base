@@ -95,6 +95,11 @@ impl Tokenize for TokenizersImpl {
 
         let mut chunks = Vec::new();
         let mut start = 0;
+        // Track the previous end position: heading-boundary breaks can
+        // push end below the previous chunk's end when combined with
+        // overlap, which would duplicate content in an endless loop.
+        // Such a range is skipped (start advances to end).
+        let mut prev_end = 0usize;
 
         while start < ids.len() {
             let window_end = (start + max_tokens).min(ids.len());
@@ -115,6 +120,23 @@ impl Tokenize for TokenizersImpl {
                 {
                     end = i;
                 }
+            }
+
+            if end <= prev_end {
+                // The heading break would produce a range no further than
+                // the previous chunk. First try the FULL window: when
+                // window_end > prev_end the overlap after a heading boundary
+                // is preserved and a real chunk is emitted. Only when the
+                // full window also fails to advance is the range skipped.
+                if window_end > prev_end {
+                    end = window_end;
+                    prev_end = end;
+                } else {
+                    start = end.max(start + 1);
+                    continue;
+                }
+            } else {
+                prev_end = end;
             }
 
             let (chunk_offsets_start, chunk_offsets_end) = if let (Some(first), Some(last)) = (
@@ -146,13 +168,16 @@ impl Tokenize for TokenizersImpl {
     }
 }
 
-/// Iterate the byte offset and text of every line OUTSIDE fenced code blocks.
-/// Fences open with ``` or ~~~ and close only on a line starting with the SAME
-/// marker (CommonMark). Shared by chunking (heading_starts) and graph entity
-/// extraction so heading-like lines inside fences are ignored consistently.
-pub(crate) fn visible_lines(text: &str) -> Vec<(usize, &str)> {
+/// Byte offsets of markdown heading lines (`^#{1,6}\s`), for boundary-aware
+/// chunking. Scanning is byte-oriented and cheap enough for large inputs.
+/// Fence-aware: heading-like lines inside ``` or ~~~ blocks are ignored
+/// (shared with graph entity/section extraction).
+pub(crate) fn heading_starts(text: &str) -> Vec<usize> {
     let mut out = Vec::new();
     let mut line_start = 0usize;
+    // Track the opening fence marker (``` or ~~~); a fence closes only on a
+    // line starting with the SAME marker, so `# heading`-like lines inside
+    // either fence are never treated as headings (CommonMark).
     let mut fence_marker: Option<&str> = None;
     for (i, b) in text.bytes().enumerate() {
         if b == b'\n' {
@@ -166,8 +191,8 @@ pub(crate) fn visible_lines(text: &str) -> Vec<(usize, &str)> {
                 fence_marker = Some("```");
             } else if trimmed.starts_with("~~~") {
                 fence_marker = Some("~~~");
-            } else {
-                out.push((line_start, line));
+            } else if is_heading_line(trimmed) {
+                out.push(line_start);
             }
             line_start = i + 1;
         }
@@ -175,20 +200,14 @@ pub(crate) fn visible_lines(text: &str) -> Vec<(usize, &str)> {
     if line_start < text.len() {
         let line = &text[line_start..];
         let trimmed = line.trim_start();
-        if !(trimmed.starts_with("```") || trimmed.starts_with("~~~")) && fence_marker.is_none() {
-            out.push((line_start, line));
+        if !(trimmed.starts_with("```") || trimmed.starts_with("~~~"))
+            && fence_marker.is_none()
+            && is_heading_line(trimmed)
+        {
+            out.push(line_start);
         }
     }
     out
-}
-
-/// Byte offsets of markdown heading lines (`^#{1,6}\s`), for boundary-aware
-/// chunking. Scanning is byte-oriented and cheap enough for large inputs.
-fn heading_starts(text: &str) -> Vec<usize> {
-    visible_lines(text)
-        .into_iter()
-        .filter_map(|(off, line)| is_heading_line(line.trim_start()).then_some(off))
-        .collect()
 }
 
 fn is_heading_line(line: &str) -> bool {
@@ -225,7 +244,9 @@ fn heading_text(text: &str, start: usize) -> Option<String> {
         .map(|e| start + e)
         .unwrap_or(text.len());
     let line = &text[start..end];
-    let trimmed = line.trim_start_matches('#').trim();
+    // trim_start FIRST so indented headings ("  ## Topic") have their
+    // Markdown markers removed consistently with heading_starts.
+    let trimmed = line.trim_start().trim_start_matches('#').trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
@@ -248,6 +269,15 @@ mod tests {
     fn collects_heading_offsets() {
         let text = "# A\nbody\n## B\nmore\n";
         assert_eq!(heading_starts(text), vec![0, 9]);
+    }
+
+    #[test]
+    fn heading_starts_skips_fenced_heading_like_lines() {
+        // Heading-like lines inside ``` and ~~~ fences must not be detected;
+        // a fence closes only on its own marker.
+        let text = "# Real\n```\n# Fake\n~~~\nstill inside\n```\n## Real2\n~~~\n# Fake2\n~~~\n";
+        let starts = heading_starts(text);
+        assert_eq!(starts, vec![0, 39], "got {starts:?}");
     }
 
     #[test]
