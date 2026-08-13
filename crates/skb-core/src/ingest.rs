@@ -130,6 +130,18 @@ pub async fn upload(
     req.validate()?;
     let force = req.force.unwrap_or(false);
     let doc = extract_document_data(req, config).await?;
+    let existed = doc_exists(db, &doc.sha256).await?;
+    if !force && existed {
+        return Ok(UploadResult {
+            document_id: None,
+            title: doc.title,
+            status: "skipped".into(),
+            chunks: 0,
+            tokens: 0,
+            sha256: doc.sha256,
+            entities: vec![],
+        });
+    }
 
     let chunks = tokenizer.chunk(
         &doc.content,
@@ -159,23 +171,6 @@ pub async fn upload(
         .begin()
         .await
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("upload begin: {e}")))?;
-
-    // The duplicate check runs inside the same transaction as the write so a
-    // concurrent upload of identical content cannot both observe "new" and
-    // create duplicate documents.
-    let existed = tx_doc_exists(&tx, &doc.sha256).await?;
-    if !force && existed {
-        let _ = tx.cancel().await;
-        return Ok(UploadResult {
-            document_id: None,
-            title: doc.title,
-            status: "skipped".into(),
-            chunks: 0,
-            tokens: 0,
-            sha256: doc.sha256,
-            entities: vec![],
-        });
-    }
 
     let stored = store_and_index(&tx, &doc, &chunks, &embeddings, force && existed).await;
     let (doc_id, entities) = match stored {
@@ -365,15 +360,15 @@ async fn extract_document_data(
             .to_string();
         let config = config.clone();
         let raw = tokio::task::spawn_blocking(move || -> Result<RawInput, SkbError> {
-            // Resolve and validate in one step: the canonicalized path
-            // returned here is used for all subsequent operations so a
-            // symlink swapped between validation and read cannot escape
-            // `allowed_dirs` (TOCTOU).
-            let path = validate_path(&path, &config)?;
-            let meta = std::fs::metadata(&path)
+            // The canonicalized path returned by validate_path is the one
+            // used for metadata, size validation and the read, so the
+            // validated path is the path actually opened (no TOCTOU
+            // re-resolution window).
+            let canonical = validate_path(&path, &config)?;
+            let meta = std::fs::metadata(&canonical)
                 .map_err(|e| SkbError::new(ErrorCode::Io, format!("stat file: {e}")))?;
             check_size(meta.len(), &config)?;
-            let bytes = read_file_bytes(&path)?;
+            let bytes = read_file_bytes(&canonical)?;
             Ok(RawInput::Bytes(bytes))
         })
         .await
@@ -418,22 +413,18 @@ async fn extract_document_data(
         ));
     };
 
-    // For URL inputs the server-provided Content-Type is the most reliable
-    // hint; for path/file inputs the extension is. The title/file-title
-    // fallbacks only apply when neither is available.
-    let mime_hint = if req.url.is_some() {
-        content_type_hint.or_else(|| mime_for(&source))
-    } else {
-        mime_for(&source)
-            .or_else(|| req.title.as_deref().and_then(mime_for))
-            .or_else(|| mime_for(&file_title))
-            .or(content_type_hint)
-    };
+    let mime_hint = mime_for(&source)
+        .or_else(|| req.title.as_deref().and_then(mime_for))
+        .or_else(|| mime_for(&file_title))
+        .or(content_type_hint);
 
     let (content, mime) = match raw {
         RawInput::Text(text) => {
             check_size(text.len() as u64, config)?;
-            (extract_text(&text, &source), mime_hint)
+            (
+                extract_text_with_mime(&text, &source, mime_hint.as_deref()),
+                mime_hint,
+            )
         }
         RawInput::Bytes(bytes) => {
             extract_from_bytes(&bytes, &source, mime_hint.as_deref(), config).await?
@@ -470,18 +461,14 @@ async fn extract_from_bytes(
     config: &Config,
 ) -> Result<(String, Option<String>), SkbError> {
     check_size(bytes.len() as u64, config)?;
-    // Magic bytes take precedence; the mime hint is only a fallback for
-    // content that cannot be interpreted as UTF-8, so a `.pdf` URL that
-    // actually returns HTML or text is ingested as text instead of failing
-    // PDF parsing.
-    let hint_pdf = mime_hint == Some("application/pdf");
-    if is_pdf_bytes(bytes) || (hint_pdf && std::str::from_utf8(bytes).is_err()) {
+    let is_pdf = is_pdf_bytes(bytes) || mime_hint == Some("application/pdf");
+    if is_pdf {
         let text = extract_pdf_checked(bytes).await?;
         return Ok((text, Some("application/pdf".to_string())));
     }
     match std::str::from_utf8(bytes) {
         Ok(text) => Ok((
-            extract_text(text, source),
+            extract_text_with_mime(text, source, mime_hint),
             mime_hint
                 .map(str::to_string)
                 .or(Some("text/plain".to_string())),
@@ -514,30 +501,84 @@ fn pdf_semaphore() -> std::sync::Arc<tokio::sync::Semaphore> {
 
 /// Extract PDF text with resource guards: page count, wall-clock time and
 /// output size (PDF bomb mitigation, spec §12.3). The page-count check is the
-/// primary PDF-bomb defense; parsing and extraction run in one blocking
-/// closure that owns the semaphore permit, so the concurrency slot is held
-/// until the blocking work actually finishes even if the wall-clock timeout
-/// fires and the caller stops waiting.
+/// primary PDF-bomb defense; parsing and extraction run on blocking threads
+/// under a wall-clock timeout so a slow document cannot hang the request. A
+/// fixed concurrency cap bounds how many blocking jobs may pile up.
 async fn extract_pdf_checked(bytes: &[u8]) -> Result<String, SkbError> {
-    let permit = pdf_semaphore()
-        .acquire_owned()
-        .await
-        .map_err(|e| SkbError::new(ErrorCode::Io, format!("pdf semaphore: {e}")))?;
+    // The wall-clock budget starts before the permit wait so waiting for a
+    // slot counts against MAX_PROCESS_SECONDS (bounded via timeout below).
+    let start = Instant::now();
+    // Each permit is acquired (owned) before the job starts and moved into
+    // its spawn_blocking closure so it stays held until the blocking task
+    // finishes — a timed-out caller cannot free the slot while the job still
+    // runs, so actual concurrent PDF jobs never exceed
+    // MAX_CONCURRENT_PDF_JOBS.
+    let parse_permit = tokio::time::timeout(
+        Duration::from_secs(MAX_PROCESS_SECONDS),
+        pdf_semaphore().acquire_owned(),
+    )
+    .await
+    .map_err(|_| {
+        SkbError::new(
+            ErrorCode::Validation,
+            "pdf semaphore wait exceeded time limit",
+        )
+    })?
+    .map_err(|e| SkbError::new(ErrorCode::Db, format!("pdf semaphore: {e}")))?;
     let shared = std::sync::Arc::new(bytes.to_vec());
-    let job = tokio::task::spawn_blocking(move || -> Result<String, String> {
-        let _permit = permit;
-        let doc = lopdf::Document::load_mem(&shared).map_err(|e| format!("pdf parse: {e}"))?;
-        let pages = doc.get_pages().len();
-        if pages > MAX_PDF_PAGES {
-            return Err(format!("pdf has {pages} pages, limit is {MAX_PDF_PAGES}"));
-        }
-        pdf_extract::extract_text_from_mem(&shared).map_err(|e| format!("pdf extract: {e}"))
-    });
-    let text = tokio::time::timeout(Duration::from_secs(MAX_PROCESS_SECONDS), job)
+    let doc = tokio::time::timeout(
+        Duration::from_secs(MAX_PROCESS_SECONDS),
+        tokio::task::spawn_blocking({
+            let shared = shared.clone();
+            move || {
+                let _permit = parse_permit;
+                lopdf::Document::load_mem(&shared)
+            }
+        }),
+    )
+    .await
+    .map_err(|_| SkbError::new(ErrorCode::Validation, "pdf parsing exceeded time limit"))?
+    .map_err(|e| SkbError::new(ErrorCode::Io, format!("pdf parse join: {e}")))?
+    .map_err(|e| SkbError::new(ErrorCode::Io, format!("pdf parse: {e}")))?;
+    let pages = doc.get_pages().len();
+    if pages > MAX_PDF_PAGES {
+        return Err(SkbError::new(
+            ErrorCode::Validation,
+            format!("pdf has {pages} pages, limit is {MAX_PDF_PAGES}"),
+        ));
+    }
+    // The extraction itself is synchronous and cannot be cancelled; the
+    // timeout bounds how long the caller waits. Parse and extraction share
+    // one MAX_PROCESS_SECONDS budget so a slow parse cannot be followed by a
+    // full second timeout. The extract permit is owned and moved into the
+    // closure like the parse permit; the acquisition itself is bounded by
+    // the same remaining budget so waiting for a slot cannot exceed
+    // MAX_PROCESS_SECONDS.
+    let remaining = Duration::from_secs(MAX_PROCESS_SECONDS).saturating_sub(start.elapsed());
+    let extract_permit = tokio::time::timeout(remaining, pdf_semaphore().acquire_owned())
         .await
-        .map_err(|_| SkbError::new(ErrorCode::Validation, "pdf processing exceeded time limit"))?
-        .map_err(|e| SkbError::new(ErrorCode::Io, format!("pdf join: {e}")))?
-        .map_err(|e| SkbError::new(ErrorCode::Validation, e))?;
+        .map_err(|_| {
+            SkbError::new(
+                ErrorCode::Validation,
+                "pdf semaphore wait exceeded time limit",
+            )
+        })?
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("pdf semaphore: {e}")))?;
+    let remaining = Duration::from_secs(MAX_PROCESS_SECONDS).saturating_sub(start.elapsed());
+    let text = tokio::time::timeout(
+        remaining,
+        tokio::task::spawn_blocking({
+            let shared = shared.clone();
+            move || {
+                let _permit = extract_permit;
+                pdf_extract::extract_text_from_mem(&shared)
+            }
+        }),
+    )
+    .await
+    .map_err(|_| SkbError::new(ErrorCode::Validation, "pdf extraction exceeded time limit"))?
+    .map_err(|e| SkbError::new(ErrorCode::Io, format!("pdf extract join: {e}")))?
+    .map_err(|e| SkbError::new(ErrorCode::Io, format!("pdf extract: {e}")))?;
     Ok(text)
 }
 
@@ -559,6 +600,19 @@ fn mime_for(name: &str) -> Option<String> {
         _ => "",
     };
     (!mime.is_empty()).then(|| mime.to_string())
+}
+
+/// MIME-aware text extraction: converts HTML when the hint says text/html,
+/// otherwise behaves like extract_text.
+fn extract_text_with_mime(content: &str, source: &str, mime_hint: Option<&str>) -> String {
+    if mime_hint
+        .map(|m| m.to_lowercase() == "text/html")
+        .unwrap_or(false)
+    {
+        html_to_text(content)
+    } else {
+        extract_text(content, source)
+    }
 }
 
 fn extract_text(content: &str, source: &str) -> String {
@@ -681,28 +735,6 @@ fn fetch_url_with_validator(
     let max_bytes = max_upload_bytes(config);
     let deadline = Instant::now() + Duration::from_secs(MAX_PROCESS_SECONDS);
 
-    // Build the agent once and reuse it across redirect hops so the
-    // connection pool and TLS session are not re-created per hop; the
-    // remaining total time is enforced by the deadline check below.
-    let agent = if use_safe_resolver {
-        ureq::Agent::with_parts(
-            ureq::Agent::config_builder()
-                .max_redirects(0)
-                .http_status_as_error(false)
-                .timeout_connect(Some(Duration::from_secs(10)))
-                .build(),
-            ureq::unversioned::transport::DefaultConnector::default(),
-            SafeResolver,
-        )
-    } else {
-        ureq::Agent::config_builder()
-            .max_redirects(0)
-            .http_status_as_error(false)
-            .timeout_connect(Some(Duration::from_secs(10)))
-            .build()
-            .new_agent()
-    };
-
     let mut current = url_str.to_string();
     for _ in 0..=MAX_REDIRECTS {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -716,13 +748,28 @@ fn fetch_url_with_validator(
             .map_err(|e| SkbError::new(ErrorCode::Validation, format!("invalid url: {e}")))?;
         validate(&url)?;
 
-        // Enforce the remaining total budget at request level so the body
-        // read (not just connect) cannot block past the deadline.
+        let agent = if use_safe_resolver {
+            ureq::Agent::with_parts(
+                ureq::Agent::config_builder()
+                    .max_redirects(0)
+                    .http_status_as_error(false)
+                    .timeout_connect(Some(Duration::from_secs(10)))
+                    .timeout_global(Some(remaining))
+                    .build(),
+                ureq::unversioned::transport::DefaultConnector::default(),
+                SafeResolver,
+            )
+        } else {
+            ureq::Agent::config_builder()
+                .max_redirects(0)
+                .http_status_as_error(false)
+                .timeout_connect(Some(Duration::from_secs(10)))
+                .timeout_global(Some(remaining))
+                .build()
+                .new_agent()
+        };
         let mut resp = agent
             .get(&current)
-            .config()
-            .timeout_global(Some(remaining))
-            .build()
             .call()
             .map_err(|e| SkbError::new(ErrorCode::Io, format!("fetch url: {e}")))?;
         let status = resp.status().as_u16();
@@ -758,14 +805,10 @@ fn fetch_url_with_validator(
                     .trim()
                     .to_ascii_lowercase()
             });
-        // Read up to max_bytes + 1 so an exactly-at-limit response is accepted
-        // while an over-limit one trips BodyExceedsLimit; guard the +1 against
-        // u64 overflow.
-        let read_limit = max_bytes.saturating_add(1);
         let body = resp
             .body_mut()
             .with_config()
-            .limit(read_limit)
+            .limit(max_bytes + 1)
             .read_to_vec()
             .map_err(|e| match e {
                 ureq::Error::BodyExceedsLimit(_) => {
@@ -788,9 +831,9 @@ fn fetch_url_with_validator(
 }
 
 /// Validate scheme and that the host resolves only to public addresses.
-/// Resolution happens immediately before the request so the validated answer
-/// is as fresh as possible (residual DNS-rebinding window is inherent to the
-/// transport; the resolver/connector pinning is not exposed by ureq).
+/// This is a pre-request, defense-in-depth check; the actual connection goes
+/// through the `SafeResolver` + `ureq::Agent::with_parts` path, which pins the
+/// request to the validated addresses so the DNS-rebinding window is closed.
 pub fn validate_url_host(url: &Url) -> Result<(), SkbError> {
     match url.scheme() {
         "http" | "https" => {}
@@ -849,8 +892,8 @@ pub fn is_blocked_ip(ip: IpAddr) -> bool {
                 || v6.is_multicast()
                 || v6.is_unique_local()
                 || v6.is_unicast_link_local()
-                || is_site_local_v6(v6)
                 || is_documentation_v6(v6)
+                || is_site_local_v6(v6)
                 || is_nat64_v6(v6)
                 || is_6to4_v6(v6)
                 || is_teredo_v6(v6)
@@ -876,14 +919,15 @@ fn is_blocked_v4(v4: std::net::Ipv4Addr) -> bool {
         || v4.is_unspecified()
         || v4.is_broadcast()
         || v4.is_documentation()
-        // 0.0.0.0/8 — "this network" (RFC 1122); only 0.0.0.0 itself matches
-        // is_unspecified, so block the whole range (some OSes route it to
-        // loopback; ::0.0.0.x arrives here via to_ipv4()).
-        || v4.octets()[0] == 0
         || is_cgnat(v4)
         || is_benchmarking(v4)
         || is_reserved_v4(v4)
         || v4.octets() == [169, 254, 169, 254]
+        // 0.0.0.0/8 — "this network" (the whole range, not only the
+        // unspecified 0.0.0.0).
+        || v4.octets()[0] == 0
+        // 192.88.99.0/24 — 6to4 relay anycast.
+        || (v4.octets()[0] == 192 && v4.octets()[1] == 88 && v4.octets()[2] == 99)
 }
 
 /// 100.64.0.0/10 — shared address space (CGNAT).
@@ -903,17 +947,22 @@ fn is_reserved_v4(v4: std::net::Ipv4Addr) -> bool {
     v4.octets()[0] >= 240
 }
 
-/// 2001:db8::/32 — documentation range; 3fff::/20 (RFC 9637) — additional
-/// documentation range.
+/// 2001:db8::/32 — documentation range; 3ff0::/12 — documentation (RFC 9637
+/// assigns 3fff::/20; the broader /12 prefix covers 3ff0::1 too, which
+/// documentation tooling commonly uses).
 fn is_documentation_v6(v6: std::net::Ipv6Addr) -> bool {
     let s = v6.segments();
-    s[0] == 0x2001 && s[1] == 0x0db8 || s[0] & 0xfff0 == 0x3ff0
+    if s[0] == 0x2001 && s[1] == 0x0db8 {
+        return true;
+    }
+    // 3ff0::/12: the first 12 bits are 0011 1111 1111, i.e. the top 16 bits
+    // masked with 0xfff0 equal 0x3ff0.
+    s[0] & 0xfff0 == 0x3ff0
 }
 
-/// fec0::/10 — deprecated site-local (RFC 3879).
+/// fec0::/10 — site-local (deprecated, still must be blocked).
 fn is_site_local_v6(v6: std::net::Ipv6Addr) -> bool {
-    let s = v6.segments();
-    s[0] & 0xffc0 == 0xfec0
+    v6.segments()[0] & 0xffc0 == 0xfec0
 }
 
 /// 64:ff9b::/96 — NAT64 well-known prefix (maps to IPv4 destinations).
@@ -935,14 +984,7 @@ fn is_teredo_v6(v6: std::net::Ipv6Addr) -> bool {
 
 fn base64_decode_checked(b64: &str, config: &Config) -> Result<Vec<u8>, SkbError> {
     use base64::Engine;
-    // Check the decoded-length estimate from the original input before
-    // allocating the whitespace-stripped string: whitespace only shrinks the
-    // payload, so this is a safe upper bound that rejects oversized input
-    // without building the compact copy.
-    check_size(base64::decoded_len_estimate(b64.len()) as u64, config)?;
     let compact: String = b64.chars().filter(|c| !c.is_whitespace()).collect();
-    // Re-check on the compact length (tight bound) before allocating the
-    // decoded buffer.
     let estimated = base64::decoded_len_estimate(compact.len());
     check_size(estimated as u64, config)?;
     let bytes = base64::engine::general_purpose::STANDARD
@@ -953,8 +995,8 @@ fn base64_decode_checked(b64: &str, config: &Config) -> Result<Vec<u8>, SkbError
 }
 
 fn validate_path(path: &std::path::Path, config: &Config) -> Result<std::path::PathBuf, SkbError> {
-    // Always canonicalize so callers use the same resolved path for every
-    // subsequent operation (no re-resolution TOCTOU window).
+    // Always canonicalize so the returned path is the resolved one used for
+    // the subsequent metadata / read operations (no re-resolution window).
     let canonical = path
         .canonicalize()
         .map_err(|e| SkbError::new(ErrorCode::Io, format!("resolve path: {e}")))?;
@@ -988,9 +1030,10 @@ fn embed_batch(
     Ok(all)
 }
 
-async fn tx_doc_exists(tx: &LocalTransaction, sha256: &str) -> Result<bool, SkbError> {
+async fn doc_exists(db: &Db, sha256: &str) -> Result<bool, SkbError> {
     let query = "SELECT count() AS c FROM document WHERE sha256 = $sha256 GROUP ALL";
-    let mut r = tx
+    let mut r = db
+        .db
         .query(query)
         .bind(("sha256", sha256.to_string()))
         .await
@@ -1062,12 +1105,16 @@ mod tests {
             "0.0.0.0",
             "0.0.0.1",
             "0.1.2.3",
+            "192.88.99.1",
             "192.0.2.1",
             "::1",
             "fe80::1",
             "fc00::1",
             "ff02::1",
             "::",
+            "3ff0::1",
+            "3fff:1::1",
+            "fec0::1",
         ];
         for ip in blocked {
             let ip: IpAddr = ip.parse().unwrap();
@@ -1092,9 +1139,6 @@ mod tests {
             "64:ff9b::7f00:1",
             "2002:7f00:0001::",
             "2001:0000:0:0:0:0:0101:0101",
-            "fec0::1",
-            "3fff::1",
-            "3ff0::1",
         ];
         for ip in extra_v6 {
             let ip: IpAddr = ip.parse().unwrap();
@@ -1178,12 +1222,7 @@ mod tests {
 
     /// Serve an HTTP response repeatedly on a loopback listener in a background
     /// thread, returning the base URL.
-    /// Serve `response` for exactly `times` connections on a background
-    /// listener. `times` must equal the number of connections each test
-    /// consumes (fetch_url_rejects_too_many_redirects uses MAX_REDIRECTS + 1,
-    /// fetch_url_rejects_body_over_size_limit uses 1); otherwise the listener
-    /// thread blocks in accept until process shutdown.
-    fn serve_repeatedly(response: String, times: usize) -> String {
+    fn serve_repeatedly(response: &'static str, times: usize) -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
@@ -1203,7 +1242,7 @@ mod tests {
         // A 302 pointing back at itself never terminates; the manual redirect
         // loop must cap at MAX_REDIRECTS.
         let url = serve_repeatedly(
-            "HTTP/1.1 302 Found\r\nlocation: /self\r\ncontent-length: 0\r\n\r\n".to_string(),
+            "HTTP/1.1 302 Found\r\nlocation: /self\r\ncontent-length: 0\r\n\r\n",
             MAX_REDIRECTS + 1,
         );
         let config = Config::default();
@@ -1226,7 +1265,7 @@ mod tests {
             body.len(),
             body
         );
-        let url = serve_repeatedly(response, 1);
+        let url = serve_repeatedly(Box::leak(response.into_boxed_str()), 1);
         let mut config = Config::default();
         config.upload.max_file_mb = 1;
         assert!(matches!(

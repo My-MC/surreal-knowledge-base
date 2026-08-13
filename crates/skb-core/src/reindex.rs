@@ -33,13 +33,18 @@ pub struct ReindexRequest {
 /// - Model or dimension change: the schema (embedding field + HNSW index) is
 ///   redefined and every document rebuilt. The transition is split into
 ///   atomic steps because SurrealDB's `DEFINE INDEX` rebuild cannot see
-///   uncommitted deletes inside the same transaction; each step is idempotent
-///   and the stored `meta` is only updated at the end, so any interruption
-///   leaves a detectable `E_MODEL_MISMATCH` state that a re-run of `reindex`
-///   completes (spec §9-5).
+///   uncommitted deletes inside the same transaction; each step is idempotent.
+/// - Interruption/recovery is tracked via the `reindex_in_progress` marker:
+///   "dim" means a dimension transition was interrupted and the next run
+///   re-executes the dimension-change path (transition + redefine_index);
+///   "meta" means a metadata/tokenizer interruption, recovered by
+///   rebuild_all + update_metas without wiping chunks/indexes/fields.
+///   Metadata may be updated before rebuild_all (the transition writes the
+///   new dimension immediately); recovery is determined by the marker, not
+///   by "metadata updated only at the end".
 pub async fn reindex(
     db: &Db,
-    embedder: &dyn Embed,
+    embedder: std::sync::Arc<dyn Embed>,
     tokenizer: &dyn Tokenize,
     config: &Config,
     req: &ReindexRequest,
@@ -52,15 +57,15 @@ pub async fn reindex(
         .await?
         .and_then(|v| v.parse::<usize>().ok());
     let dimension_changed = stored_dim.is_some_and(|d| d != dimension);
-    // A previous dimension-change reindex was interrupted mid-rebuild: the
-    // marker is still set and the stored dimension already matches, so a
-    // re-run must finish rebuilding chunks AND ensure the HNSW index exists.
-    let recovering = db
-        .get_meta("reindex_in_progress")
-        .await?
-        .as_deref()
-        .is_some_and(|v| v == "1")
-        && !dimension_changed;
+    // An active reindex-in-progress marker means a previous run was
+    // interrupted. "dim" requires the full dimension-change recovery path
+    // (including the transition and redefine_index) even when stored_dim
+    // already matches; "meta" interruptions resume through rebuild_all +
+    // update_metas without wiping chunks/indexes/fields (dimension_changed
+    // stays false, so the else branch below is taken).
+    let marker = db.get_meta("reindex_in_progress").await?;
+    let interrupted_dim = marker.as_deref() == Some("dim");
+    let dimension_changed = dimension_changed || interrupted_dim;
 
     // Get all documents
     let find =
@@ -84,8 +89,11 @@ pub async fn reindex(
     if dry_run {
         let mut dry_entity_names = std::collections::HashSet::new();
         for doc in docs.iter() {
+            let did = doc["did"].as_str().unwrap_or("");
             let content = doc["content"].as_str().unwrap_or("");
-            if content.is_empty() {
+            // Same did/content filter as the execution path so dry-run counts
+            // match rebuild_all.
+            if did.is_empty() || content.is_empty() {
                 continue;
             }
             let chunks = tokenizer.chunk(
@@ -96,30 +104,36 @@ pub async fn reindex(
             if chunks.is_empty() {
                 continue;
             }
-            dry_entity_names.extend(
-                chunks
-                    .iter()
-                    .flat_map(|c| crate::graph::extract_entities(&c.content))
-                    .map(|e| e.name),
-            );
+            // Match the execution path: extract entities PER CHUNK, not from
+            // the full document content.
+            for chunk in chunks.iter() {
+                dry_entity_names.extend(
+                    crate::graph::extract_entities(&chunk.content)
+                        .into_iter()
+                        .map(|e| e.name),
+                );
+            }
             result.documents_processed += 1;
             result.chunks_created += chunks.len();
             result.tokens_total += chunks.iter().map(|c| c.token_count).sum::<usize>();
         }
+        // One assignment after the loop: unique entity count across all docs.
         result.entities_extracted = dry_entity_names.len();
-        // Emit the same final notification as the normal path so callbacks
-        // recognize dry-run completion (docs.len(), docs.len()).
-        if let Some(report) = progress {
-            report(docs.len(), docs.len());
-        }
+        // Dry runs are side-effect free: no marker, no metadata writes.
         return Ok(result);
     }
 
-    // Mark the rebuild as in progress before touching data so an interruption
-    // (mid-wipe, mid-rebuild, or mid-index) is detectable on the next open with
-    // the *new* config, which would otherwise pass the model/dimension/
-    // fingerprint comparison and silently return empty or partial results.
-    db.set_meta("reindex_in_progress", "1").await?;
+    // Reindex-in-progress marker: set before the transition begins so an
+    // interrupted reindex (crash, kill) is detected on the next normal open;
+    // deleted only after update_metas completes. The value records WHAT was
+    // interrupted: "dim" requires the full dimension transition (wipe +
+    // field redefinition + redefine_index) on rerun, "meta" only the
+    // rebuild_all + metadata path. `open_inner` treats both as active.
+    db.set_meta(
+        "reindex_in_progress",
+        if dimension_changed { "dim" } else { "meta" },
+    )
+    .await?;
 
     if dimension_changed {
         // 1. Atomic transition: wipe old chunks/mentions and redefine the
@@ -151,30 +165,38 @@ pub async fn reindex(
             .await?;
         db.set_meta("embedding_model", &config.embedding.model)
             .await?;
-        result = rebuild_all(db, embedder, tokenizer, config, &docs, progress).await?;
+        result = rebuild_all(db, embedder.clone(), tokenizer, config, &docs, progress).await?;
         // 2. Rebuild the HNSW index over the fresh new-dimension chunks.
-        redefine_index_transaction(db, dimension).await?;
-        update_metas(db, embedder, tokenizer, config).await?;
-    } else if recovering {
-        // An interrupted dimension-change reindex left the marker set but the
-        // stored dimension already matches: the wipe/transition committed but
-        // chunks were only partially rebuilt. Rebuild everything, then ensure
-        // the HNSW index exists (it may be missing from the interruption).
-        result = rebuild_all(db, embedder, tokenizer, config, &docs, progress).await?;
-        redefine_index_transaction(db, dimension).await?;
-        update_metas(db, embedder, tokenizer, config).await?;
+        let tx = db
+            .db
+            .clone()
+            .begin()
+            .await
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex begin: {e}")))?;
+        let indexed = redefine_index(&tx, dimension).await;
+        match indexed {
+            Ok(()) => {
+                tx.commit()
+                    .await
+                    .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex commit: {e}")))?;
+            }
+            Err(e) => {
+                let _ = tx.cancel().await;
+                return Err(e);
+            }
+        }
+        update_metas(db, embedder.as_ref(), tokenizer, config).await?;
     } else {
-        result = rebuild_all(db, embedder, tokenizer, config, &docs, progress).await?;
+        result = rebuild_all(db, embedder.clone(), tokenizer, config, &docs, progress).await?;
         // Always refresh metadata after a successful rebuild: even a
         // tokenizer-only change must record the new fingerprint (§5.4).
-        update_metas(db, embedder, tokenizer, config).await?;
+        update_metas(db, embedder.as_ref(), tokenizer, config).await?;
     }
-    // The rebuild completed successfully: delete the in-progress marker so
-    // the store opens normally with the new config.
-    crate::db::delete_meta(&db.db, "reindex_in_progress").await?;
 
-    // Guarantee the final progress notification reaches 100% even when the
-    // loop skipped documents (e.g. empty content), so clients see completion.
+    // Reindex completed: delete the in-progress marker (set above), then
+    // report completion so CLI/MCP progress reaches 100% even when the last
+    // documents were skipped by the empty did/content/chunks checks.
+    crate::db::delete_meta(&db.db, "reindex_in_progress").await?;
     if let Some(report) = progress {
         report(docs.len(), docs.len());
     }
@@ -185,33 +207,13 @@ pub async fn reindex(
 type LocalTransaction = surrealdb::method::Transaction<surrealdb::engine::local::Db>;
 
 /// Wipe old chunks/mentions and redefine the embedding field for a new
-/// dimension. Atomic: on failure nothing is committed. The wipe time and
-/// affected chunk count are logged so the operational impact of the full
-/// single-transaction delete can be assessed (batch deletion is a later
-/// follow-up; atomicity is preserved here).
+/// dimension. Atomic: on failure nothing is committed.
 async fn transition_dimension(tx: &LocalTransaction, dimension: usize) -> Result<(), SkbError> {
-    let start = std::time::Instant::now();
-    let mut count_r = tx
-        .query("SELECT count() AS c FROM chunk GROUP ALL")
-        .await
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex wipe count: {e}")))?;
-    let count_rows: Vec<serde_json::Value> = count_r
-        .take(0)
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex wipe count take: {e}")))?;
-    let chunk_count = count_rows
-        .first()
-        .and_then(|v| v["c"].as_u64())
-        .unwrap_or(0);
     tx.query("DELETE FROM mentions; DELETE FROM chunk;")
         .await
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex wipe: {e}")))?
         .check()
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex wipe check: {e}")))?;
-    tracing::info!(
-        elapsed_ms = start.elapsed().as_millis(),
-        chunks = chunk_count,
-        "reindex dimension wipe completed"
-    );
     let sql = format!(
         "REMOVE INDEX IF EXISTS chunk_embedding_hnsw ON chunk; \
          REMOVE FIELD IF EXISTS embedding ON chunk; \
@@ -230,14 +232,6 @@ async fn transition_dimension(tx: &LocalTransaction, dimension: usize) -> Result
 /// embeddings of the target dimension). Runs after the rebuild so its scan
 /// only sees committed, correct-dimension vectors.
 async fn redefine_index(tx: &LocalTransaction, dimension: usize) -> Result<(), SkbError> {
-    // Remove a possibly-existing index first so recovery from an interrupted
-    // reindex can recreate it even when `DEFINE INDEX` would otherwise fail
-    // on an existing definition.
-    tx.query("REMOVE INDEX IF EXISTS chunk_embedding_hnsw ON chunk;")
-        .await
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex index remove: {e}")))?
-        .check()
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex index remove check: {e}")))?;
     let sql = format!(
         "DEFINE INDEX chunk_embedding_hnsw ON chunk \
          FIELDS embedding HNSW DIMENSION {dimension} DIST COSINE;"
@@ -250,35 +244,11 @@ async fn redefine_index(tx: &LocalTransaction, dimension: usize) -> Result<(), S
     Ok(())
 }
 
-/// Rebuild the HNSW index inside its own transaction (commit on success,
-/// cancel on failure), so callers do not duplicate the begin/commit handling.
-async fn redefine_index_transaction(db: &Db, dimension: usize) -> Result<(), SkbError> {
-    let tx = db
-        .db
-        .clone()
-        .begin()
-        .await
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex begin: {e}")))?;
-    let indexed = redefine_index(&tx, dimension).await;
-    match indexed {
-        Ok(()) => {
-            tx.commit()
-                .await
-                .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex commit: {e}")))?;
-            Ok(())
-        }
-        Err(e) => {
-            let _ = tx.cancel().await;
-            Err(e)
-        }
-    }
-}
-
 /// Rebuild every document's chunks and mentions, one transaction per document
 /// (spec §5.4).
 async fn rebuild_all(
     db: &Db,
-    embedder: &dyn Embed,
+    embedder: std::sync::Arc<dyn Embed>,
     tokenizer: &dyn Tokenize,
     config: &Config,
     docs: &[serde_json::Value],
@@ -296,6 +266,11 @@ async fn rebuild_all(
         let did = doc["did"].as_str().unwrap_or("");
         let content = doc["content"].as_str().unwrap_or("");
         if did.is_empty() || content.is_empty() {
+            // Skipped documents still report progress so the final
+            // notification always reaches total (MCP + CLI).
+            if let Some(report) = progress {
+                report(i + 1, total);
+            }
             continue;
         }
         let chunks = tokenizer.chunk(
@@ -304,30 +279,26 @@ async fn rebuild_all(
             config.chunking.overlap_tokens,
         )?;
         if chunks.is_empty() {
+            if let Some(report) = progress {
+                report(i + 1, total);
+            }
             continue;
         }
         let texts: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
-        let embeddings = embed_in_batches(embedder, &texts, config.embedding.batch_size)?;
+        let batch_size = config.embedding.batch_size;
+        let embedder = embedder.clone();
+        let embeddings = tokio::task::spawn_blocking(move || {
+            embed_in_batches(embedder.as_ref(), &texts, batch_size)
+        })
+        .await
+        .map_err(|e| SkbError::new(ErrorCode::Io, format!("embed join: {e}")))??;
 
-        let tx = db
-            .db
-            .clone()
-            .begin()
-            .await
-            .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex begin: {e}")))?;
-        let rebuilt = rebuild_document(&tx, did, content, &chunks, &embeddings).await;
-        let entity_names = match rebuilt {
-            Ok(names) => {
-                tx.commit()
-                    .await
-                    .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex commit: {e}")))?;
-                names
-            }
-            Err(e) => {
-                let _ = tx.cancel().await;
-                return Err(e);
-            }
-        };
+        // begin -> rebuild_document -> commit retried as a whole on retryable
+        // write conflicts (embedded SurrealKV; a transaction cannot be
+        // re-committed, so a fresh one is started per attempt;
+        // rebuild_document is idempotent for a given (did, chunks)).
+        let entity_names =
+            rebuild_document_retrying(db, did, content, &chunks, &embeddings).await?;
         entity_names.into_iter().for_each(|n| {
             all_entity_names.insert(n);
         });
@@ -335,12 +306,8 @@ async fn rebuild_all(
         result.documents_processed += 1;
         result.chunks_created += chunks.len();
         result.tokens_total += chunks.iter().map(|c| c.token_count).sum::<usize>();
-        // The final (total, total) notification is emitted once by the caller
-        // after the rebuild completes; skip it here to avoid duplicates.
         if let Some(report) = progress {
-            if i + 1 < total {
-                report(i + 1, total);
-            }
+            report(i + 1, total);
         }
     }
     result.entities_extracted = all_entity_names.len();
@@ -394,7 +361,59 @@ async fn update_metas(
     }
 }
 
-/// Replace one document's chunks and mentions within the supplied transaction.
+/// Rebuild one document's chunks within a transaction, retrying the whole
+/// begin -> rebuild -> commit sequence on retryable write conflicts (embedded
+/// SurrealKV; a transaction cannot be re-committed, so a fresh one is started
+/// per attempt; rebuild_document is idempotent for a given (did, chunks)).
+async fn rebuild_document_retrying(
+    db: &Db,
+    did: &str,
+    content: &str,
+    chunks: &[crate::tokenize::Chunk],
+    embeddings: &[Vec<f32>],
+) -> Result<Vec<String>, SkbError> {
+    const ATTEMPTS: usize = 8;
+    let mut last = None;
+    let mut delay = std::time::Duration::from_millis(50);
+    for attempt in 0..ATTEMPTS {
+        let tx = db
+            .db
+            .clone()
+            .begin()
+            .await
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("reindex begin: {e}")))?;
+        match rebuild_document(&tx, did, content, chunks, embeddings).await {
+            Ok(names) => match tx.commit().await {
+                Ok(_) => return Ok(names),
+                Err(e) if e.to_string().contains("Transaction write conflict") => {
+                    last = Some(e);
+                    if attempt + 1 < ATTEMPTS {
+                        tokio::time::sleep(delay).await;
+                        delay = delay
+                            .saturating_mul(2)
+                            .min(std::time::Duration::from_millis(800));
+                    }
+                }
+                Err(e) => {
+                    // commit consumed the transaction; nothing to cancel.
+                    return Err(SkbError::new(ErrorCode::Db, format!("reindex commit: {e}")));
+                }
+            },
+            Err(e) => {
+                let _ = tx.cancel().await;
+                return Err(e);
+            }
+        }
+    }
+    Err(SkbError::new(
+        ErrorCode::Db,
+        format!(
+            "reindex commit: {}",
+            last.map(|e| e.to_string()).unwrap_or_default()
+        ),
+    ))
+}
+
 async fn rebuild_document(
     tx: &LocalTransaction,
     did: &str,
@@ -452,8 +471,9 @@ async fn rebuild_document(
             crate::graph::index_chunk_entities_in_transaction(tx, cid, &chunk.content).await?;
         entity_names.extend(names);
     }
-    // Rebuild the heading-section part-of hierarchy for the whole document,
-    // matching the ingest flow (spec §5.1).
+    // Recreate the heading part-of hierarchy from the ORIGINAL document body,
+    // matching ingest so section links are rebuilt when extraction rules
+    // change.
     crate::graph::link_section_hierarchy(tx, content).await?;
     Ok(entity_names.into_iter().collect())
 }

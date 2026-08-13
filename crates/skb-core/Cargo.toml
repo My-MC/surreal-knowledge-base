@@ -39,6 +39,7 @@ lopdf = "0.42"
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["async_tokio"] }
+ahash = "0.8"
 
 [[bench]]
 name = "skb"

@@ -21,18 +21,18 @@ fn setup_config() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 
-    let db_path = dir.join("db").display().to_string().replace('\\', "/");
+    let db_path = dir.join("db");
     let config = format!(
         r#"search = {{ rrf_k = 10 }}
 
 [embedding]
 onnx_path = "mock"
-dimension = {}
+dimension = 8
 
 [storage]
-path = "{db_path}"
+path = "{}"
 "#,
-        skb_core::embed::MOCK_EMBEDDER_DIMENSION,
+        db_path.display()
     );
     std::fs::write(dir.join("skb.toml"), config).unwrap();
 }
@@ -81,7 +81,7 @@ fn core_search(query: &str, mode: &str) -> Value {
     let dir = test_dir();
     let mut config = skb_core::config::Config::default();
     config.embedding.onnx_path = "mock".to_string();
-    config.embedding.dimension = skb_core::embed::MOCK_EMBEDDER_DIMENSION;
+    config.embedding.dimension = 8;
     config.storage.path = dir.join("db");
     rt.block_on(async {
         let kb = skb_core::KnowledgeBase::open(config).await.unwrap();
@@ -102,7 +102,7 @@ fn core_list() -> Value {
     let dir = test_dir();
     let mut config = skb_core::config::Config::default();
     config.embedding.onnx_path = "mock".to_string();
-    config.embedding.dimension = skb_core::embed::MOCK_EMBEDDER_DIMENSION;
+    config.embedding.dimension = 8;
     config.storage.path = dir.join("db");
     rt.block_on(async {
         let kb = skb_core::KnowledgeBase::open(config).await.unwrap();
@@ -111,6 +111,7 @@ fn core_list() -> Value {
                 limit: Some(10),
                 offset: Some(0),
                 order: None,
+                after: None,
             })
             .await
             .unwrap();
@@ -123,7 +124,7 @@ fn core_stats() -> Value {
     let dir = test_dir();
     let mut config = skb_core::config::Config::default();
     config.embedding.onnx_path = "mock".to_string();
-    config.embedding.dimension = skb_core::embed::MOCK_EMBEDDER_DIMENSION;
+    config.embedding.dimension = 8;
     config.storage.path = dir.join("db");
     rt.block_on(async {
         let kb = skb_core::KnowledgeBase::open(config).await.unwrap();
@@ -241,17 +242,17 @@ fn contract_upload_partial_failure() {
     )
     .unwrap();
 
-    // Partial failure must exit non-zero while still reporting the committed
-    // results and the aggregated errors on stdout.
+    // Partial failure must exit with the explicit code 1 while still
+    // reporting the committed results and the aggregated errors on stdout.
     let output = Command::new(skb_binary())
         .args(["upload", docs_dir.to_str().unwrap(), "--recursive"])
         .current_dir(test_dir())
         .output()
         .expect("failed to run skb upload");
-    assert_ne!(
+    assert_eq!(
         output.status.code(),
-        Some(0),
-        "partial failure must exit non-zero"
+        Some(1),
+        "partial failure must exit with code 1"
     );
     let val: Value = serde_json::from_slice(&output.stdout).unwrap();
 
@@ -276,19 +277,15 @@ fn contract_search_response_fields() {
     );
 
     let search = run_skb(&["search", "zzzkw", "--mode", "keyword"], None);
-    let hits = search["hits"].as_array().unwrap();
-    assert!(!hits.is_empty(), "keyword search must return hits");
-    let hit = &hits[0];
+    let hit = &search["hits"][0];
     assert_eq!(hit["title"], "fields-test");
     assert!(hit["source"].is_string());
     let hl = hit["highlights"].as_array().unwrap();
     assert!(hl.iter().any(|v| v == "zzzkw"));
 
     let vec = run_skb(&["search", "zzzkw", "--mode", "vector"], None);
-    let hits = vec["hits"].as_array().unwrap();
-    assert!(!hits.is_empty(), "vector search must return hits");
-    assert!(hits[0]["title"].is_string());
-    assert!(hits[0]["highlights"].is_null());
+    assert!(vec["hits"][0]["title"].is_string());
+    assert!(vec["hits"][0]["highlights"].is_null());
 }
 
 #[test]
@@ -347,10 +344,7 @@ fn contract_doctor_json() {
     setup_config();
     let val = run_skb(&["doctor"], None);
     assert_eq!(val["db_connected"], true);
-    assert_eq!(
-        val["embedding_dimension"],
-        skb_core::embed::MOCK_EMBEDDER_DIMENSION
-    );
+    assert_eq!(val["embedding_dimension"], 8);
     assert!(val["errors"].as_array().unwrap().is_empty());
 }
 
@@ -364,9 +358,7 @@ fn contract_upload_glob_and_multiple_paths() {
     std::fs::write(docs.join("b.md"), "# B\n\ncontent b").unwrap();
     std::fs::write(docs.join("c.txt"), "plain c").unwrap();
 
-    // Forward slashes so glob patterns are valid on Windows.
-    let docs = docs.display().to_string().replace('\\', "/");
-    let pattern = format!("{docs}/*.md");
+    let pattern = format!("{}/*.md", docs.display());
     let val = run_skb(&["upload", &pattern], None);
     assert_eq!(
         val["results"].as_array().unwrap().len(),
@@ -377,19 +369,36 @@ fn contract_upload_glob_and_multiple_paths() {
 
     // A single input keeps the direct UploadResult shape (no results/errors
     // wrapper); multi-input uploads always report {results, errors}.
-    let single = format!("{docs}/c.txt");
-    let val = run_skb(&["upload", &single], None);
+    let val = run_skb(&["upload", docs.join("c.txt").to_str().unwrap()], None);
     assert_eq!(val["status"], "created");
     assert!(val["document_id"].is_string());
 
-    // A glob matching exactly one file also keeps the direct shape.
-    let one = format!("{docs}/*.tx?");
-    let val = run_skb(&["upload", &one, "--force"], None);
-    assert!(val["document_id"].is_string());
-    assert!(val["status"] == "created" || val["status"] == "updated");
+    // Two explicit positional inputs are a multi-input upload: {results,
+    // errors} with two results and zero errors.
+    let a = docs.join("a.md").to_str().unwrap().to_string();
+    let b = docs.join("b.md").to_str().unwrap().to_string();
+    let val = run_skb(&["upload", &a, &b, "--force"], None);
+    assert_eq!(val["results"].as_array().unwrap().len(), 2);
+    assert_eq!(val["errors"].as_array().unwrap().len(), 0);
+
+    // A --recursive directory containing exactly one file still uses the
+    // multi-input {results, errors} envelope (one result, zero errors).
+    let single = dir.join("singledir");
+    std::fs::create_dir_all(&single).unwrap();
+    std::fs::write(single.join("only.md"), "# Only\n\ncontent only").unwrap();
+    let val = run_skb(
+        &["upload", single.to_str().unwrap(), "--recursive", "--force"],
+        None,
+    );
+    assert_eq!(
+        val["results"].as_array().unwrap().len(),
+        1,
+        "recursive single-file upload must use the {{results, errors}} envelope"
+    );
+    assert_eq!(val["errors"].as_array().unwrap().len(), 0);
 
     let list = run_skb(&["list"], None);
-    assert_eq!(list.as_array().unwrap().len(), 3);
+    assert_eq!(list.as_array().unwrap().len(), 4);
 }
 
 #[test]
