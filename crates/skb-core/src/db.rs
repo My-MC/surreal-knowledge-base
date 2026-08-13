@@ -41,29 +41,49 @@ pub(crate) trait MetaStore {
 
 impl MetaStore for Db {
     async fn set_meta(&self, key: &str, val: &str) -> Result<(), SkbError> {
-        self.db
-            .query(SET_META_SQL)
-            .bind(("key", key))
-            .bind(("val", val))
-            .await
-            .map_err(|e| SkbError::new(ErrorCode::Db, format!("set_meta: {e}")))?
-            .check()
-            .map_err(|e| SkbError::new(ErrorCode::Db, format!("set_meta check: {e}")))?;
-        Ok(())
+        set_meta_impl(&self.db, key, val).await
     }
 }
 
 impl MetaStore for surrealdb::method::Transaction<surrealdb::engine::local::Db> {
     async fn set_meta(&self, key: &str, val: &str) -> Result<(), SkbError> {
-        self.query(SET_META_SQL)
-            .bind(("key", key))
-            .bind(("val", val))
-            .await
-            .map_err(|e| SkbError::new(ErrorCode::Db, format!("set_meta: {e}")))?
-            .check()
-            .map_err(|e| SkbError::new(ErrorCode::Db, format!("set_meta check: {e}")))?;
-        Ok(())
+        set_meta_tx(self, key, val).await
     }
+}
+
+/// Shared upsert implementation for the connection handle; both the inherent
+/// `Db::set_meta` and the `MetaStore for Db` impl delegate here so the SQL and
+/// error mapping cannot diverge.
+async fn set_meta_impl(
+    db: &Surreal<surrealdb::engine::local::Db>,
+    key: &str,
+    val: &str,
+) -> Result<(), SkbError> {
+    db.query(SET_META_SQL)
+        .bind(("key", key))
+        .bind(("val", val))
+        .await
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("set_meta: {e}")))?
+        .check()
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("set_meta check: {e}")))?;
+    Ok(())
+}
+
+/// Shared upsert implementation for the transaction handle (same SQL and
+/// error mapping as `set_meta_impl`).
+async fn set_meta_tx(
+    tx: &surrealdb::method::Transaction<surrealdb::engine::local::Db>,
+    key: &str,
+    val: &str,
+) -> Result<(), SkbError> {
+    tx.query(SET_META_SQL)
+        .bind(("key", key))
+        .bind(("val", val))
+        .await
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("set_meta: {e}")))?
+        .check()
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("set_meta check: {e}")))?;
+    Ok(())
 }
 
 impl Db {
@@ -94,19 +114,9 @@ impl Db {
         }
     }
 
-    pub async fn migrate(&self, embedding_dim: usize) -> Result<(), SkbError> {
-        let schema = include_str!("../../../schema/001_init.surql");
-        let schema = schema.replace("{DIM}", &embedding_dim.to_string());
-        self.db
-            .query(&schema)
-            .await
-            .map_err(|e| SkbError::new(ErrorCode::Db, format!("migrate: {e}")))?
-            .check()
-            .map_err(|e| SkbError::new(ErrorCode::Db, format!("migrate check: {e}")))?;
-        Ok(())
-    }
-
-    /// Whether the database has no tables yet (a brand-new store).
+    /// True when the database has no tables yet (a freshly created data
+    /// directory). Used to decide whether stored model metadata can be
+    /// compared before the schema is applied (spec §9-5).
     pub async fn is_new_database(&self) -> Result<bool, SkbError> {
         let mut r = self
             .db
@@ -117,8 +127,22 @@ impl Db {
             .take(0)
             .map_err(|e| SkbError::new(ErrorCode::Db, format!("info db take: {e}")))?;
         let tables = rows.first().and_then(|v| v["tables"].as_object());
-        // Fail closed: an unexpected shape is treated as an existing store.
+        // Fail closed: if the result shape is unexpected (tables missing),
+        // treat the database as existing so model/dimension comparison is
+        // never skipped on a populated store (spec §9-5).
         Ok(tables.is_some_and(|t| t.is_empty()))
+    }
+
+    pub async fn migrate(&self, embedding_dim: usize) -> Result<(), SkbError> {
+        let schema = include_str!("../../../schema/001_init.surql");
+        let schema = schema.replace("{DIM}", &embedding_dim.to_string());
+        self.db
+            .query(&schema)
+            .await
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("migrate: {e}")))?
+            .check()
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("migrate check: {e}")))?;
+        Ok(())
     }
 
     pub async fn get_meta(&self, key: &str) -> Result<Option<String>, SkbError> {
@@ -134,6 +158,10 @@ impl Db {
         Ok(rows
             .first()
             .and_then(|v| v["meta_value"].as_str().map(|s| s.to_string())))
+    }
+
+    pub async fn set_meta(&self, key: &str, val: &str) -> Result<(), SkbError> {
+        set_meta_impl(&self.db, key, val).await
     }
 }
 

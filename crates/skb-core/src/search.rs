@@ -6,8 +6,14 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// Practical upper bound for `top_k`; also keeps `fetch_k = top_k * 3` small.
+/// Practical upper bound for search `top_k`: results are materialized in
+/// memory, and hybrid search fetches `top_k * 3` candidates. Shared by the
+/// request validation, the JSON Schema and the config validation.
 pub const MAX_TOP_K: usize = 1000;
+
+/// Maximum graph-expansion hop depth. Shared by the request validation and
+/// the JSON Schema so the two cannot drift.
+pub const MAX_GRAPH_EXPAND: usize = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SearchRequest {
@@ -15,7 +21,7 @@ pub struct SearchRequest {
     pub mode: Option<SearchMode>,
     #[schemars(range(min = 1, max = MAX_TOP_K))]
     pub top_k: Option<usize>,
-    #[schemars(range(min = 0, max = 5))]
+    #[schemars(range(min = 0, max = MAX_GRAPH_EXPAND))]
     pub graph_expand: Option<usize>,
     pub filter: Option<HashMap<String, String>>,
 }
@@ -43,10 +49,10 @@ impl SearchRequest {
             }
         }
         if let Some(depth) = self.graph_expand {
-            if depth > 5 {
+            if depth > MAX_GRAPH_EXPAND {
                 return Err(SkbError::new(
                     ErrorCode::Validation,
-                    "graph_expand must be at most 5",
+                    format!("graph_expand must be at most {MAX_GRAPH_EXPAND}"),
                 ));
             }
         }
@@ -147,12 +153,12 @@ async fn vector_search(
 async fn keyword_search(db: &Db, query: &str, top_k: usize) -> Result<Vec<SearchHit>, SkbError> {
     let sql = "SELECT content, idx, meta::id(document) AS document, \
          document.title AS title, document.source AS source, search::score(0) AS score \
-         FROM chunk WHERE content @@ $query ORDER BY score DESC LIMIT $top";
+         FROM chunk WHERE content @0@ $q ORDER BY score DESC LIMIT $top";
 
     let mut r = db
         .db
         .query(sql)
-        .bind(("query", query.to_string()))
+        .bind(("q", query.to_string()))
         .bind(("top", top_k as i64))
         .await
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("keyword: {e}")))?;
@@ -188,7 +194,8 @@ async fn hybrid_search(
          meta::id(document) AS document, \
          document.title AS title, document.source AS source, \
          vector::similarity::cosine(embedding, {emb_str}) AS score \
-         FROM chunk WHERE embedding <|{fetch_k},40|> {emb_str}"
+         FROM chunk WHERE embedding <|{fetch_k},40|> {emb_str} \
+         ORDER BY score DESC LIMIT {fetch_k}"
     );
     let mut r = db
         .db
@@ -203,11 +210,11 @@ async fn hybrid_search(
     let ksql = "SELECT content, idx, meta::id(id) AS chunk_id, \
          meta::id(document) AS document, \
          document.title AS title, document.source AS source, search::score(0) AS score \
-         FROM chunk WHERE content @@ $query ORDER BY score DESC LIMIT $fetch";
+         FROM chunk WHERE content @0@ $q ORDER BY score DESC LIMIT $fetch";
     let mut r = db
         .db
         .query(ksql)
-        .bind(("query", query.to_string()))
+        .bind(("q", query.to_string()))
         .bind(("fetch", fetch_k as i64))
         .await
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("hybrid kw: {e}")))?;
@@ -215,72 +222,95 @@ async fn hybrid_search(
         .take(0)
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("hybrid kw take: {e}")))?;
 
-    // RRF merge
-    type RankedHit = (f64, String, usize, String, Option<String>, Option<String>);
+    // RRF merge. keyword_matched marks chunks matched by the keyword leg so
+    // only those receive highlights; pure vector hits stay None.
+    struct RankedHit {
+        score: f64,
+        content: String,
+        idx: usize,
+        document: String,
+        title: Option<String>,
+        source: Option<String>,
+        keyword_matched: bool,
+    }
     let rrf_k = rrf_k.max(1) as f64;
     let mut scores: HashMap<String, RankedHit> = HashMap::new();
 
     for (rank, row) in vrows.iter().enumerate() {
         let id = row["chunk_id"].as_str().unwrap_or("").to_string();
-        let content = row["content"].as_str().unwrap_or("").to_string();
-        let idx = row["idx"].as_u64().unwrap_or(0) as usize;
-        let doc = row["document"].as_str().unwrap_or("").to_string();
-        let title = row["title"].as_str().map(|s| s.to_string());
-        let source = row["source"].as_str().map(|s| s.to_string());
         let rrf = 1.0 / (rrf_k + (rank as f64 + 1.0));
-        scores
-            .entry(id)
-            .and_modify(|e| e.0 += rrf)
-            .or_insert((rrf, content, idx, doc, title, source));
+        scores.entry(id).or_insert(RankedHit {
+            score: rrf,
+            content: row["content"].as_str().unwrap_or("").to_string(),
+            idx: row["idx"].as_u64().unwrap_or(0) as usize,
+            document: row["document"].as_str().unwrap_or("").to_string(),
+            title: row["title"].as_str().map(|s| s.to_string()),
+            source: row["source"].as_str().map(|s| s.to_string()),
+            keyword_matched: false,
+        });
     }
 
     let highlights = match_terms(query);
     for (rank, row) in krows.iter().enumerate() {
         let id = row["chunk_id"].as_str().unwrap_or("").to_string();
-        let content = row["content"].as_str().unwrap_or("").to_string();
-        let idx = row["idx"].as_u64().unwrap_or(0) as usize;
-        let doc = row["document"].as_str().unwrap_or("").to_string();
-        let title = row["title"].as_str().map(|s| s.to_string());
-        let source = row["source"].as_str().map(|s| s.to_string());
         let rrf = 1.0 / (rrf_k + (rank as f64 + 1.0));
-        scores
-            .entry(id)
-            .and_modify(|e| e.0 += rrf)
-            .or_insert((rrf, content, idx, doc, title, source));
+        if let Some(e) = scores.get_mut(&id) {
+            e.score += rrf;
+            e.keyword_matched = true;
+        } else {
+            scores.insert(
+                id,
+                RankedHit {
+                    score: rrf,
+                    content: row["content"].as_str().unwrap_or("").to_string(),
+                    idx: row["idx"].as_u64().unwrap_or(0) as usize,
+                    document: row["document"].as_str().unwrap_or("").to_string(),
+                    title: row["title"].as_str().map(|s| s.to_string()),
+                    source: row["source"].as_str().map(|s| s.to_string()),
+                    keyword_matched: true,
+                },
+            );
+        }
     }
 
     let mut sorted: Vec<_> = scores.into_iter().collect();
     sorted.sort_by(|a, b| {
-        b.1 .0
-            .partial_cmp(&a.1 .0)
+        // Deterministic ordering: equal RRF scores fall back to the chunk id
+        // so truncate(top_k) keeps the same hits regardless of HashMap
+        // iteration order.
+        b.1.score
+            .partial_cmp(&a.1.score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
     });
     sorted.truncate(top_k);
 
     Ok(sorted
         .into_iter()
-        .map(|(_, (score, content, idx, doc, title, source))| {
-            // Highlight only terms actually present in this chunk's content
-            // (the shared global highlights were computed from the query, not
-            // per hit).
-            let hit_highlights: Vec<String> = highlights
-                .iter()
-                .filter(|t| content.to_lowercase().contains(&t.to_lowercase()))
-                .cloned()
-                .collect();
-            let hit_highlights = if hit_highlights.is_empty() {
-                None
+        .map(|(_, hit)| {
+            let content = hit.content;
+            // Only keyword-matched chunks get highlights, and only for terms
+            // actually present in this chunk's body; vector-only hits keep
+            // None (spec §6).
+            let highlights = if hit.keyword_matched {
+                let content_lower = content.to_lowercase();
+                let filtered: Vec<String> = highlights
+                    .iter()
+                    .filter(|t| content_lower.contains(t.as_str()))
+                    .cloned()
+                    .collect();
+                Some(filtered)
             } else {
-                Some(hit_highlights)
+                None
             };
             SearchHit {
-                document_id: doc,
-                chunk_idx: idx,
+                document_id: hit.document,
+                chunk_idx: hit.idx,
                 content,
-                score,
-                title,
-                source,
-                highlights: hit_highlights,
+                score: hit.score,
+                title: hit.title,
+                source: hit.source,
+                highlights,
                 matched_entities: None,
             }
         })
@@ -295,20 +325,14 @@ fn rows_to_hits(
     for row in rows {
         let content = row["content"].as_str().unwrap_or("").to_string();
         // Only terms actually present in this chunk's content are highlighted
-        // (match_terms already returns lowercase terms); a filter that yields
-        // nothing becomes None (same representation as the hybrid path).
-        let content_lower = content.to_lowercase();
-        let hit_highlights: Option<Vec<String>> = highlights.and_then(|terms| {
-            let filtered: Vec<String> = terms
+        // (the query terms were computed globally, not per hit).
+        let hit_highlights: Option<Vec<String>> = highlights.map(|terms| {
+            let content_lower = content.to_lowercase();
+            terms
                 .iter()
                 .filter(|t| content_lower.contains(t.as_str()))
                 .cloned()
-                .collect();
-            if filtered.is_empty() {
-                None
-            } else {
-                Some(filtered)
-            }
+                .collect()
         });
         hits.push(SearchHit {
             document_id: row["document"].as_str().unwrap_or("").to_string(),

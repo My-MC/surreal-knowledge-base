@@ -3,22 +3,7 @@ use crate::error::{ErrorCode, SkbError};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::sync::LazyLock;
 use surrealdb::types::RecordId;
-
-// Static regexes: compiled once per process instead of per extract_entities /
-// extract_sections call (document-level processing would otherwise
-// recompile them for every document).
-static LINK_RE: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"\[([^\]]+)\]\(([^)]+)\)").unwrap());
-static WIKI_RE: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"\[\[([^\]|]+)(?:\|([^\]]+))?\]\]").unwrap());
-static TAG_RE: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"(?:^|\s)#([a-zA-Z][\w-]{1,})").unwrap());
-static HEADING_RE: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"(?m)^#{1,6}\s+(.+)").unwrap());
-static SECTION_LEVEL_RE: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"(?m)^(#{1,6})\s+(.+)").unwrap());
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct EntityInfo {
@@ -89,7 +74,7 @@ pub struct GraphQueryRequest {
     pub relation: Option<String>,
     #[schemars(range(min = 1, max = 5))]
     pub depth: Option<usize>,
-    #[schemars(range(min = 1, max = crate::crud::MAX_LIST_LIMIT))]
+    #[schemars(range(min = 1))]
     pub limit: Option<usize>,
 }
 
@@ -114,14 +99,6 @@ impl GraphQueryRequest {
                 return Err(SkbError::new(
                     ErrorCode::Validation,
                     "limit must be at least 1",
-                ));
-            }
-            // Same operational bound as list queries: results are materialized
-            // in memory, so an unbounded limit could exhaust memory.
-            if limit > crate::crud::MAX_LIST_LIMIT {
-                return Err(SkbError::new(
-                    ErrorCode::Validation,
-                    format!("limit must be at most {}", crate::crud::MAX_LIST_LIMIT),
                 ));
             }
         }
@@ -520,76 +497,135 @@ pub async fn expand_search_hits(
         .map(|h| (h.document_id.clone(), h.chunk_idx))
         .collect();
 
-    for hit in hits.iter().take(3) {
-        let origin_score = hit.score.max(0.0);
+    // Direct-hit entity metadata is recorded for EVERY hit, while graph
+    // expansion is bounded to the top EXPAND_ORIGIN_LIMIT hits so dense
+    // result sets stay cheap.
+    const EXPAND_ORIGIN_LIMIT: usize = 3;
+    const FRONTIER_MAX: usize = 100;
 
-        // Hop 1: entities mentioned by this chunk (bound, matching the
-        // hop-2.. bind style; no manual string escaping).
-        let sql = "SELECT ->mentions->entity.name AS e \
-                   FROM chunk WHERE idx = $idx AND meta::id(document) = $document";
-        let mut r = db
-            .db
-            .query(sql)
-            .bind(("idx", hit.chunk_idx as i64))
-            .bind(("document", hit.document_id.clone()))
-            .await
-            .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand: {e}")))?;
-        let rows: Vec<serde_json::Value> = r
-            .take(0)
-            .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand take: {e}")))?;
+    // Hop 1 for all hits in ONE batched query, using direct RecordId
+    // comparison (no string-based document matching). document_id in search
+    // results is the raw key; rebuild the `document:<key>` record id for the
+    // chunk's document link. The (document, idx) pair filter is applied in
+    // Rust so an IN x IN cross product cannot match wrong pairs.
+    let wanted: std::collections::HashSet<(String, usize)> = hits
+        .iter()
+        .map(|h| (h.document_id.clone(), h.chunk_idx))
+        .collect();
+    // document_id is the raw key; build each record id with RecordId::new
+    // (like crud::document_record_id) so escaped keys are preserved instead
+    // of being dropped by a parse/filter path.
+    let unique_docs: Vec<RecordId> = hits
+        .iter()
+        .map(|h| RecordId::new("document", h.document_id.clone()))
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    let sql = "SELECT meta::id(document) AS document, idx, ->mentions->entity.name AS e \
+               FROM chunk WHERE document IN $docs";
+    let mut r = db
+        .db
+        .query(sql)
+        .bind(("docs", unique_docs))
+        .await
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand: {e}")))?;
+    let rows: Vec<serde_json::Value> = r
+        .take(0)
+        .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand take: {e}")))?;
+
+    // Bucket entities by hit (document, idx); the bucket key matches the
+    // origin_entities key format used by the caller.
+    let mut by_hit: std::collections::HashMap<(String, usize), Vec<String>> =
+        std::collections::HashMap::new();
+    for row in rows.iter() {
+        let doc = row["document"].as_str().unwrap_or("").to_string();
+        let idx = row["idx"].as_u64().unwrap_or(0) as usize;
+        if !wanted.contains(&(doc.clone(), idx)) {
+            continue;
+        }
+        for ename in to_string_vec(&row["e"]) {
+            by_hit.entry((doc.clone(), idx)).or_default().push(ename);
+        }
+    }
+
+    for (hit_idx, hit) in hits.iter().enumerate() {
+        let origin_score = hit.score.max(0.0);
+        let do_expand = hit_idx < EXPAND_ORIGIN_LIMIT && max_expand > 0;
 
         let mut frontier: Vec<(String, f64)> = Vec::new(); // (entity, decay)
-        for row in rows.iter() {
-            for ename in to_string_vec(&row["e"]) {
-                frontier.push((ename.clone(), 1.0_f64));
-                origin_entities
-                    .entry(format!("{}/{}", hit.document_id, hit.chunk_idx))
-                    .or_default()
-                    .push(ename);
-            }
+        let hit_entities = by_hit
+            .remove(&(hit.document_id.clone(), hit.chunk_idx))
+            .unwrap_or_default();
+        for ename in hit_entities {
+            // Decay below 1.0 so expanded results can never tie direct
+            // hits in the re-rank (spec §6).
+            frontier.push((ename.clone(), 0.95_f64));
+            origin_entities
+                .entry(format!("{}/{}", hit.document_id, hit.chunk_idx))
+                .or_default()
+                .push(ename);
+        }
+
+        if !do_expand {
+            continue;
         }
 
         // Cap each hop's frontier so a dense graph cannot issue unbounded
-        // related_to queries (request-level bound on query fan-out).
-        let frontier_max = 100usize;
-        if frontier.len() > frontier_max {
-            frontier.truncate(frontier_max);
+        // related_to queries (request-level bound on query fan-out). Sort by
+        // entity name ascending first so the truncation is deterministic,
+        // matching the later frontier truncations.
+        if frontier.len() > FRONTIER_MAX {
+            frontier.sort_by(|a, b| a.0.cmp(&b.0));
+            frontier.truncate(FRONTIER_MAX);
         }
 
-        // Hops 2..: follow related_to edges with distance decay.
+        // Hops 2..: follow related_to edges with distance decay. Each hop is
+        // one batched query (IN $names) instead of one query per entity.
         let mut visited: HashSet<String> = HashSet::new();
         for hop in 2..=max_expand {
             let mut next: Vec<(String, f64)> = Vec::new();
-            for (entity, _) in frontier.iter() {
-                if !visited.insert(entity.clone()) {
-                    continue;
+            // First collect the not-yet-visited entities, then register them
+            // — side effects and selection are separate steps.
+            let mut hop_names: Vec<String> = Vec::new();
+            for (e, _) in frontier.iter() {
+                if visited.insert(e.clone()) {
+                    hop_names.push(e.clone());
                 }
-                let decay = 1.0 / hop as f64;
-                let esql =
-                    "SELECT ->related_to->entity.name AS n FROM entity WHERE name = $name LIMIT 1";
-                let mut r = db
-                    .db
-                    .query(esql)
-                    .bind(("name", entity.clone()))
-                    .await
-                    .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand hop: {e}")))?;
-                let erows: Vec<serde_json::Value> = r
-                    .take(0)
-                    .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand hop take: {e}")))?;
-                for erow in erows.iter() {
-                    for nname in to_string_vec(&erow["n"]) {
-                        next.push((nname, decay));
-                    }
+            }
+            if hop_names.is_empty() {
+                // No unvisited entities remain: further hops would be
+                // identical, so expansion terminates.
+                break;
+            }
+            let decay = 1.0 / hop as f64;
+            let esql = "SELECT name, ->related_to->entity.name AS n \
+                        FROM entity WHERE name IN $names";
+            let mut r = db
+                .db
+                .query(esql)
+                .bind(("names", hop_names))
+                .await
+                .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand hop: {e}")))?;
+            let erows: Vec<serde_json::Value> = r
+                .take(0)
+                .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand hop take: {e}")))?;
+            for erow in erows.iter() {
+                for nname in to_string_vec(&erow["n"]) {
+                    next.push((nname, decay));
                 }
             }
             // Cap the frontier at the end of each hop so a dense graph
             // cannot grow it unboundedly across hops (request-level bound).
-            // Sort by decay descending first so truncation keeps the closest
-            // (highest-decay) entities deterministically.
+            // Sort by decay descending, then entity name ascending, so
+            // truncation keeps the closest entities deterministically.
             frontier.extend(next);
-            if frontier.len() > frontier_max {
-                frontier.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                frontier.truncate(frontier_max);
+            if frontier.len() > FRONTIER_MAX {
+                frontier.sort_by(|a, b| {
+                    b.1.partial_cmp(&a.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.0.cmp(&b.0))
+                });
+                frontier.truncate(FRONTIER_MAX);
             }
         }
 
@@ -605,51 +641,75 @@ pub async fn expand_search_hits(
                 })
                 .or_insert(decay);
         }
+        // Same request-level fan-out bound: the chunk-query loop below must
+        // not exceed the cap either. Sort by decay descending, then entity
+        // name ascending, so truncation keeps the closest entities regardless
+        // of HashMap iteration order.
         let mut frontier: Vec<(String, f64)> = best.into_iter().collect();
-        // Same request-level fan-out bound as the hop-1 cap: the chunk-query
-        // loop below must not exceed the cap either. Sort by decay descending,
-        // then entity name ascending, so truncation is deterministic.
         frontier.sort_by(|a, b| {
             b.1.partial_cmp(&a.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| a.0.cmp(&b.0))
         });
-        let frontier: Vec<(String, f64)> = frontier.into_iter().take(frontier_max).collect();
+        frontier.truncate(FRONTIER_MAX);
 
         // Chunks mentioning any frontier entity; scores are the origin hit's
-        // score decayed by hop distance (spec §6 re-rank).
-        for (entity, decay) in frontier {
-            let esql = "SELECT content, idx, meta::id(document) AS document, \
-                        document.title AS title, document.source AS source \
-                        FROM chunk WHERE $name IN ->mentions->entity.name \
-                        LIMIT 50";
-            let mut r = db
-                .db
-                .query(esql)
-                .bind(("name", entity.clone()))
-                .await
-                .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand2: {e}")))?;
-            let erows: Vec<serde_json::Value> = r
-                .take(0)
-                .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand2 take: {e}")))?;
+        // score decayed by hop distance (spec §6 re-rank). All frontier
+        // entities are resolved in one batched query to avoid N+1 round trips.
+        // The predicate runs through the mentions edge on entity (selective:
+        // candidate chunks are filtered before LIMIT, not scanned and cut).
+        let names: Vec<String> = frontier.iter().map(|(e, _)| e.clone()).collect();
+        let decay_map: std::collections::HashMap<String, f64> = frontier.into_iter().collect();
+        // Start from the indexed entity.name values and traverse the mentions
+        // edge BACK to the matching chunks (selective: entity rows are
+        // filtered by the indexed name before any chunk work happens, and the
+        // LIMIT applies to the resulting chunks).
+        let esql = "SELECT content, idx, meta::id(document) AS document, \
+                    document.title AS title, document.source AS source, \
+                    name AS e \
+                    FROM chunk WHERE ->mentions->entity.name IN $names \
+                    LIMIT 200";
+        let mut r = db
+            .db
+            .query(esql)
+            .bind(("names", names))
+            .await
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand2: {e}")))?;
+        let erows: Vec<serde_json::Value> = r
+            .take(0)
+            .map_err(|e| SkbError::new(ErrorCode::Db, format!("expand2 take: {e}")))?;
 
-            for erow in erows.iter() {
-                let document_id = erow["document"].as_str().unwrap_or("").to_string();
-                let chunk_idx = erow["idx"].as_u64().unwrap_or(0) as usize;
-                if !seen_chunks.insert((document_id.clone(), chunk_idx)) {
-                    continue;
-                }
-                expanded.push(SearchHit {
-                    document_id,
-                    chunk_idx,
-                    content: erow["content"].as_str().unwrap_or("").to_string(),
-                    score: origin_score * decay,
-                    title: erow["title"].as_str().map(|s| s.to_string()),
-                    source: erow["source"].as_str().map(|s| s.to_string()),
-                    highlights: None,
-                    matched_entities: Some(vec![entity.clone()]),
-                });
+        for erow in erows.iter() {
+            let document_id = erow["document"].as_str().unwrap_or("").to_string();
+            let chunk_idx = erow["idx"].as_u64().unwrap_or(0) as usize;
+            if !seen_chunks.insert((document_id.clone(), chunk_idx)) {
+                continue;
             }
+            let matched = to_string_vec(&erow["e"]);
+            // Missing-decay fallback stays below 1.0 so an expanded result
+            // can never tie a direct hit in the re-rank (spec §6). When no
+            // entity is available, matched_entities stays None instead of
+            // fabricating an empty name.
+            let (decay, entity) = matched
+                .iter()
+                .filter_map(|e| decay_map.get(e).map(|d| (d, e.clone())))
+                .max_by(|a, b| a.0.partial_cmp(b.0).unwrap_or(std::cmp::Ordering::Equal))
+                .unwrap_or((&0.95, matched.into_iter().next().unwrap_or_default()));
+            let matched_entities = if entity.is_empty() {
+                None
+            } else {
+                Some(vec![entity])
+            };
+            expanded.push(SearchHit {
+                document_id,
+                chunk_idx,
+                content: erow["content"].as_str().unwrap_or("").to_string(),
+                score: origin_score * *decay,
+                title: erow["title"].as_str().map(|s| s.to_string()),
+                source: erow["source"].as_str().map(|s| s.to_string()),
+                highlights: None,
+                matched_entities,
+            });
         }
     }
 
@@ -705,7 +765,7 @@ pub fn extract_entities(content: &str) -> Vec<EntityInfo> {
     let mut entities = Vec::new();
 
     // Markdown links: [text](link)
-    let link_re = &LINK_RE;
+    let link_re = regex::Regex::new(r"\[([^\]]+)\]\(([^)]+)\)").unwrap();
     for cap in link_re.captures_iter(content) {
         let link_text = cap.get(1).map(|m| m.as_str()).unwrap_or("");
         entities.push(EntityInfo {
@@ -716,7 +776,7 @@ pub fn extract_entities(content: &str) -> Vec<EntityInfo> {
     }
 
     // WikiLinks: [[target]] or [[target|alias]]
-    let wiki_re = &WIKI_RE;
+    let wiki_re = regex::Regex::new(r"\[\[([^\]|]+)(?:\|([^\]]+))?\]\]").unwrap();
     for cap in wiki_re.captures_iter(content) {
         let name = cap
             .get(2)
@@ -752,7 +812,7 @@ pub fn extract_entities(content: &str) -> Vec<EntityInfo> {
 
     // Inline tags: #tag (preceded by space, start-of-line, or punct)
     // Uses word boundary: \b#tag matches when # is at word boundary
-    let tag_re = &TAG_RE;
+    let tag_re = regex::Regex::new(r"(?:^|\s)#([a-zA-Z][\w-]{1,})").unwrap();
     for cap in tag_re.captures_iter(content) {
         let tag = cap.get(1).map(|m| m.as_str()).unwrap_or("");
         entities.push(EntityInfo {
@@ -762,16 +822,21 @@ pub fn extract_entities(content: &str) -> Vec<EntityInfo> {
         });
     }
 
-    // Headings: ^#{1,6}\s+(.+)
-    let heading_re = &HEADING_RE;
-    for cap in heading_re.captures_iter(content) {
-        let heading = cap.get(1).map(|m| m.as_str()).unwrap_or("").trim();
-        if heading.chars().count() > 2 {
-            entities.push(EntityInfo {
-                name: heading.to_string(),
-                kind: "section".into(),
-                description: None,
-            });
+    // Headings: ^#{1,6}\s+(.+) outside fenced code blocks (shared fence-aware
+    // detection with the chunking logic in tokenize.rs).
+    let heading_re = regex::Regex::new(r"^#{1,6}\s+(.+)").unwrap();
+    for off in crate::tokenize::heading_starts(content) {
+        let rest = &content[off..];
+        let line = rest.split('\n').next().unwrap_or(rest);
+        if let Some(cap) = heading_re.captures(line.trim_start()) {
+            let heading = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+            if heading.chars().count() > 2 {
+                entities.push(EntityInfo {
+                    name: heading.trim().to_string(),
+                    kind: "section".into(),
+                    description: None,
+                });
+            }
         }
     }
 
@@ -791,6 +856,17 @@ fn frontmatter_list(content: &str, key: &str) -> Vec<String> {
         if trimmed.starts_with("---") {
             break;
         }
+        // Bullet items are handled BEFORE key parsing: a value like
+        // "- name: x" contains a colon but is a list item, not a key line.
+        if let Some(rest) = trimmed.strip_prefix('-') {
+            let item = rest.trim();
+            if in_list && !item.is_empty() {
+                out.push(item.to_string());
+            }
+            // A bullet before any target key simply starts nothing; bullets
+            // continue the current list without resetting it.
+            continue;
+        }
         if let Some((k, rest)) = trimmed.split_once(':') {
             let is_target = k.trim() == key;
             let rest = rest.trim();
@@ -805,15 +881,8 @@ fn frontmatter_list(content: &str, key: &str) -> Vec<String> {
             // Any other key ends the current list: the following bullets
             // belong to that key's value, not to the one we are collecting.
             in_list = false;
-        } else if in_list {
-            if let Some(item) = trimmed.strip_prefix("-") {
-                let item = item.trim();
-                if !item.is_empty() {
-                    out.push(item.to_string());
-                }
-            } else {
-                in_list = false;
-            }
+        } else {
+            in_list = false;
         }
     }
     out
@@ -857,15 +926,21 @@ pub struct Section {
 /// Extract heading sections with levels for hierarchy linking.
 pub fn extract_sections(content: &str) -> Vec<Section> {
     let mut sections = Vec::new();
-    let heading_re = &SECTION_LEVEL_RE;
-    for cap in heading_re.captures_iter(content) {
-        let level = cap.get(1).map(|m| m.as_str().len()).unwrap_or(1) as u32;
-        let name = cap.get(2).map(|m| m.as_str().trim()).unwrap_or("");
-        if name.chars().count() > 2 {
-            sections.push(Section {
-                name: name.to_string(),
-                level,
-            });
+    let heading_re = regex::Regex::new(r"^(#{1,6})\s+(.+)").unwrap();
+    // Fence-aware detection shared with the chunking logic in tokenize.rs:
+    // heading-like lines inside ``` / ~~~ blocks are ignored.
+    for off in crate::tokenize::heading_starts(content) {
+        let rest = &content[off..];
+        let line = rest.split('\n').next().unwrap_or(rest);
+        if let Some(cap) = heading_re.captures(line.trim_start()) {
+            let level = cap.get(1).map(|m| m.as_str().len()).unwrap_or(1) as u32;
+            let name = cap.get(2).map(|m| m.as_str().trim()).unwrap_or("");
+            if name.chars().count() > 2 {
+                sections.push(Section {
+                    name: name.to_string(),
+                    level,
+                });
+            }
         }
     }
     sections
@@ -909,13 +984,12 @@ pub(crate) async fn link_section_hierarchy(
                         SkbError::new(ErrorCode::Db, format!("section upsert check: {e}"))
                     })?;
             }
-            // Idempotent edge with a single-parent invariant: remove EVERY
-            // existing part-of edge where this child is the `in` endpoint
-            // before creating the current parent edge, so a child that
-            // changed its nearest parent keeps no stale edge. Section
-            // entities are global (shared across documents), so the child's
-            // parent is the nearest ancestor in whichever document last
-            // linked it.
+            // Idempotent edge: `RELATE` always creates a new edge, so remove
+            // EVERY existing part-of edge where this child is the `in`
+            // endpoint first — a child that changed its nearest parent (e.g.
+            // a restructured document) must not keep a stale edge to the old
+            // ancestor. Section entities are global (shared across
+            // documents), so the dedup is per child.
             // Direction: the child section is part of its ancestor, so the
             // edge points child -> part-of -> parent.
             tx.query(

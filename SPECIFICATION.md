@@ -331,21 +331,21 @@ impl KnowledgeBase {
     pub async fn search(&self, req: SearchRequest) -> Result<SearchResponse>;
 
     // グラフ
-    pub async fn graph_query(&self, req: GraphQueryRequest) -> Result<GraphQueryResponse>;
-    pub async fn upsert_entity(&self, req: EntityRequest) -> Result<Entity>;
-    pub async fn link(&self, req: LinkRequest) -> Result<LinkResult>;
+    pub async fn graph_query(&self, req: &GraphQueryRequest) -> Result<GraphQueryResult>;
+    pub async fn upsert_entity(&self, entity: &EntityInfo) -> Result<()>;
+    pub async fn link_entities(&self, link: &LinkInfo) -> Result<()>;
 
     // 管理
     pub async fn stats(&self) -> Result<Stats>;
     pub async fn doctor(&self) -> Result<DoctorReport>;  // 環境診断
-    pub async fn reindex(&self, req: ReindexRequest) -> Result<ReindexResult>; // モデル/チャンク設定変更の全件反映（§5.4）
+    pub async fn reindex(&self, req: &reindex::ReindexRequest, progress: Option<&reindex::ProgressFn>) -> Result<ReindexResult>; // モデル/チャンク設定変更の全件反映（§5.4）
 }
 ```
 
 - すべての Request/Response 型は `Serialize`/`Deserialize`/`JsonSchema` を derive し、**CLI の JSON 入出力と MCP ツールスキーマの双方をこの型から生成**する。
-- 非同期（`tokio`）。長時間処理（upload）は内部で進捗コールバックを受け取れる設計とし、MCP では progress notification、CLI ではプログレスバーへ写像する。
+- 非同期（`tokio`）。長時間処理（reindex）は内部で進捗コールバックを受け取り、MCP では progress notification、CLI ではプログレス表示へ写像する。upload は文書ごとのサイズ制限により単発の完了応答で十分であり、進捗コールバックの対象外とする。
 
-上記は v1 の目標API契約である。全 Request/Response 型は `Serialize`/`Deserialize`/`JsonSchema` を derive し、MCP ツールスキーマは CLI と同じ `skb-core` DTO から自動生成される（Phase 9-2 完了）。進捗コールバック（Phase 9-5）と CLI/MCP のゴールデン契約テスト（Phase 9-6）は未完了である。
+上記は v1 の目標API契約である。全 Request/Response 型は `Serialize`/`Deserialize`/`JsonSchema` を derive し、MCP ツールスキーマは CLI と同じ `skb-core` DTO から自動生成される（Phase 9-2 完了）。reindex の進捗コールバック（Phase 9-5 完了）と CLI/MCP のゴールデン契約テスト（Phase 9-6 完了）も実装済みである。
 
 ### 7.2 設定
 
