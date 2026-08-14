@@ -187,6 +187,7 @@ fn contract_upload_rejects_multiple_sources() {
 #[serial(contract)]
 #[test]
 fn contract_upload_url_with_recursive() {
+    setup_config();
     // --url --recursive (no --path) must reach the single-URL upload flow
     // (and fail on the unreachable URL) instead of an empty multi-input loop
     // or the "--recursive requires --path" usage error.
@@ -195,7 +196,7 @@ fn contract_upload_url_with_recursive() {
         .current_dir(test_dir())
         .output()
         .expect("failed to run skb upload --url --recursive");
-    assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(8), "E_VALIDATION exit code");
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
