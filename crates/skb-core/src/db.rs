@@ -149,8 +149,9 @@ impl Db {
         // it first never fails on duplicates; the duplicate check then runs
         // against the applied store). The check is a full-table GROUP BY, so
         // it runs only once per store: success is recorded in `meta` and
-        // subsequent startups skip it.
-        if self.get_meta("dup_check_v1").await?.is_none() {
+        // subsequent startups skip it. Only the exact "ok" value counts as
+        // validated; unexpected or corrupted metadata re-runs the check.
+        if self.get_meta("dup_check_v1").await?.as_deref() != Some("ok") {
             let dup_sql = "SELECT document, idx FROM \
                            (SELECT document, idx, count() AS c FROM chunk \
                             GROUP BY document, idx) WHERE c > 1 LIMIT 10";
