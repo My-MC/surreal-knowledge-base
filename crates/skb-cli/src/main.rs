@@ -750,6 +750,22 @@ mod tests {
     }
 
     #[test]
+    fn upload_base64_conflicts_with_paths_and_url() {
+        // --base64 --stdin satisfies the requires = "stdin" constraint, so
+        // these rejections independently exercise conflicts_with_all.
+        assert!(Cli::try_parse_from(["skb", "upload", "--base64", "--stdin", "a.md"]).is_err());
+        assert!(Cli::try_parse_from([
+            "skb",
+            "upload",
+            "--base64",
+            "--stdin",
+            "--url",
+            "https://x.example/a"
+        ])
+        .is_err());
+    }
+
+    #[test]
     fn upload_input_source_precedence() {
         // clap accepts combined sources at parse time; the runtime check
         // (exactly one of --stdin, --url, paths) rejects combinations.

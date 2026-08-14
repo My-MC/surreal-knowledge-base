@@ -490,7 +490,7 @@ fn contract_upload_url_reaches_url_branch() {
         .current_dir(test_dir())
         .output()
         .expect("failed to run skb upload --url");
-    assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(8), "E_VALIDATION exit code");
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let combined = format!("{stdout}\n{stderr}");
