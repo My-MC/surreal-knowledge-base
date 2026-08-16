@@ -36,11 +36,10 @@ jobs:
           # Failing to install cargo-audit fails the step (hence the job):
           # a green gate must never skip the advisory check silently.
           cargo install cargo-audit --locked
-          # rkyv (RUSTSEC-2026-0235) and rsa (RUSTSEC-2023-0071) come from
-          # surrealdb-core (via its rkyv / jsonwebtoken deps). No fixed
-          # 0.7.x / 0.9.x release exists, and the 0.8 / 0.10 majors are
-          # breaking — cannot be upgraded from this crate. Tracked upstream.
-          cargo audit --ignore RUSTSEC-2026-0235 --ignore RUSTSEC-2023-0071
+          # Suppressed advisories live in .cargo/audit.toml with re-evaluation
+          # dates and tracking issue #40, so the ignore list cannot silently
+          # become permanent.
+          cargo audit
       - name: Check no native-tls / openssl dependency
         run: |
           cargo tree -i openssl-sys 2>&1 | grep -q "did not match"

@@ -152,7 +152,8 @@ impl Db {
         // subsequent startups skip it. Only the exact "ok" value counts as
         // validated; unexpected or corrupted metadata re-runs the check.
         if self.get_meta("dup_check_v1").await?.as_deref() != Some("ok") {
-            let dup_sql = "SELECT document, idx FROM \
+            let dup_sql =
+                "SELECT string::concat('document:', meta::id(document)) AS doc_id, idx FROM \
                            (SELECT document, idx, count() AS c FROM chunk \
                             GROUP BY document, idx) WHERE c > 1 LIMIT 10";
             let mut dup = self
@@ -169,7 +170,7 @@ impl Db {
                     .map(|r| {
                         format!(
                             "{} idx={}",
-                            r["document"].as_str().unwrap_or("?"),
+                            r["doc_id"].as_str().unwrap_or("?"),
                             r["idx"].as_u64().unwrap_or(0)
                         )
                     })
