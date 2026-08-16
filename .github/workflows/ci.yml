@@ -31,11 +31,14 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Serial tests (incl. golden contract tests)
         run: cargo test --workspace -- --test-threads=1
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          # Pinned version; install failure fails the step (hence the job):
+          # a green gate must never skip the advisory check silently.
+          tool: cargo-audit@0.22.2
       - name: Cargo audit (dependency advisories, incl. pinned ureq)
         run: |
-          # Failing to install cargo-audit fails the step (hence the job):
-          # a green gate must never skip the advisory check silently.
-          cargo install cargo-audit --locked
           # Suppressed advisories live in .cargo/audit.toml with re-evaluation
           # dates and tracking issue #40, so the ignore list cannot silently
           # become permanent.

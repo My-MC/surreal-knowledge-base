@@ -7,7 +7,7 @@
 // (spawns the real target/debug/skb and target/debug/skb-mcp binaries; do not
 // run standalone.)
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -243,11 +243,7 @@ fn run_cli(dir: &std::path::Path, args: &[&str], stdin_data: Option<&str>) -> Re
 fn normalize(value: &mut Value) {
     match value {
         Value::Object(map) => {
-            map.remove("document_id");
-            map.remove("id");
-            map.remove("elapsed_ms");
-            map.remove("created_at");
-            map.remove("updated_at");
+            drop_volatile_keys(map);
             for (k, v) in map.iter_mut() {
                 // `hits` carries ranking order and `chunks` are ordered by
                 // idx — both must survive comparison; `highlights` /
@@ -277,11 +273,7 @@ fn normalize(value: &mut Value) {
 fn normalize_object_preserving_arrays(value: &mut Value) {
     match value {
         Value::Object(map) => {
-            map.remove("document_id");
-            map.remove("id");
-            map.remove("elapsed_ms");
-            map.remove("created_at");
-            map.remove("updated_at");
+            drop_volatile_keys(map);
             for (k, v) in map.iter_mut() {
                 if k == "highlights" || k == "matched_entities" {
                     for item in v.as_array_mut().into_iter().flatten() {
@@ -294,6 +286,16 @@ fn normalize_object_preserving_arrays(value: &mut Value) {
         }
         other => normalize(other),
     }
+}
+
+/// Remove keys that differ between runs (random record ids, timing) from an
+/// object. Shared by both normalization flavors so the key set cannot drift.
+fn drop_volatile_keys(map: &mut Map<String, Value>) {
+    map.remove("document_id");
+    map.remove("id");
+    map.remove("elapsed_ms");
+    map.remove("created_at");
+    map.remove("updated_at");
 }
 
 const TEST_DOC: &str = "SurrealDB supports vector search with HNSW and full-text with BM25.";

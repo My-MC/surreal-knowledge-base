@@ -153,9 +153,9 @@ impl Db {
         // validated; unexpected or corrupted metadata re-runs the check.
         if self.get_meta("dup_check_v1").await?.as_deref() != Some("ok") {
             let dup_sql =
-                "SELECT string::concat('document:', meta::id(document)) AS doc_id, idx FROM \
-                           (SELECT document, idx, count() AS c FROM chunk \
-                            GROUP BY document, idx) WHERE c > 1 LIMIT 10";
+                "SELECT doc_id, idx FROM \
+                           (SELECT string::concat('document:', meta::id(document)) AS doc_id, idx, count() AS c FROM chunk \
+                            GROUP BY doc_id, idx) WHERE c > 1 LIMIT 10";
             let mut dup = self
                 .db
                 .query(dup_sql)
