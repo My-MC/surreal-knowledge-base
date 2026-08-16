@@ -211,7 +211,6 @@ fn contract_upload_url_with_recursive() {
     );
 }
 
-#[serial(contract)]
 #[test]
 fn contract_search() {
     setup_config();

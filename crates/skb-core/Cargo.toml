@@ -35,7 +35,7 @@ pdf-extract = "0.12"
 lopdf = "0.42"
 
 [dev-dependencies]
-criterion = { version = "0.8", features = ["async_tokio"] }
+criterion = "0.8"
 ahash = "0.8"
 
 [[bench]]
