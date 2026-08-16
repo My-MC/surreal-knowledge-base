@@ -98,7 +98,6 @@ impl KnowledgeBase {
             config.resolve_embedding_settings(embedder.dimension(), embedder.max_input_tokens())?;
 
         let dimension = embedder.dimension();
-
         // Compare the stored model/dimension BEFORE migrate so a mismatch never
         // modifies the schema, field, index or meta (spec §9-5). A brand-new
         // database has no meta table yet and takes the initialization path.

@@ -152,6 +152,40 @@ fn contract_upload() {
 
 #[serial(contract)]
 #[test]
+fn contract_upload_rejects_multiple_sources() {
+    setup_config();
+    // Combining input sources is rejected at runtime with E_VALIDATION
+    // (spec §12.2: exactly one of --stdin, --url, or paths).
+    let output = Command::new(skb_binary())
+        .args([
+            "upload",
+            "--stdin",
+            "--url",
+            "http://127.0.0.1:1/x",
+            "--title",
+            "multi",
+        ])
+        .current_dir(test_dir())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn skb upload")
+        .wait_with_output()
+        .expect("failed to run skb upload");
+    assert_eq!(output.status.code(), Some(8), "E_VALIDATION exit code");
+    let val: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(val["error"], "E_VALIDATION");
+    assert!(
+        val["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("exactly one"),
+        "must explain the single-source rule: {val}"
+    );
+}
+
+#[serial(contract)]
+#[test]
 fn contract_upload_url_with_recursive() {
     setup_config();
     // --url --recursive (no --path) must reach the single-URL upload flow
@@ -162,7 +196,7 @@ fn contract_upload_url_with_recursive() {
         .current_dir(test_dir())
         .output()
         .expect("failed to run skb upload --url --recursive");
-    assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(8), "E_VALIDATION exit code");
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
@@ -363,6 +397,7 @@ fn contract_list_chunk_count_and_delete_counts() {
     assert_eq!(val["error"], "E_DOCUMENT_NOT_FOUND");
 }
 
+#[serial(contract)]
 #[test]
 fn contract_query_command() {
     setup_config();
@@ -380,6 +415,7 @@ fn contract_query_command() {
     assert!(statements[0][0]["c"].as_u64().unwrap() >= 1);
 }
 
+#[serial(contract)]
 #[test]
 fn contract_doctor_json() {
     setup_config();
@@ -389,6 +425,7 @@ fn contract_doctor_json() {
     assert!(val["errors"].as_array().unwrap().is_empty());
 }
 
+#[serial(contract)]
 #[test]
 fn contract_upload_glob_and_multiple_paths() {
     setup_config();
@@ -442,6 +479,35 @@ fn contract_upload_glob_and_multiple_paths() {
     assert_eq!(list.as_array().unwrap().len(), 4);
 }
 
+#[serial(contract)]
+#[test]
+fn contract_upload_url_reaches_url_branch() {
+    setup_config();
+    // http://127.0.0.1:1/x is blocked by SSRF validation before any
+    // connection, so the URL branch must fail with E_VALIDATION (not fall
+    // through to the "no files to upload" usage error).
+    let output = Command::new(skb_binary())
+        .args(["upload", "--url", "http://127.0.0.1:1/x"])
+        .current_dir(test_dir())
+        .output()
+        .expect("failed to run skb upload --url");
+    assert_eq!(output.status.code(), Some(8), "E_VALIDATION exit code");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let combined = format!("{stdout}\n{stderr}");
+    assert!(
+        !combined.contains("no files to upload"),
+        "URL must not fall through to the no-files error: {combined}"
+    );
+    let val: Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|e| panic!("stdout must be JSON: {e}\nstdout={stdout}"));
+    assert_eq!(
+        val["error"], "E_VALIDATION",
+        "SSRF-blocked URL must report E_VALIDATION: {combined}"
+    );
+}
+
+#[serial(contract)]
 #[test]
 fn contract_pipeline() {
     setup_config();

@@ -748,4 +748,39 @@ mod tests {
         );
         assert!(Cli::try_parse_from(["skb", "upload", "--base64", "--stdin"]).is_ok());
     }
+
+    #[test]
+    fn upload_base64_conflicts_with_paths_and_url() {
+        // --base64 --stdin satisfies the requires = "stdin" constraint, so
+        // these rejections independently exercise conflicts_with_all.
+        assert!(Cli::try_parse_from(["skb", "upload", "--base64", "--stdin", "a.md"]).is_err());
+        assert!(Cli::try_parse_from([
+            "skb",
+            "upload",
+            "--base64",
+            "--stdin",
+            "--url",
+            "https://x.example/a"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn upload_input_source_precedence() {
+        // clap accepts combined sources at parse time; the runtime check
+        // (exactly one of --stdin, --url, paths) rejects combinations.
+        assert!(Cli::try_parse_from(["skb", "upload", "a.md", "--stdin"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["skb", "upload", "a.md", "--url", "https://x.example/a"]).is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(["skb", "upload", "--url", "https://x.example/a", "--stdin"])
+                .is_ok()
+        );
+        assert!(Cli::try_parse_from(["skb", "upload", "--base64", "a.md"]).is_err());
+        assert!(
+            Cli::try_parse_from(["skb", "upload", "--base64", "--url", "https://x.example/a"])
+                .is_err()
+        );
+    }
 }

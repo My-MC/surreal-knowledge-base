@@ -411,7 +411,6 @@ pub async fn delete_document(
         .begin()
         .await
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("delete begin: {e}")))?;
-
     // A missing document is an explicit error (spec §9-6).
     let mut r = tx
         .query("SELECT id FROM $id LIMIT 1")
