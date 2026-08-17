@@ -139,7 +139,9 @@ impl McpClient {
             if read == 0 {
                 panic!("skb-mcp exited before responding to request {id} (early exit)");
             }
-            let msg: Value = serde_json::from_str(&line).unwrap();
+            let msg: Value = serde_json::from_str(&line).unwrap_or_else(|e| {
+                panic!("non-JSON line on skb-mcp stdout while waiting for {id}: {e}: {line:?}")
+            });
             if msg["id"] == json!(id) {
                 self.last_response
                     .store(now_millis(), std::sync::atomic::Ordering::SeqCst);

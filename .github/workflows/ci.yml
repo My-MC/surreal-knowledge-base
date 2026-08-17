@@ -37,6 +37,19 @@ jobs:
           # Pinned version; install failure fails the step (hence the job):
           # a green gate must never skip the advisory check silently.
           tool: cargo-audit@0.22.2
+      - name: Fail on expired audit suppressions
+        shell: bash
+        run: |
+          today=$(date -u +%Y-%m-%d)
+          while read -r deadline; do
+            if [[ "$today" > "$deadline" ]]; then
+              echo "expired audit suppression deadline: $deadline (see .cargo/audit.toml, issue #40)"
+              exit 1
+            fi
+          done < <(
+            grep -oE 'Re-evaluate on or before [0-9]{4}-[0-9]{2}-[0-9]{2}' .cargo/audit.toml \
+              | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' || true
+          )
       - name: Cargo audit (dependency advisories, incl. pinned ureq)
         run: |
           # Suppressed advisories live in .cargo/audit.toml with re-evaluation
