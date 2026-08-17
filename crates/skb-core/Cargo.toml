@@ -32,7 +32,7 @@ url = "2"
 base64 = "0.23"
 regex = "1"
 pdf-extract = "0.12"
-lopdf = "0.42"
+lopdf = "0.44"
 
 [dev-dependencies]
 criterion = "0.8"
