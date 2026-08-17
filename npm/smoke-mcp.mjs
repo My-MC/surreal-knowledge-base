@@ -162,7 +162,9 @@ assert(upJson.title === "smoke-doc", "skb_upload must echo the title");
 
 const search = await request("tools/call", {
   name: "skb_search",
-  arguments: { query: runToken, mode: "keyword", top_k: 5 },
+  // Older smoke docs share the "smoketoken" prefix after tokenization, so
+  // request a larger window than a single leftover run.
+  arguments: { query: runToken, mode: "keyword", top_k: 50 },
 });
 assert(!search.result?.isError, "skb_search must succeed");
 const searchText = search.result?.content?.[0]?.text ?? "";

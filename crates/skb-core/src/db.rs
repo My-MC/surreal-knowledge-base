@@ -171,7 +171,9 @@ impl Db {
                         format!(
                             "{} idx={}",
                             r["doc_id"].as_str().unwrap_or("?"),
-                            r["idx"].as_u64().unwrap_or(0)
+                            r["idx"]
+                                .as_i64()
+                                .map_or_else(|| "?".to_string(), |idx| idx.to_string())
                         )
                     })
                     .collect();
