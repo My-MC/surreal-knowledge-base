@@ -52,6 +52,18 @@ jobs:
             echo "no 'Re-evaluate on or before <date>' deadlines found in .cargo/audit.toml"
             exit 1
           fi
+          # Every suppressed advisory must carry its own deadline, otherwise a
+          # new ignore entry without one would bypass this gate.
+          ignored=$(awk '
+            /^ignore = \[/ { in_ignore = 1; next }
+            in_ignore && /^\]/ { in_ignore = 0 }
+            in_ignore && /"RUSTSEC-/ { count++ }
+            END { print count + 0 }
+          ' .cargo/audit.toml)
+          if [[ "$ignored" -ne ${#deadlines[@]} ]]; then
+            echo "each ignored advisory must have exactly one re-evaluation deadline (found $ignored ignores, ${#deadlines[@]} deadlines)"
+            exit 1
+          fi
           for deadline in "${deadlines[@]}"; do
             if [[ "$today" > "$deadline" ]]; then
               echo "expired audit suppression deadline: $deadline (see .cargo/audit.toml, issue #40)"
