@@ -41,15 +41,23 @@ jobs:
         shell: bash
         run: |
           today=$(date -u +%Y-%m-%d)
-          while read -r deadline; do
+          mapfile -t deadlines < <(
+            grep -oE 'Re-evaluate on or before [0-9]{4}-[0-9]{2}-[0-9]{2}' .cargo/audit.toml \
+              | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}'
+          )
+          # The extraction must stay in sync with .cargo/audit.toml: zero
+          # deadlines means the gate silently stopped working, not that the
+          # suppressions are safe.
+          if [[ ${#deadlines[@]} -eq 0 ]]; then
+            echo "no 'Re-evaluate on or before <date>' deadlines found in .cargo/audit.toml"
+            exit 1
+          fi
+          for deadline in "${deadlines[@]}"; do
             if [[ "$today" > "$deadline" ]]; then
               echo "expired audit suppression deadline: $deadline (see .cargo/audit.toml, issue #40)"
               exit 1
             fi
-          done < <(
-            grep -oE 'Re-evaluate on or before [0-9]{4}-[0-9]{2}-[0-9]{2}' .cargo/audit.toml \
-              | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' || true
-          )
+          done
       - name: Cargo audit (dependency advisories, incl. pinned ureq)
         run: |
           # Suppressed advisories live in .cargo/audit.toml with re-evaluation
@@ -248,9 +256,17 @@ jobs:
         run: |
           BIN=npm-out/packages/linux-arm64/bin/skb-mcp
           chmod +x "$BIN"
-          ldd "$BIN"
+          DEPS=$(ldd "$BIN" 2>&1)
+          echo "$DEPS"
+          # Positive check: ldd must actually resolve the binary's dynamic
+          # dependencies; a silent failure here would make the forbidden-lib
+          # scan below vacuous.
+          if ! echo "$DEPS" | grep -q 'libc\.so'; then
+            echo "could not read dynamic dependencies from $BIN"
+            exit 1
+          fi
           for lib in libonnxruntime libssl libcrypto libstdc++; do
-            if ldd "$BIN" 2>&1 | grep -q "$lib"; then
+            if echo "$DEPS" | grep -q "$lib"; then
               echo "unexpected dynamic dependency: $lib"
               exit 1
             fi
@@ -290,9 +306,17 @@ jobs:
         run: |
           BIN=npm-out/packages/darwin-arm64/bin/skb-mcp
           chmod +x "$BIN"
-          otool -L "$BIN"
+          DEPS=$(otool -L "$BIN" 2>&1)
+          echo "$DEPS"
+          # Positive check: otool must actually resolve the binary's dynamic
+          # dependencies; a silent failure here would make the forbidden-lib
+          # scan below vacuous.
+          if ! echo "$DEPS" | grep -q 'libSystem\.B\.dylib'; then
+            echo "could not read dynamic dependencies from $BIN"
+            exit 1
+          fi
           for lib in libonnxruntime libssl libcrypto; do
-            if otool -L "$BIN" 2>&1 | grep -q "$lib"; then
+            if echo "$DEPS" | grep -q "$lib"; then
               echo "unexpected dynamic dependency: $lib"
               exit 1
             fi
