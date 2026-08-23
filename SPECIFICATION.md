@@ -269,7 +269,7 @@ LLM 抽出は `EntityExtractor` トレイトの差し替え実装として将来
 
 #### 整合性ルール（`KnowledgeBase::open` 時に検証）
 
-1. `0 <= overlap_tokens < max_tokens ≤ max_input_tokens` を検証。違反時は `E_VALIDATION`。
+1. `0 ≤ overlap_tokens < max_tokens ≤ max_input_tokens` を検証。違反時は `E_VALIDATION`。
 2. `meta` テーブルに記録された `embedding_model` / `embedding_dimension` と設定値を比較。**不一致のまま通常操作は行わず** `E_MODEL_MISMATCH` を返し、再構築（`reindex`）を案内する。これにより、異なる次元・語彙のベクトルが同一インデックスに混在することを防ぐ。
 3. `embedding.tokenizer` は明示パスと `"auto"`（`embedding.model` に対応する tokenizer.json の解決）のどちらでも、同じ tokenizer 識別子契約を適用する。tokenizer.json の存在と形式を検証し、取得元（モデル ID と revision、または明示パス）、`tokenizers` のアルゴリズム/バージョン、vocabulary、normalizer、pre-tokenizer、post-processor、decoder、その他の構成情報を canonical JSON serialization した上で SHA-256 fingerprint を生成する。fingerprint には schema version を含め、canonicalization 規則と対象フィールドを変更する場合は schema version を更新する。解決した tokenizer の取得元、アルゴリズム/バージョン、fingerprint schema version、fingerprint を `meta` に保存し、既存値と不一致の場合は `E_MODEL_MISMATCH` を返して再構築（`reindex`）を案内する。新規作成時・reindex 完了時には、明示パスと `auto` の両方を含むすべての解決経路で同じ tokenizer metadata を保存する。
 
@@ -319,7 +319,9 @@ LLM 抽出は `EntityExtractor` トレイトの差し替え実装として将来
 pub struct KnowledgeBase { /* db, embedder, tokenizer, config */ }
 
 impl KnowledgeBase {
-    pub async fn open(config: &Config) -> Result<Self>;
+    pub async fn open(config: Config) -> Result<Self>;
+    // モデル/次元/tokenizer 不一致でも開く。reindex による再構築専用（§9-5）
+    pub async fn open_for_reindex(config: Config) -> Result<Self>;
 
     // 資料管理
     pub async fn upload(&self, req: UploadRequest) -> Result<UploadResult>;
@@ -338,14 +340,14 @@ impl KnowledgeBase {
     // 管理
     pub async fn stats(&self) -> Result<Stats>;
     pub async fn doctor(&self) -> Result<DoctorReport>;  // 環境診断
-    pub async fn reindex(&self, req: &reindex::ReindexRequest, progress: Option<&reindex::ProgressFn>) -> Result<ReindexResult>; // モデル/チャンク設定変更の全件反映（§5.4）
+    pub async fn reindex(&self, req: &ReindexRequest, progress: Option<&ProgressFn>) -> Result<ReindexResult>; // モデル/チャンク設定変更の全件反映（§5.4）
 }
 ```
 
 - すべての Request/Response 型は `Serialize`/`Deserialize`/`JsonSchema` を derive し、**CLI の JSON 入出力と MCP ツールスキーマの双方をこの型から生成**する。
-- 非同期（`tokio`）。長時間処理（reindex）は内部で進捗コールバックを受け取り、MCP では progress notification、CLI ではプログレス表示へ写像する。upload は文書ごとのサイズ制限により単発の完了応答で十分であり、進捗コールバックの対象外とする。
+- 非同期（`tokio`）。長時間処理（reindex）は進捗コールバック（`ProgressFn`）を受け取り、MCP では progress notification、CLI ではプログレス出力へ写像する。
 
-上記は v1 の目標API契約である。全 Request/Response 型は `Serialize`/`Deserialize`/`JsonSchema` を derive し、MCP ツールスキーマは CLI と同じ `skb-core` DTO から自動生成される（Phase 9-2 完了）。reindex の進捗コールバック（Phase 9-5 完了）と CLI/MCP のゴールデン契約テスト（Phase 9-6 完了）も実装済みである。
+上記は v1 の目標API契約である。実装進捗は IMPLEMENTATION_PLAN.md を参照すること。
 
 ### 7.2 設定
 
@@ -406,7 +408,7 @@ v1 では stdio トランスポートのみを提供する。HTTP トランス�
 | # | ツール名 | 概要 | 主要パラメータ |
 |---|---|---|---|
 | 1 | `skb_upload` | 資料をアップロード | `path?`, `url?`, `content?`, `content_base64?`, `title?`, `tags?`, `metadata?`, `force?` |
-| 2 | `skb_search` | 検索 | `query`, `mode?=hybrid`, `top_k?=10`, `filter?`, `graph_expand?=0` |
+| 2 | `skb_search` | 検索 | `query`, `mode?`（既定は `config.search.default_mode`。出荷時設定値は hybrid であり、設定変更時は hybrid へのフォールバックではない）, `top_k?`（既定は `config.search.top_k`、範囲1〜1000、超過は `E_VALIDATION`）, `filter?`, `graph_expand?=0`（0〜5、超過は `E_VALIDATION`） |
 | 3 | `skb_list_documents` | 一覧 | `limit?=50`, `offset?=0`, `order?=created_desc`（`created_desc` / `created_asc` / `title_asc` / `title_desc`） |
 | 4 | `skb_get_document` | 取得 | `id`, `include_chunks?=false` |
 | 5 | `skb_delete_document` | 削除 | `id` |

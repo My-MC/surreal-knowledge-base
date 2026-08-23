@@ -1,0 +1,17 @@
+# cargo-audit configuration (auto-loaded from the project root).
+#
+# Suppressed advisories must be re-evaluated: track issue #40
+# (https://github.com/My-MC/surreal-knowledge-base/issues/40) and drop each
+# entry here once upstream publishes a fixed release.
+
+[advisories]
+# rkyv via surrealdb-core: no fixed 0.7.x release exists; the 0.8 major is
+# breaking and cannot be upgraded from this crate.
+# Re-evaluate on or before 2026-11-15 (tracking issue #40).
+ignore = [
+    "RUSTSEC-2026-0235",
+    # rsa via surrealdb-core (jsonwebtoken deps): no fixed 0.9.x release
+    # exists; the 0.10 major is breaking.
+    # Re-evaluate on or before 2026-11-15 (tracking issue #40).
+    "RUSTSEC-2023-0071",
+]

@@ -12,12 +12,70 @@ env:
 jobs:
   test:
     name: Test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace -- --test-threads=1
+      - name: Cargo check
+        run: cargo check --workspace
+      - name: Clippy (warning-free)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      # CI は検証のみでリポジトリを変更しないため、cargo fix / cargo clippy --fix は実行しない。
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Serial tests (incl. golden contract tests)
+        run: cargo test --workspace -- --test-threads=1
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          # Pinned version; install failure fails the step (hence the job):
+          # a green gate must never skip the advisory check silently.
+          tool: cargo-audit@0.22.2
+      - name: Fail on expired audit suppressions
+        shell: bash
+        run: |
+          today=$(date -u +%Y-%m-%d)
+          mapfile -t deadlines < <(
+            grep -oE 'Re-evaluate on or before [0-9]{4}-[0-9]{2}-[0-9]{2}' .cargo/audit.toml \
+              | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}'
+          )
+          # The extraction must stay in sync with .cargo/audit.toml: zero
+          # deadlines means the gate silently stopped working, not that the
+          # suppressions are safe.
+          if [[ ${#deadlines[@]} -eq 0 ]]; then
+            echo "no 'Re-evaluate on or before <date>' deadlines found in .cargo/audit.toml"
+            exit 1
+          fi
+          # Every suppressed advisory must carry its own deadline, otherwise a
+          # new ignore entry without one would bypass this gate.
+          ignored=$(awk '
+            /^ignore = \[/ { in_ignore = 1; next }
+            in_ignore && /^\]/ { in_ignore = 0 }
+            in_ignore && /"RUSTSEC-/ { count++ }
+            END { print count + 0 }
+          ' .cargo/audit.toml)
+          if [[ "$ignored" -ne ${#deadlines[@]} ]]; then
+            echo "each ignored advisory must have exactly one re-evaluation deadline (found $ignored ignores, ${#deadlines[@]} deadlines)"
+            exit 1
+          fi
+          for deadline in "${deadlines[@]}"; do
+            if [[ "$today" > "$deadline" ]]; then
+              echo "expired audit suppression deadline: $deadline (see .cargo/audit.toml, issue #40)"
+              exit 1
+            fi
+          done
+      - name: Cargo audit (dependency advisories, incl. pinned ureq)
+        run: |
+          # Suppressed advisories live in .cargo/audit.toml with re-evaluation
+          # dates and tracking issue #40, so the ignore list cannot silently
+          # become permanent.
+          cargo audit
       - name: Check no native-tls / openssl dependency
         run: |
           cargo tree -i openssl-sys 2>&1 | grep -q "did not match"
@@ -28,6 +86,9 @@ jobs:
   build:
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -56,6 +117,8 @@ jobs:
       RUSTFLAGS: ${{ matrix.rustflags }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -90,12 +153,21 @@ jobs:
   smoke:
     name: Smoke test (linux-x64)
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     needs: build
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v7
         with:
           node-version: 22
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.19
       - uses: actions/download-artifact@v8
         with:
           name: npm-linux-x64
@@ -107,16 +179,30 @@ jobs:
           chmod +x npm/packages/linux-x64/bin/skb-mcp
       - name: Check shared library dependencies
         run: |
-          ldd npm/packages/linux-x64/bin/skb-mcp
-          ldd npm/packages/linux-x64/bin/skb-mcp 2>&1 | (! grep -q libonnxruntime)
-          ldd npm/packages/linux-x64/bin/skb-mcp 2>&1 | (! grep -q libssl)
-          ldd npm/packages/linux-x64/bin/skb-mcp 2>&1 | (! grep -q libcrypto)
-          ldd npm/packages/linux-x64/bin/skb-mcp 2>&1 | (! grep -q libstdc++)
+          BIN=npm/packages/linux-x64/bin/skb-mcp
+          ldd "$BIN"
+          for lib in libonnxruntime libssl libcrypto libstdc++; do
+            if ldd "$BIN" 2>&1 | grep -q "$lib"; then
+              echo "unexpected dynamic dependency: $lib"
+              exit 1
+            fi
+          done
       - name: Check GLIBC floor
         run: |
-          echo "Max GLIBC version required:"
-          objdump -T npm/packages/linux-x64/bin/skb-mcp | grep -oP 'GLIBC_[0-9.]+' | sort -Vu | tail -1
-      - name: Smoke test (pack, install, MCP handshake)
+          MAX_GLIBC=$(objdump -T npm/packages/linux-x64/bin/skb-mcp \
+            | grep -oP 'GLIBC_\K[0-9.]+' | sort -Vu | tail -1)
+          if [ -z "$MAX_GLIBC" ]; then
+            echo "failed to extract a GLIBC version from the binary"
+            exit 1
+          fi
+          echo "Max GLIBC version required: $MAX_GLIBC"
+          LIMIT=2.38
+          HIGHEST=$(printf '%s\n%s\n' "$MAX_GLIBC" "$LIMIT" | sort -V | tail -1)
+          if [ "$HIGHEST" != "$LIMIT" ]; then
+            echo "GLIBC floor exceeded: requires $MAX_GLIBC, limit is $LIMIT"
+            exit 1
+          fi
+      - name: Smoke test (pack, install, full MCP flow)
         run: |
           cd "$GITHUB_WORKSPACE/npm" && npm pack
           cd "$GITHUB_WORKSPACE/npm/packages/linux-x64" && npm pack
@@ -139,8 +225,173 @@ jobs:
           EOF
 
           SKB_BIN="$(dirname "$(node -p "require.resolve('@surreal-knowledge-base/linux-x64/package.json')")")/bin/skb-mcp"
-          echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"smoke-test","version":"1.0"}}}' \
-            | "$SKB_BIN" 2>mcp.log \
-            | head -1 \
-            | grep -q "protocolVersion" \
-            || { echo "MCP handshake failed; stderr:"; cat mcp.log; exit 1; }
+          cd "$SMOKE"
+
+          # Full E2E flow: initialize -> tools/list -> skb_upload -> skb_search
+          # (requests are awaited sequentially: rmcp handles them concurrently)
+          node "$GITHUB_WORKSPACE/npm/smoke-mcp.mjs" "$SKB_BIN"
+
+      - name: Wrapper launch via node (npx-style) and bun
+        run: |
+          SMOKE="$GITHUB_WORKSPACE/target/skb-smoke"
+          cd "$SMOKE"
+          WRAPPER="$(node -p "require.resolve('surreal-knowledge-base/bin/skb-mcp.js')")"
+          echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"node-wrapper","version":"1.0"}}}' \
+            | timeout 60 node "$WRAPPER" >node.out 2>node.log || true
+          grep -q 'protocolVersion' node.out \
+            || { echo "node wrapper launch failed; stderr:"; cat node.log; exit 1; }
+          echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"bun-wrapper","version":"1.0"}}}' \
+            | timeout 60 bun "$WRAPPER" >bun.out 2>bun.log || true
+          grep -q 'protocolVersion' bun.out \
+            || { echo "bun wrapper launch failed; stderr:"; cat bun.log; exit 1; }
+
+  e2e-linux-arm64:
+    name: E2E (linux-arm64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    needs: build
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@v8
+        with:
+          name: npm-linux-arm64
+          path: npm-out/
+      - name: Check shared library dependencies
+        run: |
+          BIN=npm-out/packages/linux-arm64/bin/skb-mcp
+          chmod +x "$BIN"
+          DEPS=$(ldd "$BIN" 2>&1)
+          echo "$DEPS"
+          # Positive check: ldd must actually resolve the binary's dynamic
+          # dependencies; a silent failure here would make the forbidden-lib
+          # scan below vacuous.
+          if ! echo "$DEPS" | grep -q 'libc\.so'; then
+            echo "could not read dynamic dependencies from $BIN"
+            exit 1
+          fi
+          for lib in libonnxruntime libssl libcrypto libstdc++; do
+            if echo "$DEPS" | grep -q "$lib"; then
+              echo "unexpected dynamic dependency: $lib"
+              exit 1
+            fi
+          done
+      - name: MCP E2E flow (initialize -> tools/list -> upload -> search)
+        run: |
+          cat > skb.toml << EOF
+          [storage]
+          path = "target/e2e-linux-arm64-db"
+          [embedding]
+          onnx_path = "mock"
+          dimension = 8
+          tokenizer = "$GITHUB_WORKSPACE/npm/smoke-tokenizer.json"
+          EOF
+          node "$GITHUB_WORKSPACE/npm/smoke-mcp.mjs" "$PWD/npm-out/packages/linux-arm64/bin/skb-mcp"
+
+  e2e-macos:
+    name: E2E (darwin-arm64)
+    runs-on: macos-latest
+    timeout-minutes: 20
+    needs: build
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@v8
+        with:
+          name: npm-darwin-arm64
+          path: npm-out/
+      - name: Check dynamic library dependencies (otool)
+        run: |
+          BIN=npm-out/packages/darwin-arm64/bin/skb-mcp
+          chmod +x "$BIN"
+          DEPS=$(otool -L "$BIN" 2>&1)
+          echo "$DEPS"
+          # Positive check: otool must actually resolve the binary's dynamic
+          # dependencies; a silent failure here would make the forbidden-lib
+          # scan below vacuous.
+          if ! echo "$DEPS" | grep -q 'libSystem\.B\.dylib'; then
+            echo "could not read dynamic dependencies from $BIN"
+            exit 1
+          fi
+          for lib in libonnxruntime libssl libcrypto; do
+            if echo "$DEPS" | grep -q "$lib"; then
+              echo "unexpected dynamic dependency: $lib"
+              exit 1
+            fi
+          done
+      - name: MCP E2E flow (initialize -> tools/list -> upload -> search)
+        run: |
+          cat > skb.toml << EOF
+          [storage]
+          path = "target/e2e-macos-db"
+          [embedding]
+          onnx_path = "mock"
+          dimension = 8
+          tokenizer = "$GITHUB_WORKSPACE/npm/smoke-tokenizer.json"
+          EOF
+          node "$GITHUB_WORKSPACE/npm/smoke-mcp.mjs" "$PWD/npm-out/packages/darwin-arm64/bin/skb-mcp"
+
+  e2e-windows:
+    name: E2E (win32-x64)
+    runs-on: windows-2022
+    timeout-minutes: 20
+    needs: build
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@v8
+        with:
+          name: npm-win32-x64
+          path: npm-out/
+      - name: Check imported DLLs (VC++ runtime prerequisite)
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vswhere -latest -property installationPath
+          $dumpbin = Get-ChildItem "$vsPath\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1
+          if (-not $dumpbin) { Write-Error "dumpbin not found"; exit 1 }
+          $deps = & $dumpbin.FullName /dependents npm-out\packages\win32-x64\bin\skb-mcp.exe
+          $deps | Select-String '\.dll'
+          if ($deps | Select-String 'onnxruntime') { Write-Error "onnxruntime.dll must not be imported"; exit 1 }
+          # Reject any OpenSSL-related DLL: versioned (libssl-3-x64.dll,
+          # libcrypto-3-x64.dll, ...), unversioned (libssl.dll,
+          # libcrypto.dll) and legacy (ssleay32/libeay32) names, prefix-matched
+          # so new variants are caught.
+          if ($deps | Select-String 'libssl|libcrypto|ssleay|libeay') { Write-Error "OpenSSL DLL must not be imported"; exit 1 }
+          if (-not ($deps | Select-String 'MSVCP140.dll')) { Write-Error "MSVCP140.dll (VC++ runtime) must be imported"; exit 1 }
+          if (-not ($deps | Select-String 'VCRUNTIME140.dll')) { Write-Error "VCRUNTIME140.dll (VC++ runtime) must be imported"; exit 1 }
+          Write-Output "VC++ runtime present on runner: $(Test-Path "$env:WINDIR\System32\vcruntime140.dll")"
+      - name: MCP E2E flow (initialize -> tools/list -> upload -> search)
+        shell: pwsh
+        run: |
+          $tok = (Join-Path $env:GITHUB_WORKSPACE "npm\smoke-tokenizer.json").Replace('\', '/')
+          @"
+          [storage]
+          path = "target/e2e-windows-db"
+          [embedding]
+          onnx_path = "mock"
+          dimension = 8
+          tokenizer = "$tok"
+          "@ | Set-Content -Encoding ascii skb.toml
+          node "$env:GITHUB_WORKSPACE/npm/smoke-mcp.mjs" "$env:GITHUB_WORKSPACE/npm-out/packages/win32-x64/bin/skb-mcp.exe"

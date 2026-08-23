@@ -769,17 +769,20 @@ mod tests {
 
     /// Open and drop a KnowledgeBase, retrying transient embedded-SurrealKv
     /// file-lock failures instead of relying on a fixed sleep. Only used for
-    /// in-process reopen sequences in tests.
+    /// in-process reopen sequences in tests. Non-Db errors (e.g. the expected
+    /// E_MODEL_MISMATCH) are returned immediately so a later transient lock
+    /// failure cannot mask the real answer (spec §9-5 tests).
     async fn open_retrying(config: Config) -> Result<KnowledgeBase, SkbError> {
-        const ATTEMPTS: usize = 8;
+        const ATTEMPTS: usize = 20;
         let mut last = None;
         for _ in 0..ATTEMPTS {
             match KnowledgeBase::open(config.clone()).await {
                 Ok(kb) => return Ok(kb),
-                Err(e) => {
+                Err(e) if matches!(e.code, ErrorCode::Db) => {
                     last = Some(e);
                     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
                 }
+                Err(e) => return Err(e),
             }
         }
         Err(last.expect("ATTEMPTS is non-zero"))
@@ -1351,13 +1354,16 @@ mod tests {
             config_b.embedding.tokenizer = tok_b.display().to_string();
             // Absorb the same transient file-lock race as open_retrying.
             let mut opened = None;
-            for _ in 0..8 {
+            for _ in 0..20 {
                 match KnowledgeBase::open_for_reindex(config_b.clone()).await {
                     Ok(kb) => {
                         opened = Some(kb);
                         break;
                     }
-                    Err(_) => tokio::time::sleep(std::time::Duration::from_millis(150)).await,
+                    Err(e) if matches!(e.code, ErrorCode::Db) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    }
+                    Err(e) => panic!("open_for_reindex failed: {e:?}"),
                 }
             }
             opened.expect("open_for_reindex must succeed");
@@ -1368,7 +1374,10 @@ mod tests {
                 Ok(_) => panic!("expected open to fail with a mismatch"),
                 Err(e) => e,
             };
-            assert!(matches!(err.code, ErrorCode::ModelMismatch));
+            assert!(
+                matches!(err.code, ErrorCode::ModelMismatch),
+                "unexpected error code: {err:?}"
+            );
         });
         drop(rt);
 

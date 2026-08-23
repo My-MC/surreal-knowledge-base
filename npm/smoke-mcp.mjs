@@ -7,9 +7,6 @@
 // Usage: node smoke-mcp.mjs <path-to-skb-mcp-binary>
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
-import { fileURLToPath } from "node:url";
-import { join } from "node:path";
-import { rmSync } from "node:fs";
 
 const bin = process.argv[2];
 if (!bin) {
@@ -17,66 +14,46 @@ if (!bin) {
   process.exit(2);
 }
 
-// Dedicated store under the repository's target directory (absolute path, so
-// it is independent of the process working directory; SKB_STORAGE_PATH is the
-// env override handled by Config::load). fileURLToPath + join handle spaces,
-// non-ASCII characters and Windows paths correctly.
-const repoRoot = fileURLToPath(new URL("..", import.meta.url));
-const dbPath = join(repoRoot, "target", `skb-smoke-db-${process.pid}`);
-const child = spawn(bin, [], {
-  stdio: ["pipe", "pipe", "inherit"],
-  env: { ...process.env, SKB_STORAGE_PATH: dbPath },
-});
-const rl = createInterface({ input: child.stdout });
 const pending = new Map();
 let nextId = 1;
 
-// Every failure path must terminate the child before exiting so its
-// SurrealKV file handles are released (the smoke DB is under ./target).
-let shuttingDown = false;
+// childRef is null until the child is spawned; a synchronous module
+// evaluation failure before that must still exit with the original
+// failure reason instead of tripping over the uninitialized child const.
+let childRef = null;
 
-// Remove the per-process database directory; called only after the child has
-// exited so its file handles are already released.
-function cleanupDb() {
-  try {
-    rmSync(dbPath, { recursive: true, force: true });
-  } catch {}
-}
-
-function fail(message) {
-  console.error("FAIL: " + message);
-  shuttingDown = true;
-  try {
-    child.kill();
-  } catch {}
-  child.once("exit", () => {
-    cleanupDb();
-    process.exit(1);
-  });
-  setTimeout(() => {
-    cleanupDb();
-    process.exit(1);
-  }, 5000).unref();
-  // Final operation: throw so callers stop immediately and cannot continue
-  // into subsequent logic after an assertion failure.
-  throw new Error(message);
-}
-
-child.on("exit", () => {
-  shuttingDown = true;
-  cleanupDb();
+// Registered before any await so an assertion failure anywhere in the flow
+// reaches the top-level failure path (terminate child, wait for exit,
+// exit non-zero) instead of dying with an unhandled rejection.
+process.on("uncaughtException", (err) => {
+  console.error("FAIL: " + (err?.message ?? err));
+  shutdown(1);
 });
 
-// A spawn failure (missing binary, permission denied) must fail the smoke
-// run with a clear message instead of hanging on the response wait.
+const child = spawn(bin, [], { stdio: ["pipe", "pipe", "inherit"] });
+childRef = child;
 child.on("error", (err) => {
-  fail(`cannot start MCP binary '${bin}': ${err.message}`);
+  for (const [id, { reject, timer }] of pending) {
+    clearTimeout(timer);
+    pending.delete(id);
+    reject(new Error(`cannot start MCP binary '${bin}': ${err.message} (request ${id})`));
+  }
 });
+const rl = createInterface({ input: child.stdout });
+// Swallow EPIPE from stdin writes after the child exits; the exit/error
+// handlers reject pending requests with the real failure reason.
+child.stdin.on("error", () => {});
 
-// EPIPE / early server termination while writing requests must fail the run
-// instead of surfacing as an uncaught exception.
-child.stdin.on("error", (err) => {
-  fail(`MCP stdin error: ${err.message}`);
+// If the child exits before responding (crash, bad config, etc.), fail all
+// in-flight requests immediately with the exit code instead of timing out.
+child.on("exit", (code, signal) => {
+  for (const [id, { reject }] of pending) {
+    clearTimeout(pending.get(id).timer);
+    pending.delete(id);
+    reject(
+      new Error(`MCP subprocess exited early (code=${code}, signal=${signal}) while waiting for request ${id}`)
+    );
+  }
 });
 
 rl.on("line", (line) => {
@@ -87,26 +64,25 @@ rl.on("line", (line) => {
     return;
   }
   if (msg.id !== undefined && pending.has(msg.id)) {
-    pending.get(msg.id)(msg);
+    const entry = pending.get(msg.id);
+    clearTimeout(entry.timer);
     pending.delete(msg.id);
+    entry.resolve(msg);
   }
 });
 
 function request(method, params) {
   const id = nextId++;
   return new Promise((resolve, reject) => {
-    pending.set(id, resolve);
-    const msg = { jsonrpc: "2.0", id, method, params };
-    child.stdin.write(JSON.stringify(msg) + "\n");
-    setTimeout(() => {
+    const timer = setTimeout(() => {
       if (pending.has(id)) {
         pending.delete(id);
-        if (!shuttingDown) {
-          child.kill();
-        }
         reject(new Error(`timeout waiting for response to ${method}`));
       }
     }, 30000);
+    pending.set(id, { resolve, reject, timer });
+    const msg = { jsonrpc: "2.0", id, method, params };
+    child.stdin.write(JSON.stringify(msg) + "\n");
   });
 }
 
@@ -114,10 +90,33 @@ function notify(method, params) {
   child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method, params }) + "\n");
 }
 
+// assert reports the failure and hands control to the top-level failure path,
+// which terminates the child and waits for its exit (releasing SurrealKV file
+// locks) before ending the parent with status 1. Throwing immediately keeps
+// failed checks from continuing to schedule child shutdown.
 function assert(cond, message) {
   if (!cond) {
-    fail(message);
+    throw new Error(message);
   }
+}
+
+function shutdown(code) {
+  // A synchronous module-evaluation failure before the child is spawned must
+  // still exit with the original failure reason.
+  if (childRef === null) {
+    process.exit(code);
+  }
+  // If the child already exited, "exit" never fires again and the unref'd
+  // timer below cannot keep the loop alive; exit with the intended code.
+  process.exitCode = code;
+  if (childRef.exitCode !== null || childRef.signalCode !== null) {
+    process.exit(code);
+  }
+  // Wait for the child to exit so its SurrealKV file handles are released
+  // before the job moves on; fall back to exiting after 5s.
+  childRef.once("exit", () => process.exit(code));
+  childRef.kill();
+  setTimeout(() => process.exit(code), 5000).unref();
 }
 
 const INIT = {
@@ -135,10 +134,18 @@ const toolNames = (tools.result?.tools ?? []).map((t) => t.name);
 assert(toolNames.includes("skb_upload"), "tools/list must list skb_upload");
 assert(toolNames.includes("skb_search"), "tools/list must list skb_search");
 
+// Unique content per run so an existing store never dedupes the upload to
+// "skipped" (and the search assertion still finds the document). The run
+// token makes the search assertion match only THIS run's upload, not a
+// smoke-doc left by an earlier run in the default database.
+const runToken = `smoketoken${Date.now()}x${process.pid}`;
+const uniqueContent =
+  `Smoke test document about HNSW vector search and BM25. ${runToken}`;
+
 const up = await request("tools/call", {
   name: "skb_upload",
   arguments: {
-    content: "Smoke test document about HNSW vector search and BM25.",
+    content: uniqueContent,
     title: "smoke-doc",
   },
 });
@@ -155,20 +162,22 @@ assert(upJson.title === "smoke-doc", "skb_upload must echo the title");
 
 const search = await request("tools/call", {
   name: "skb_search",
-  arguments: { query: "HNSW", mode: "keyword", top_k: 5 },
+  // Older smoke docs share the "smoketoken" prefix after tokenization, so
+  // request a larger window than a single leftover run.
+  arguments: { query: runToken, mode: "keyword", top_k: 50 },
 });
 assert(!search.result?.isError, "skb_search must succeed");
 const searchText = search.result?.content?.[0]?.text ?? "";
-assert(searchText.includes("smoke-doc"), "skb_search must find the uploaded document");
+let searchJson;
+try {
+  searchJson = JSON.parse(searchText);
+} catch {
+  assert(false, `skb_search must return JSON, got: ${searchText}`);
+}
+assert(
+  (searchJson.hits ?? []).some((h) => h.content?.includes(runToken)),
+  "skb_search must find the uploaded document",
+);
 
 console.log("SMOKE OK");
-shuttingDown = true;
-child.once("exit", () => {
-  cleanupDb();
-  process.exit(0);
-});
-child.kill();
-setTimeout(() => {
-  cleanupDb();
-  process.exit(0);
-}, 5000).unref();
+shutdown(0);

@@ -210,7 +210,7 @@ fn validate_document_id(id: &str) -> Result<(&str, &str), SkbError> {
     if key.is_empty() {
         return Err(SkbError::new(
             ErrorCode::Validation,
-            format!("id must not be empty: '{id}'"),
+            format!("document record key must not be empty: '{id}'"),
         ));
     }
     if key

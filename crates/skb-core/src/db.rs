@@ -142,6 +142,53 @@ impl Db {
             .map_err(|e| SkbError::new(ErrorCode::Db, format!("migrate: {e}")))?
             .check()
             .map_err(|e| SkbError::new(ErrorCode::Db, format!("migrate check: {e}")))?;
+        // chunk_document_idx assumes (document, idx) is unique; a legacy store
+        // with duplicates would silently corrupt index lookups (graph
+        // expansion, deletes), so abort startup on duplicates. Runs after the
+        // schema and index are applied (the index is non-UNIQUE, so applying
+        // it first never fails on duplicates; the duplicate check then runs
+        // against the applied store). The check is a full-table GROUP BY, so
+        // it runs only once per store: success is recorded in `meta` and
+        // subsequent startups skip it. Only the exact "ok" value counts as
+        // validated; unexpected or corrupted metadata re-runs the check.
+        if self.get_meta("dup_check_v1").await?.as_deref() != Some("ok") {
+            let dup_sql =
+                "SELECT doc_id, idx FROM \
+                           (SELECT string::concat('document:', meta::id(document)) AS doc_id, idx, count() AS c FROM chunk \
+                            GROUP BY doc_id, idx) WHERE c > 1 LIMIT 10";
+            let mut dup = self
+                .db
+                .query(dup_sql)
+                .await
+                .map_err(|e| SkbError::new(ErrorCode::Db, format!("migrate dup check: {e}")))?;
+            let dup_rows: Vec<serde_json::Value> = dup
+                .take(0)
+                .map_err(|e| SkbError::new(ErrorCode::Db, format!("migrate dup take: {e}")))?;
+            if !dup_rows.is_empty() {
+                let sample: Vec<String> = dup_rows
+                    .iter()
+                    .map(|r| {
+                        format!(
+                            "{} idx={}",
+                            r["doc_id"].as_str().unwrap_or("?"),
+                            r["idx"]
+                                .as_i64()
+                                .map_or_else(|| "?".to_string(), |idx| idx.to_string())
+                        )
+                    })
+                    .collect();
+                return Err(SkbError::new(
+                    ErrorCode::Db,
+                    format!(
+                        "chunk table has duplicate (document, idx) rows; resolve before opening: {}",
+                        sample.join(", ")
+                    ),
+                ));
+            }
+            set_meta_impl(&self.db, "dup_check_v1", "ok")
+                .await
+                .map_err(|e| SkbError::new(ErrorCode::Db, format!("migrate dup mark: {e}")))?;
+        }
         Ok(())
     }
 
