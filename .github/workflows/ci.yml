@@ -181,6 +181,7 @@ jobs:
           mkdir -p npm/packages/linux-x64/bin
           cp npm-out/packages/linux-x64/bin/skb-mcp npm/packages/linux-x64/bin/
           chmod +x npm/packages/linux-x64/bin/skb-mcp
+          cp npm/THIRD_PARTY_LICENSES.md npm/packages/linux-x64/
       - name: Check shared library dependencies
         run: |
           BIN=npm/packages/linux-x64/bin/skb-mcp
@@ -299,6 +300,7 @@ jobs:
           mkdir -p npm/packages/linux-arm64/bin
           cp npm-out/packages/linux-arm64/bin/skb-mcp npm/packages/linux-arm64/bin/
           chmod +x npm/packages/linux-arm64/bin/skb-mcp
+          cp npm/THIRD_PARTY_LICENSES.md npm/packages/linux-arm64/
       - name: Check shared library dependencies
         run: |
           BIN=npm/packages/linux-arm64/bin/skb-mcp
@@ -416,6 +418,7 @@ jobs:
           mkdir -p npm/packages/darwin-arm64/bin
           cp npm-out/packages/darwin-arm64/bin/skb-mcp npm/packages/darwin-arm64/bin/
           chmod +x npm/packages/darwin-arm64/bin/skb-mcp
+          cp npm/THIRD_PARTY_LICENSES.md npm/packages/darwin-arm64/
       - name: Check dynamic library dependencies (otool)
         run: |
           BIN=npm/packages/darwin-arm64/bin/skb-mcp
@@ -516,6 +519,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path npm/packages/win32-x64/bin | Out-Null
           Copy-Item npm-out/packages/win32-x64/bin/skb-mcp.exe npm/packages/win32-x64/bin/skb-mcp.exe
+          Copy-Item npm/THIRD_PARTY_LICENSES.md npm/packages/win32-x64/THIRD_PARTY_LICENSES.md
       - name: Check imported DLLs (VC++ runtime prerequisite)
         shell: pwsh
         run: |
