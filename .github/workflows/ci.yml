@@ -483,12 +483,20 @@ jobs:
           E2E="$GITHUB_WORKSPACE/target/e2e-macos"
           cd "$E2E"
           WRAPPER="$(node -p "require.resolve('surreal-knowledge-base/bin/skb-mcp.js')")"
+          # macOS lacks GNU timeout; use gtimeout if available, otherwise run without timeout (wrapper exits quickly)
+          if command -v gtimeout >/dev/null 2>&1; then
+            TIMEOUT="gtimeout 60"
+          elif command -v timeout >/dev/null 2>&1; then
+            TIMEOUT="timeout 60"
+          else
+            TIMEOUT=""
+          fi
           echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"node-wrapper","version":"1.0"}}}' \
-            | timeout 60 node "$WRAPPER" >node.out 2>node.log || true
+            | $TIMEOUT node "$WRAPPER" >node.out 2>node.log || true
           grep -q 'protocolVersion' node.out \
             || { echo "node wrapper launch failed; stderr:"; cat node.log; exit 1; }
           echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"bun-wrapper","version":"1.0"}}}' \
-            | timeout 60 bun "$WRAPPER" >bun.out 2>bun.log || true
+            | $TIMEOUT bun "$WRAPPER" >bun.out 2>bun.log || true
           grep -q 'protocolVersion' bun.out \
             || { echo "bun wrapper launch failed; stderr:"; cat bun.log; exit 1; }
 
