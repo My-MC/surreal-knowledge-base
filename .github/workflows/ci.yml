@@ -83,6 +83,21 @@ jobs:
           cargo tree --features ort -p skb-core -i openssl-sys 2>&1 | grep -q "did not match"
           cargo tree --features ort -p skb-core -i native-tls 2>&1 | grep -q "did not match"
 
+  msrv:
+    name: MSRV check (1.88)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: MSRV Cargo check
+        run: cargo check --workspace
+
   build:
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}

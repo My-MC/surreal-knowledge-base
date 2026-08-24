@@ -35,7 +35,7 @@ skills/          opencode agent skill
 
 ## Prerequisites
 
-- [Rust](https://rustup.rs/) 1.70+
+- [Rust](https://rustup.rs/) 1.88+
 - For real embeddings (`--features ort`): ONNX Runtime is downloaded automatically on first build (~15 minutes, cached at `~/.cache/ort.pyke.io`)
 - First MCP/CLI run (even with mock embeddings): tokenizer.json is auto-downloaded from Hugging Face (~17 MB, cached at `~/.cache/huggingface`)
 

@@ -4,8 +4,9 @@ members = ["crates/skb-core", "crates/skb-cli", "crates/skb-mcp"]
 exclude = ["spike"]
 
 [workspace.package]
-# MSRV: uses usize::is_multiple_of (stabilized 1.87); CI pins the stable toolchain.
-rust-version = "1.87"
+# MSRV: direct deps require 1.88 (rmcp/lopdf/time); transitive max is 1.94 via surrealdb/hf-hub.
+# Uses usize::is_multiple_of (stabilized 1.87).
+rust-version = "1.88"
 
 [workspace.dependencies]
 schemars = { version = "1.2", features = ["derive"] }
