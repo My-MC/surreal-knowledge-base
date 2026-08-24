@@ -29,8 +29,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sha2 = "0.11"
 anyhow = "1"
 # Pinned exactly: SafeResolver uses ureq::unversioned (not semver-guaranteed).
-# Re-audit the SSRF defense before upgrading.
-ureq = "=3.3.0"
+# Re-audited 2026-08-24: SafeResolver+with_parts still pins validated IPs on 3.4.0;
+# RequestExt seal (3.4.0 breaking) is N/A (we use Resolver, not RequestExt).
+ureq = "=3.4.0"
 url = "2"
 base64 = "0.23"
 regex = "1"
