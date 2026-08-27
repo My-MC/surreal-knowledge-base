@@ -35,7 +35,7 @@ skills/          opencode エージェント Skill
 
 ## 必要条件
 
-- [Rust](https://rustup.rs/) 1.70+
+- [Rust](https://rustup.rs/) 1.88+
 - 実埋め込み（`--features ort`）の場合：初回ビルド時に ONNX Runtime を自動ダウンロード（約 15 分、`~/.cache/ort.pyke.io` にキャッシュ）
 - MCP/CLI の初回実行時（mock 埋め込みでも）：tokenizer.json を Hugging Face から自動ダウンロード（約 17 MB、`~/.cache/huggingface` にキャッシュ）
 
