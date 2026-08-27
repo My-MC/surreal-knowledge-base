@@ -610,19 +610,12 @@ jobs:
           Set-Location $E2E
           $wrapper = node -p "require.resolve('surreal-knowledge-base/bin/skb-mcp.js')"
           $init = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"node-wrapper","version":"1.0"}}}'
-          $timeout = 60
-          # pwsh does not turn native command exit codes into terminating errors
-          # by default; capture LASTEXITCODE explicitly so a non-zero exit is
-          # surfaced (the Actions runner also checks $LASTEXITCODE at end of
-          # step).
-          try {
-            $proc = Start-Process -FilePath node -ArgumentList $wrapper -NoNewWindow -PassThru -RedirectStandardInput init.json -RedirectStandardOutput node.out -RedirectStandardError node.log
-            'initialize' | Out-File -Encoding ascii init.json -NoNewline
-            'initialize' | Set-Content -Path init.json -Encoding ascii -NoNewline
-          } catch { Write-Error "launch error: $_"; exit 1 }
-          # Use the pipe approach but reset LASTEXITCODE after a successful
-          # protocolVersion grep so a stray non-zero exit does not fail the
-          # step once output validation has succeeded.
+          # pwsh does not turn native command exit codes into terminating
+          # errors by default; capture LASTEXITCODE explicitly so a non-zero
+          # exit is surfaced (the Actions runner also checks $LASTEXITCODE at
+          # end of step), and reset it after a successful protocolVersion
+          # grep so a stray exit code does not fail the step once output
+          # validation has succeeded.
           $init | node $wrapper > node.out 2> node.log
           $nodeExit = $LASTEXITCODE
           if (-not (Select-String -Path node.out -Pattern 'protocolVersion')) { Write-Error "node wrapper launch failed"; Get-Content node.log; exit 1 }
