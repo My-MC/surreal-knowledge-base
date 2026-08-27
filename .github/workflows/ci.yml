@@ -622,20 +622,35 @@ jobs:
           Set-Location $E2E
           $wrapper = node -p "require.resolve('surreal-knowledge-base/bin/skb-mcp.js')"
           $init = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"node-wrapper","version":"1.0"}}}'
-          # pwsh does not turn native command exit codes into terminating
-          # errors by default; capture LASTEXITCODE explicitly so a non-zero
-          # exit is surfaced (the Actions runner also checks $LASTEXITCODE at
-          # end of step), and reset it after a successful protocolVersion
-          # grep so a stray exit code does not fail the step once output
-          # validation has succeeded.
-          $init | node $wrapper > node.out 2> node.log
-          $nodeExit = $LASTEXITCODE
+          # Each launcher gets a hard 60 s budget via Start-Process +
+          # WaitForExit(60000), killed and failed when the budget elapses.
+          # pwsh does not turn native exit codes into terminating errors by
+          # default; capture ExitCode explicitly, reset after output checks
+          # so a stray non-zero exit does not fail the step post-validation.
+          Set-Content -Path init.jsonl -Value $init -Encoding ascii
+          function Invoke-WrappedLaunch {
+            param([string]$Launcher, [string]$OutFile, [string]$LogFile)
+            $p = Start-Process -FilePath $Launcher -ArgumentList "`"$wrapper`"" `
+              -WorkingDirectory $E2E `
+              -RedirectStandardInput (Join-Path $E2E 'init.jsonl') `
+              -RedirectStandardOutput (Join-Path $E2E $OutFile) `
+              -RedirectStandardError (Join-Path $E2E $LogFile) `
+              -NoNewWindow -PassThru
+            if (-not $p.WaitForExit(60000)) {
+              Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+              Write-Error "${Launcher} wrapper launch timed out after 60 s"
+              Get-Content (Join-Path $E2E $LogFile)
+              exit 1
+            }
+            return $p.ExitCode
+          }
+
+          $nodeExit = Invoke-WrappedLaunch node node.out node.log
           if (-not (Select-String -Path node.out -Pattern 'protocolVersion')) { Write-Error "node wrapper launch failed"; Get-Content node.log; exit 1 }
           if ($nodeExit -ne 0) { Write-Warning "node wrapper exited $nodeExit after producing valid output" }
           $LASTEXITCODE = 0
 
-          $init | bun $wrapper > bun.out 2> bun.log
-          $bunExit = $LASTEXITCODE
+          $bunExit = Invoke-WrappedLaunch bun bun.out bun.log
           if (-not (Select-String -Path bun.out -Pattern 'protocolVersion')) { Write-Error "bun wrapper launch failed"; Get-Content bun.log; exit 1 }
           if ($bunExit -ne 0) { Write-Warning "bun wrapper exited $bunExit after producing valid output" }
           $LASTEXITCODE = 0
