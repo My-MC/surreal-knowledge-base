@@ -4,8 +4,9 @@ members = ["crates/skb-core", "crates/skb-cli", "crates/skb-mcp"]
 exclude = ["spike"]
 
 [workspace.package]
-# MSRV: direct deps require 1.88 (rmcp/lopdf/time); transitive max is 1.94 via surrealdb/hf-hub.
-# Uses usize::is_multiple_of (stabilized 1.87).
+# MSRV: direct deps require 1.88 (rmcp, lopdf, time, serial_test pinned to 3.2.0).
+# Transitive max is 1.94 via fastnum (pulled by surrealdb). Uses
+# usize::is_multiple_of (stabilized 1.87).
 rust-version = "1.88"
 
 [workspace.dependencies]
