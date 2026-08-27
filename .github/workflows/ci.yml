@@ -220,15 +220,17 @@ jobs:
           fi
       - name: Verify npm package contents
         run: |
-          cd "$GITHUB_WORKSPACE/npm" && npm pack --dry-run 2>&1 | tail -n 20
-          # Prepare tarballs for inspection (smoke re-packs later, this is a dry check)
-          cd "$GITHUB_WORKSPACE/npm" && npm pack >/dev/null
-          tar -tzf "$GITHUB_WORKSPACE/npm/surreal-knowledge-base-0.1.0.tgz" | grep -q "package/bin/skb-mcp.js" || { echo "bin/skb-mcp.js missing in meta package"; tar -tzf "$GITHUB_WORKSPACE/npm/surreal-knowledge-base-0.1.0.tgz"; exit 1; }
-          tar -tzf "$GITHUB_WORKSPACE/npm/surreal-knowledge-base-0.1.0.tgz" | grep -q "THIRD_PARTY_LICENSES.md" || { echo "THIRD_PARTY_LICENSES.md missing in meta package"; exit 1; }
+          cd "$GITHUB_WORKSPACE/npm"
+          # Derive tarball filenames from npm pack --json so the checks stay
+          # correct when package.json version changes.
+          META_TGZ="$PWD/$(npm pack --json | node -p 'JSON.parse(require("fs").readFileSync(0,"utf8"))[0].filename')"
+          tar -tzf "$META_TGZ" | grep -q "package/bin/skb-mcp.js" || { echo "bin/skb-mcp.js missing in meta package"; tar -tzf "$META_TGZ"; exit 1; }
+          tar -tzf "$META_TGZ" | grep -q "THIRD_PARTY_LICENSES.md" || { echo "THIRD_PARTY_LICENSES.md missing in meta package"; exit 1; }
           echo "meta package contents OK"
-          cd "$GITHUB_WORKSPACE/npm/packages/linux-x64" && npm pack >/dev/null
-          tar -tzf "$GITHUB_WORKSPACE/npm/packages/linux-x64/surreal-knowledge-base-linux-x64-0.1.0.tgz" | grep -q "package/bin/skb-mcp" || { echo "bin/skb-mcp missing in linux-x64 package"; tar -tzf "$GITHUB_WORKSPACE/npm/packages/linux-x64/surreal-knowledge-base-linux-x64-0.1.0.tgz"; exit 1; }
-          tar -tzf "$GITHUB_WORKSPACE/npm/packages/linux-x64/surreal-knowledge-base-linux-x64-0.1.0.tgz" | grep -q "THIRD_PARTY_LICENSES.md" || { echo "THIRD_PARTY_LICENSES.md missing in linux-x64 package"; exit 1; }
+          cd "$GITHUB_WORKSPACE/npm/packages/linux-x64"
+          PLAT_TGZ="$PWD/$(npm pack --json | node -p 'JSON.parse(require("fs").readFileSync(0,"utf8"))[0].filename')"
+          tar -tzf "$PLAT_TGZ" | grep -q "package/bin/skb-mcp" || { echo "bin/skb-mcp missing in linux-x64 package"; tar -tzf "$PLAT_TGZ"; exit 1; }
+          tar -tzf "$PLAT_TGZ" | grep -q "THIRD_PARTY_LICENSES.md" || { echo "THIRD_PARTY_LICENSES.md missing in linux-x64 package"; exit 1; }
           echo "linux-x64 package contents OK"
       - name: Smoke test (pack, install, full MCP flow)
         run: |
@@ -347,10 +349,10 @@ jobs:
           fi
       - name: Verify npm package contents
         run: |
-          cd "$GITHUB_WORKSPACE/npm/packages/linux-arm64" && npm pack --dry-run 2>&1 | tail -n 20
-          cd "$GITHUB_WORKSPACE/npm/packages/linux-arm64" && npm pack >/dev/null
-          tar -tzf "$GITHUB_WORKSPACE/npm/packages/linux-arm64/surreal-knowledge-base-linux-arm64-0.1.0.tgz" | grep -q "package/bin/skb-mcp" || { echo "bin/skb-mcp missing in linux-arm64 package"; tar -tzf "$GITHUB_WORKSPACE/npm/packages/linux-arm64/surreal-knowledge-base-linux-arm64-0.1.0.tgz"; exit 1; }
-          tar -tzf "$GITHUB_WORKSPACE/npm/packages/linux-arm64/surreal-knowledge-base-linux-arm64-0.1.0.tgz" | grep -q "THIRD_PARTY_LICENSES.md" || { echo "THIRD_PARTY_LICENSES.md missing"; exit 1; }
+          cd "$GITHUB_WORKSPACE/npm/packages/linux-arm64"
+          PLAT_TGZ="$PWD/$(npm pack --json | node -p 'JSON.parse(require("fs").readFileSync(0,"utf8"))[0].filename')"
+          tar -tzf "$PLAT_TGZ" | grep -q "package/bin/skb-mcp" || { echo "bin/skb-mcp missing in linux-arm64 package"; tar -tzf "$PLAT_TGZ"; exit 1; }
+          tar -tzf "$PLAT_TGZ" | grep -q "THIRD_PARTY_LICENSES.md" || { echo "THIRD_PARTY_LICENSES.md missing"; exit 1; }
           echo "linux-arm64 package contents OK"
       - name: Smoke test (pack, install, full MCP flow)
         run: |
@@ -440,18 +442,24 @@ jobs:
       - name: Verify certificate store (macOS)
         run: |
           echo "Checking SystemRootCertificates keychain"
-          security find-certificate -a -p /System/Library/Keychains/SystemRootCertificates.keychain | head -n 5
-          if [ $? -ne 0 ]; then
+          # Capture security's exit code directly (pipefail would mask it; $?
+          # after a pipeline is the last command's, i.e. head's).
+          if ! CERTS=$(security find-certificate -a -p /System/Library/Keychains/SystemRootCertificates.keychain); then
             echo "failed to access SystemRootCertificates"
+            exit 1
+          fi
+          printf '%s\n' "$CERTS" | head -n 5
+          if ! printf '%s\n' "$CERTS" | grep -q 'BEGIN CERTIFICATE'; then
+            echo "no certificate found in SystemRootCertificates"
             exit 1
           fi
           echo "macOS certificate store accessible"
       - name: Verify npm package contents
         run: |
-          cd "$GITHUB_WORKSPACE/npm/packages/darwin-arm64" && npm pack --dry-run 2>&1 | tail -n 20
-          cd "$GITHUB_WORKSPACE/npm/packages/darwin-arm64" && npm pack >/dev/null
-          tar -tzf "$GITHUB_WORKSPACE/npm/packages/darwin-arm64/surreal-knowledge-base-darwin-arm64-0.1.0.tgz" | grep -q "package/bin/skb-mcp" || { echo "bin/skb-mcp missing in darwin-arm64 package"; tar -tzf "$GITHUB_WORKSPACE/npm/packages/darwin-arm64/surreal-knowledge-base-darwin-arm64-0.1.0.tgz"; exit 1; }
-          tar -tzf "$GITHUB_WORKSPACE/npm/packages/darwin-arm64/surreal-knowledge-base-darwin-arm64-0.1.0.tgz" | grep -q "THIRD_PARTY_LICENSES.md" || { echo "THIRD_PARTY_LICENSES.md missing"; exit 1; }
+          cd "$GITHUB_WORKSPACE/npm/packages/darwin-arm64"
+          PLAT_TGZ="$PWD/$(npm pack --json | node -p 'JSON.parse(require("fs").readFileSync(0,"utf8"))[0].filename')"
+          tar -tzf "$PLAT_TGZ" | grep -q "package/bin/skb-mcp" || { echo "bin/skb-mcp missing in darwin-arm64 package"; tar -tzf "$PLAT_TGZ"; exit 1; }
+          tar -tzf "$PLAT_TGZ" | grep -q "THIRD_PARTY_LICENSES.md" || { echo "THIRD_PARTY_LICENSES.md missing"; exit 1; }
           echo "darwin-arm64 package contents OK"
       - name: Smoke test (pack, install, full MCP flow)
         run: |
@@ -602,10 +610,30 @@ jobs:
           Set-Location $E2E
           $wrapper = node -p "require.resolve('surreal-knowledge-base/bin/skb-mcp.js')"
           $init = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"node-wrapper","version":"1.0"}}}'
+          $timeout = 60
+          # pwsh does not turn native command exit codes into terminating errors
+          # by default; capture LASTEXITCODE explicitly so a non-zero exit is
+          # surfaced (the Actions runner also checks $LASTEXITCODE at end of
+          # step).
+          try {
+            $proc = Start-Process -FilePath node -ArgumentList $wrapper -NoNewWindow -PassThru -RedirectStandardInput init.json -RedirectStandardOutput node.out -RedirectStandardError node.log
+            'initialize' | Out-File -Encoding ascii init.json -NoNewline
+            'initialize' | Set-Content -Path init.json -Encoding ascii -NoNewline
+          } catch { Write-Error "launch error: $_"; exit 1 }
+          # Use the pipe approach but reset LASTEXITCODE after a successful
+          # protocolVersion grep so a stray non-zero exit does not fail the
+          # step once output validation has succeeded.
           $init | node $wrapper > node.out 2> node.log
+          $nodeExit = $LASTEXITCODE
           if (-not (Select-String -Path node.out -Pattern 'protocolVersion')) { Write-Error "node wrapper launch failed"; Get-Content node.log; exit 1 }
+          if ($nodeExit -ne 0) { Write-Warning "node wrapper exited $nodeExit after producing valid output" }
+          $LASTEXITCODE = 0
+
           $init | bun $wrapper > bun.out 2> bun.log
+          $bunExit = $LASTEXITCODE
           if (-not (Select-String -Path bun.out -Pattern 'protocolVersion')) { Write-Error "bun wrapper launch failed"; Get-Content bun.log; exit 1 }
+          if ($bunExit -ne 0) { Write-Warning "bun wrapper exited $bunExit after producing valid output" }
+          $LASTEXITCODE = 0
 
   gate:
     name: CI gate (required)

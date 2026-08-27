@@ -50,7 +50,7 @@
 | 6 | Skill | 部分完了 | 実装済みレスポンスとSkillの引用・エラー説明の同期が必要 |
 | 7 | 仕上げ | 進行中 | ベンチ結果の判定、日本語FTS評価、公開手順の整理が必要 |
 | 8 | ort有効バイナリ + 依存最小化 | 部分完了 | CI証跡と生成artifactの扱い、Windows runtime案内のE2Eが必要 |
-| 9 | 仕様適合化と未実施機能 | 完了 | 9-1〜9-7完了。4-target build + `npm pack`→`npm install`→`npx`/`bunx`→`smoke-mcp.mjs` full flow、`ldd`/`otool`/`dumpbin`、GLIBC 2.38、`ca-certificates`/証明書ストア、`gate` が全緑 |
+| 9 | 仕様適合化と未実施機能 | 完了 | 9-1〜9-7完了。4-target build + `npm pack`→`npm install`→`node`/`bun` ラッパ起動→`smoke-mcp.mjs` full flow、`ldd`/`otool`/`dumpbin`、GLIBC 2.38、`ca-certificates`/証明書ストア、`gate` が全緑 |
 
 ### 現状検証マトリクス
 
@@ -61,7 +61,7 @@
 | Chunk/Graph/Search | 見出し境界チャンキング+heading永続化、EntityExtractor（WikiLink/frontmatter/見出し階層part-of）、N-hop+再ランク、検索応答title/source/highlights/matched_entities（9-4完了） | なし | — |
 | Reindex | migrate前のmodel/dimension比較（新規DBは初期化パス）、open_for_reindex管理経路、dimension変更のwipe+フィールド再定義→HNSW再構築→meta更新、中断検出+再実行復旧、MCP/CLI progress（9-5完了） | なし | — |
 | CLI/MCP | 全CLIコマンド（複数パス/glob/`skb query`/doctor JSON/reindex progress）、chunk_count/chunks_deleted/E_DOCUMENT_NOT_FOUND、MCP resource-not-found、ゴールデン契約テスト（9-6完了） | なし | — |
-| 配布/CI | 4-target build + `npm pack`→`npm install`→`npx`/`bunx`→`smoke-mcp.mjs` full flow、`ldd`/`otool`/`dumpbin`、GLIBC 2.38、`ca-certificates`/証明書ストア、`gate` 全緑 | — | 完了 |
+| 配布/CI | 4-target build + `npm pack`→`npm install`→`node`/`bun` ラッパ起動→`smoke-mcp.mjs` full flow、`ldd`/`otool`/`dumpbin`、GLIBC 2.38、`ca-certificates`/証明書ストア、`gate` 全緑 | — | 完了 |
 
 ---
 
