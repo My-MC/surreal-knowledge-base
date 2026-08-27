@@ -241,8 +241,11 @@ jobs:
           rm -rf "$SMOKE" && mkdir -p "$SMOKE" && cd "$SMOKE"
           npm init -y >/dev/null 2>&1
 
-          npm install "$GITHUB_WORKSPACE/npm/surreal-knowledge-base-0.1.0.tgz"
-          npm install "$GITHUB_WORKSPACE/npm/packages/linux-x64/surreal-knowledge-base-linux-x64-0.1.0.tgz"
+          # Resolve tarballs by glob so version bumps cannot break this job.
+          META_TGZ="$(ls "$GITHUB_WORKSPACE/npm"/surreal-knowledge-base-*.tgz)"
+          PLAT_TGZ="$(ls "$GITHUB_WORKSPACE/npm/packages/linux-x64"/surreal-knowledge-base-linux-x64-*.tgz)"
+          npm install "$META_TGZ"
+          npm install "$PLAT_TGZ"
 
           cat > skb.toml << EOF
           [storage]
@@ -363,8 +366,11 @@ jobs:
           rm -rf "$E2E" && mkdir -p "$E2E" && cd "$E2E"
           npm init -y >/dev/null 2>&1
 
-          npm install "$GITHUB_WORKSPACE/npm/surreal-knowledge-base-0.1.0.tgz"
-          npm install "$GITHUB_WORKSPACE/npm/packages/linux-arm64/surreal-knowledge-base-linux-arm64-0.1.0.tgz"
+          # Resolve tarballs by glob so version bumps cannot break this job.
+          META_TGZ="$(ls "$GITHUB_WORKSPACE/npm"/surreal-knowledge-base-*.tgz)"
+          PLAT_TGZ="$(ls "$GITHUB_WORKSPACE/npm/packages/linux-arm64"/surreal-knowledge-base-linux-arm64-*.tgz)"
+          npm install "$META_TGZ"
+          npm install "$PLAT_TGZ"
 
           cat > skb.toml << EOF
           [storage]
@@ -470,8 +476,11 @@ jobs:
           rm -rf "$E2E" && mkdir -p "$E2E" && cd "$E2E"
           npm init -y >/dev/null 2>&1
 
-          npm install "$GITHUB_WORKSPACE/npm/surreal-knowledge-base-0.1.0.tgz"
-          npm install "$GITHUB_WORKSPACE/npm/packages/darwin-arm64/surreal-knowledge-base-darwin-arm64-0.1.0.tgz"
+          # Resolve tarballs by glob so version bumps cannot break this job.
+          META_TGZ="$(ls "$GITHUB_WORKSPACE/npm"/surreal-knowledge-base-*.tgz)"
+          PLAT_TGZ="$(ls "$GITHUB_WORKSPACE/npm/packages/darwin-arm64"/surreal-knowledge-base-darwin-arm64-*.tgz)"
+          npm install "$META_TGZ"
+          npm install "$PLAT_TGZ"
 
           cat > skb.toml << EOF
           [storage]
@@ -568,7 +577,7 @@ jobs:
           Set-Location "$env:GITHUB_WORKSPACE/npm/packages/win32-x64"
           npm pack --dry-run 2>&1 | Select-Object -Last 20
           npm pack | Out-Null
-          $tar = "$env:GITHUB_WORKSPACE/npm/packages/win32-x64/surreal-knowledge-base-win32-x64-0.1.0.tgz"
+          $tar = (Get-ChildItem "$env:GITHUB_WORKSPACE/npm/packages/win32-x64/surreal-knowledge-base-win32-x64-*.tgz")[0].FullName
           if (-not (tar -tzf $tar | Select-String "package/bin/skb-mcp")) { Write-Error "bin/skb-mcp.exe missing in win32-x64 package"; tar -tzf $tar; exit 1 }
           if (-not (tar -tzf $tar | Select-String "THIRD_PARTY_LICENSES.md")) { Write-Error "THIRD_PARTY_LICENSES.md missing"; tar -tzf $tar; exit 1 }
           Write-Output "win32-x64 package contents OK"
@@ -586,8 +595,11 @@ jobs:
           Set-Location $E2E
           npm init -y | Out-Null
 
-          npm install "$env:GITHUB_WORKSPACE/npm/surreal-knowledge-base-0.1.0.tgz"
-          npm install "$env:GITHUB_WORKSPACE/npm/packages/win32-x64/surreal-knowledge-base-win32-x64-0.1.0.tgz"
+          # Resolve tarballs by glob so version bumps cannot break this job.
+          $metaTar = (Get-ChildItem "$env:GITHUB_WORKSPACE/npm/surreal-knowledge-base-*.tgz")[0].FullName
+          $platTar = (Get-ChildItem "$env:GITHUB_WORKSPACE/npm/packages/win32-x64/surreal-knowledge-base-win32-x64-*.tgz")[0].FullName
+          npm install $metaTar
+          npm install $platTar
 
           $tok = (Join-Path $env:GITHUB_WORKSPACE "npm/smoke-tokenizer.json").Replace('\', '/')
           @"
