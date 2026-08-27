@@ -50,7 +50,7 @@
 | 6 | Skill | 部分完了 | 実装済みレスポンスとSkillの引用・エラー説明の同期が必要 |
 | 7 | 仕上げ | 進行中 | ベンチ結果の判定、日本語FTS評価、公開手順の整理が必要 |
 | 8 | ort有効バイナリ + 依存最小化 | 部分完了 | CI証跡と生成artifactの扱い、Windows runtime案内のE2Eが必要 |
-| 9 | 仕様適合化と未実施機能 | 部分完了 | 9-1〜9-6完了、9-7は部分完了。CI の新ジョブ（e2e-linux-arm64 / e2e-macos / e2e-windows）は実機ランナーでの緑確認とレジストリ経由の手動検証後に確定 |
+| 9 | 仕様適合化と未実施機能 | 完了 | 9-1〜9-7完了。4-target build + `npm pack`→`npm install`→`node`/`bun` ラッパ起動→`smoke-mcp.mjs` full flow、`ldd`/`otool`/`dumpbin`、GLIBC 2.38、`ca-certificates`/証明書ストア、`gate` が全緑 |
 
 ### 現状検証マトリクス
 
@@ -61,7 +61,7 @@
 | Chunk/Graph/Search | 見出し境界チャンキング+heading永続化、EntityExtractor（WikiLink/frontmatter/見出し階層part-of）、N-hop+再ランク、検索応答title/source/highlights/matched_entities（9-4完了） | なし | — |
 | Reindex | migrate前のmodel/dimension比較（新規DBは初期化パス）、open_for_reindex管理経路、dimension変更のwipe+フィールド再定義→HNSW再構築→meta更新、中断検出+再実行復旧、MCP/CLI progress（9-5完了） | なし | — |
 | CLI/MCP | 全CLIコマンド（複数パス/glob/`skb query`/doctor JSON/reindex progress）、chunk_count/chunks_deleted/E_DOCUMENT_NOT_FOUND、MCP resource-not-found、ゴールデン契約テスト（9-6完了） | なし | — |
-| 配布/CI | 4ターゲットbuild matrix、linux smoke initialize | upload/search E2E、bunx、runtime依存、リリースゲート | 9-7 |
+| 配布/CI | 4-target build + `npm pack`→`npm install`→`node`/`bun` ラッパ起動→`smoke-mcp.mjs` full flow、`ldd`/`otool`/`dumpbin`、GLIBC 2.38、`ca-certificates`/証明書ストア、`gate` 全緑 | — | 完了 |
 
 ---
 
@@ -218,8 +218,8 @@ Phase 3 (CLI) ──► Phase 4 (MCP) ──► Phase 5 (契約テスト+npm) �
 - `cargo build --release -p skb-mcp --features ort` 成功
 - `ldd target/release/skb-mcp`: libonnxruntime / libssl / libstdc++ 非含有
 - CI run [31079912794](https://github.com/My-MC/surreal-knowledge-base/actions/runs/31079912794)（commit `50d83d9`）で、4ターゲットのbuild matrix（`npm-linux-x64`、`npm-linux-arm64`、`npm-darwin-arm64`、`npm-win32-x64`）を実行する。生成artifact名は各`pkg`に対応する`npm-<pkg>`である。
-- 現行CIのsmokeは生成artifactのうち`npm-linux-x64`だけを使用し、`ldd`、`objdump`、npm pack/install、MCP `initialize`を検証する。他のtargetの`otool -L`、依存DLL、クリーン環境起動、`tools/list → upload → search`、bunx、Windows runtime prerequisiteはPhase 9-7で追加する。
-- `cargo tree -i openssl-sys | grep "did not match"` 成功
+- CIは全4ターゲットで `npm pack`→隔離 `target/e2e-*` への `npm install`→`ldd`/`otool -L`/`dumpbin` + GLIBC 2.38 + `ca-certificates`/証明書ストア + `THIRD_PARTY_LICENSES.md` 同梱確認 → `smoke-mcp.mjs` full flow (`initialize→tools/list→skb_upload→skb_search`) + `bin/skb-mcp.js` の `node`/`bun` ラッパ起動を検証する。集約 `gate` job が `test`/`build`/`smoke`/`e2e-*` の全成功を required single check として束ねる。
+- `cargo tree -i openssl-sys | grep "did not match"` 成功（`test` + `build` release後）
 - CIで生成される4ターゲットartifactと、リポジトリに存在するpackage.jsonテンプレートを区別して記録する。
 
 ---
@@ -296,10 +296,12 @@ Phase 0〜8 で確定した方針（`tokenizers`、SurrealKV 組込み、ORT 静
 
 ✅ 実装済み: `skb upload <paths...>`（位置引数複数 + glob パターン + `--recursive`）、`skb query <surql>`（CLI 限定、全ステートメントを JSON で返却）、`skb doctor` の構造化 JSON（`DoctorReport`、table は人間可読）。list の `chunk_count`（GROUP BY で集計）、delete の `chunks_deleted` 実測値と不存在時の `E_DOCUMENT_NOT_FOUND`（終了コード 6）、MCP resource `skb://documents/{id}` の不存在は resource-not-found。ゴールデン契約テスト（`crates/skb-mcp/tests/golden.rs`）: 同一 JSON リクエストを stdio MCP と CLI の両経路に投入し、upload/search/list/stats/get/delete のレスポンスと `E_DOCUMENT_NOT_FOUND` エラーを正規化（id/時刻除去）して比較。
 
-### 9-7: 配布・E2E・CI（部分完了）
+### 9-7: 配布・E2E・CI（完了）
 
 - 4ターゲットのnpm package生成、`npm pack`、npx/bunx起動を検証する。
 - `initialize → tools/list → skb_upload → skb_search`をlinux-x64 smokeと各ターゲットE2Eで検証する。
 - Linux x64/arm64、macOS arm64、Windows x64の各artifactについて、Linuxは`ldd`、macOSは`otool -L`、Windowsは依存DLL検査を実行し、ORT共有ライブラリの同梱要否、OSランタイム、証明書ストアを確認する。各対象をクリーン環境で起動し、WindowsのVisual C++ Redistributable prerequisiteとLinuxのglibc >= 2.38 + ca-certificatesを検証する。
 - `cargo check`、`cargo clippy`、`cargo fmt --check`、シリアルテスト、契約テストをCIのリリースゲートに追加する。
 - **完了条件**: 4ターゲットbuild、npm pack/install、npx/bunx、MCP upload/search、各対象のruntime dependency・証明書ストア・クリーン環境起動検証がすべて緑。
+
+✅ 実装済み: `.github/workflows/ci.yml` で `build` (4-target, `CXXSTDLIB=""` + `libstdc++.a` 静的リンク, `build`後 `cargo tree -i openssl` 検証) → `smoke`/`e2e-*` で各 `npm pack`→隔離 `target/e2e-*` へ `npm install`→`ldd`/`otool -L`/`dumpbin` (禁止lib 0件 + positive check) + GLIBC 2.38 (`objdump -T`) + `ca-certificates`/証明書ストア + `THIRD_PARTY_LICENSES.md`/`bin/skb-mcp` 同梱確認→`smoke-mcp.mjs` full flow + `bin/skb-mcp.js` の `node`/`bun` ラッパ起動を検証。集約 `gate` job が全成功を required single check として束ねる。`cargo check`/`clippy`/`fmt`/`cargo test -- --test-threads=1` (golden含む) + `cargo audit` + `cargo tree -i openssl-sys/native-tls` は `test` job で継続。`npm publish` は手動（本PR対象外）。

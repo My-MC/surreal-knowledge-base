@@ -152,6 +152,10 @@ jobs:
         env:
           ORT_CACHE_DIR: ${{ runner.temp }}/ort-cache
         run: cargo build --release -p skb-mcp --features ort --target ${{ matrix.target }}
+      - name: Verify no OpenSSL dependency (release)
+        run: |
+          cargo tree --features ort -p skb-core -i openssl-sys 2>&1 | grep -q "did not match"
+          cargo tree --features ort -p skb-core -i native-tls 2>&1 | grep -q "did not match"
       - name: Prepare npm package
         shell: bash
         run: |
@@ -192,6 +196,7 @@ jobs:
           mkdir -p npm/packages/linux-x64/bin
           cp npm-out/packages/linux-x64/bin/skb-mcp npm/packages/linux-x64/bin/
           chmod +x npm/packages/linux-x64/bin/skb-mcp
+          cp npm/THIRD_PARTY_LICENSES.md npm/packages/linux-x64/
       - name: Check shared library dependencies
         run: |
           BIN=npm/packages/linux-x64/bin/skb-mcp
@@ -217,6 +222,31 @@ jobs:
             echo "GLIBC floor exceeded: requires $MAX_GLIBC, limit is $LIMIT"
             exit 1
           fi
+      - name: Verify CA certificates store
+        run: |
+          if [ -f /etc/ssl/certs/ca-certificates.crt ]; then
+            echo "CA store: /etc/ssl/certs/ca-certificates.crt present ($(wc -l < /etc/ssl/certs/ca-certificates.crt) certs)"
+          elif [ -f /etc/ssl/certs/ca-bundle.crt ]; then
+            echo "CA store: /etc/ssl/certs/ca-bundle.crt present"
+          else
+            echo "CA certificates store not found"
+            ls -l /etc/ssl/certs/ | head -n 30
+            exit 1
+          fi
+      - name: Verify npm package contents
+        run: |
+          cd "$GITHUB_WORKSPACE/npm"
+          # Derive tarball filenames from npm pack --json so the checks stay
+          # correct when package.json version changes.
+          META_TGZ="$PWD/$(npm pack --json | node -p 'JSON.parse(require("fs").readFileSync(0,"utf8"))[0].filename')"
+          tar -tzf "$META_TGZ" | grep -q "package/bin/skb-mcp.js" || { echo "bin/skb-mcp.js missing in meta package"; tar -tzf "$META_TGZ"; exit 1; }
+          tar -tzf "$META_TGZ" | grep -q "THIRD_PARTY_LICENSES.md" || { echo "THIRD_PARTY_LICENSES.md missing in meta package"; exit 1; }
+          echo "meta package contents OK"
+          cd "$GITHUB_WORKSPACE/npm/packages/linux-x64"
+          PLAT_TGZ="$PWD/$(npm pack --json | node -p 'JSON.parse(require("fs").readFileSync(0,"utf8"))[0].filename')"
+          tar -tzf "$PLAT_TGZ" | grep -q "package/bin/skb-mcp" || { echo "bin/skb-mcp missing in linux-x64 package"; tar -tzf "$PLAT_TGZ"; exit 1; }
+          tar -tzf "$PLAT_TGZ" | grep -q "THIRD_PARTY_LICENSES.md" || { echo "THIRD_PARTY_LICENSES.md missing in linux-x64 package"; exit 1; }
+          echo "linux-x64 package contents OK"
       - name: Smoke test (pack, install, full MCP flow)
         run: |
           cd "$GITHUB_WORKSPACE/npm" && npm pack
@@ -226,8 +256,11 @@ jobs:
           rm -rf "$SMOKE" && mkdir -p "$SMOKE" && cd "$SMOKE"
           npm init -y >/dev/null 2>&1
 
-          npm install "$GITHUB_WORKSPACE/npm/surreal-knowledge-base-0.1.0.tgz"
-          npm install "$GITHUB_WORKSPACE/npm/packages/linux-x64/surreal-knowledge-base-linux-x64-0.1.0.tgz"
+          # Resolve tarballs by glob so version bumps cannot break this job.
+          META_TGZ="$(ls "$GITHUB_WORKSPACE/npm"/surreal-knowledge-base-*.tgz)"
+          PLAT_TGZ="$(ls "$GITHUB_WORKSPACE/npm/packages/linux-x64"/surreal-knowledge-base-linux-x64-*.tgz)"
+          npm install "$META_TGZ"
+          npm install "$PLAT_TGZ"
 
           cat > skb.toml << EOF
           [storage]
@@ -275,14 +308,22 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 22
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.19
       - uses: actions/download-artifact@v8
         with:
           name: npm-linux-arm64
           path: npm-out/
+      - name: Populate npm package with binary
+        run: |
+          mkdir -p npm/packages/linux-arm64/bin
+          cp npm-out/packages/linux-arm64/bin/skb-mcp npm/packages/linux-arm64/bin/
+          chmod +x npm/packages/linux-arm64/bin/skb-mcp
+          cp npm/THIRD_PARTY_LICENSES.md npm/packages/linux-arm64/
       - name: Check shared library dependencies
         run: |
-          BIN=npm-out/packages/linux-arm64/bin/skb-mcp
-          chmod +x "$BIN"
+          BIN=npm/packages/linux-arm64/bin/skb-mcp
           DEPS=$(ldd "$BIN" 2>&1)
           echo "$DEPS"
           # Positive check: ldd must actually resolve the binary's dynamic
@@ -298,17 +339,80 @@ jobs:
               exit 1
             fi
           done
-      - name: MCP E2E flow (initialize -> tools/list -> upload -> search)
+      - name: Check GLIBC floor
         run: |
+          MAX_GLIBC=$(objdump -T npm/packages/linux-arm64/bin/skb-mcp \
+            | grep -oP 'GLIBC_\K[0-9.]+' | sort -Vu | tail -1)
+          if [ -z "$MAX_GLIBC" ]; then
+            echo "failed to extract a GLIBC version from the binary"
+            exit 1
+          fi
+          echo "Max GLIBC version required: $MAX_GLIBC"
+          LIMIT=2.38
+          HIGHEST=$(printf '%s\n%s\n' "$MAX_GLIBC" "$LIMIT" | sort -V | tail -1)
+          if [ "$HIGHEST" != "$LIMIT" ]; then
+            echo "GLIBC floor exceeded: requires $MAX_GLIBC, limit is $LIMIT"
+            exit 1
+          fi
+      - name: Verify CA certificates store
+        run: |
+          if [ -f /etc/ssl/certs/ca-certificates.crt ]; then
+            echo "CA store: /etc/ssl/certs/ca-certificates.crt present ($(wc -l < /etc/ssl/certs/ca-certificates.crt) certs)"
+          elif [ -f /etc/ssl/certs/ca-bundle.crt ]; then
+            echo "CA store: /etc/ssl/certs/ca-bundle.crt present"
+          else
+            echo "CA certificates store not found"
+            ls -l /etc/ssl/certs/ | head -n 30
+            exit 1
+          fi
+      - name: Verify npm package contents
+        run: |
+          cd "$GITHUB_WORKSPACE/npm/packages/linux-arm64"
+          PLAT_TGZ="$PWD/$(npm pack --json | node -p 'JSON.parse(require("fs").readFileSync(0,"utf8"))[0].filename')"
+          tar -tzf "$PLAT_TGZ" | grep -q "package/bin/skb-mcp" || { echo "bin/skb-mcp missing in linux-arm64 package"; tar -tzf "$PLAT_TGZ"; exit 1; }
+          tar -tzf "$PLAT_TGZ" | grep -q "THIRD_PARTY_LICENSES.md" || { echo "THIRD_PARTY_LICENSES.md missing"; exit 1; }
+          echo "linux-arm64 package contents OK"
+      - name: Smoke test (pack, install, full MCP flow)
+        run: |
+          cd "$GITHUB_WORKSPACE/npm" && npm pack
+          cd "$GITHUB_WORKSPACE/npm/packages/linux-arm64" && npm pack
+
+          E2E="$GITHUB_WORKSPACE/target/e2e-linux-arm64"
+          rm -rf "$E2E" && mkdir -p "$E2E" && cd "$E2E"
+          npm init -y >/dev/null 2>&1
+
+          # Resolve tarballs by glob so version bumps cannot break this job.
+          META_TGZ="$(ls "$GITHUB_WORKSPACE/npm"/surreal-knowledge-base-*.tgz)"
+          PLAT_TGZ="$(ls "$GITHUB_WORKSPACE/npm/packages/linux-arm64"/surreal-knowledge-base-linux-arm64-*.tgz)"
+          npm install "$META_TGZ"
+          npm install "$PLAT_TGZ"
+
           cat > skb.toml << EOF
           [storage]
-          path = "target/e2e-linux-arm64-db"
+          path = "../e2e-linux-arm64-db"
           [embedding]
           onnx_path = "mock"
           dimension = 8
           tokenizer = "$GITHUB_WORKSPACE/npm/smoke-tokenizer.json"
           EOF
-          node "$GITHUB_WORKSPACE/npm/smoke-mcp.mjs" "$PWD/npm-out/packages/linux-arm64/bin/skb-mcp"
+
+          SKB_BIN="$(dirname "$(node -p "require.resolve('@surreal-knowledge-base/linux-arm64/package.json')")")/bin/skb-mcp"
+          cd "$E2E"
+          node "$GITHUB_WORKSPACE/npm/smoke-mcp.mjs" "$SKB_BIN"
+
+      - name: Wrapper launch via node (npx-style) and bun
+        run: |
+          E2E="$GITHUB_WORKSPACE/target/e2e-linux-arm64"
+          cd "$E2E"
+          WRAPPER="$(node -p "require.resolve('surreal-knowledge-base/bin/skb-mcp.js')")"
+          echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"node-wrapper","version":"1.0"}}}' \
+            | timeout 60 node "$WRAPPER" >node.out 2>node.log || true
+          grep -q 'protocolVersion' node.out \
+            || { echo "node wrapper launch failed; stderr:"; cat node.log; exit 1; }
+          echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"bun-wrapper","version":"1.0"}}}' \
+            | timeout 60 bun "$WRAPPER" >bun.out 2>bun.log || true
+          grep -q 'protocolVersion' bun.out \
+            || { echo "bun wrapper launch failed; stderr:"; cat bun.log; exit 1; }
 
   e2e-macos:
     name: E2E (darwin-arm64)
@@ -325,14 +429,22 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 22
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.19
       - uses: actions/download-artifact@v8
         with:
           name: npm-darwin-arm64
           path: npm-out/
+      - name: Populate npm package with binary
+        run: |
+          mkdir -p npm/packages/darwin-arm64/bin
+          cp npm-out/packages/darwin-arm64/bin/skb-mcp npm/packages/darwin-arm64/bin/
+          chmod +x npm/packages/darwin-arm64/bin/skb-mcp
+          cp npm/THIRD_PARTY_LICENSES.md npm/packages/darwin-arm64/
       - name: Check dynamic library dependencies (otool)
         run: |
-          BIN=npm-out/packages/darwin-arm64/bin/skb-mcp
-          chmod +x "$BIN"
+          BIN=npm/packages/darwin-arm64/bin/skb-mcp
           DEPS=$(otool -L "$BIN" 2>&1)
           echo "$DEPS"
           # Positive check: otool must actually resolve the binary's dynamic
@@ -348,17 +460,77 @@ jobs:
               exit 1
             fi
           done
-      - name: MCP E2E flow (initialize -> tools/list -> upload -> search)
+      - name: Verify certificate store (macOS)
         run: |
+          echo "Checking SystemRootCertificates keychain"
+          # Capture security's exit code directly (pipefail would mask it; $?
+          # after a pipeline is the last command's, i.e. head's).
+          if ! CERTS=$(security find-certificate -a -p /System/Library/Keychains/SystemRootCertificates.keychain); then
+            echo "failed to access SystemRootCertificates"
+            exit 1
+          fi
+          printf '%s\n' "$CERTS" | head -n 5
+          if ! printf '%s\n' "$CERTS" | grep -q 'BEGIN CERTIFICATE'; then
+            echo "no certificate found in SystemRootCertificates"
+            exit 1
+          fi
+          echo "macOS certificate store accessible"
+      - name: Verify npm package contents
+        run: |
+          cd "$GITHUB_WORKSPACE/npm/packages/darwin-arm64"
+          PLAT_TGZ="$PWD/$(npm pack --json | node -p 'JSON.parse(require("fs").readFileSync(0,"utf8"))[0].filename')"
+          tar -tzf "$PLAT_TGZ" | grep -q "package/bin/skb-mcp" || { echo "bin/skb-mcp missing in darwin-arm64 package"; tar -tzf "$PLAT_TGZ"; exit 1; }
+          tar -tzf "$PLAT_TGZ" | grep -q "THIRD_PARTY_LICENSES.md" || { echo "THIRD_PARTY_LICENSES.md missing"; exit 1; }
+          echo "darwin-arm64 package contents OK"
+      - name: Smoke test (pack, install, full MCP flow)
+        run: |
+          cd "$GITHUB_WORKSPACE/npm" && npm pack
+          cd "$GITHUB_WORKSPACE/npm/packages/darwin-arm64" && npm pack
+
+          E2E="$GITHUB_WORKSPACE/target/e2e-macos"
+          rm -rf "$E2E" && mkdir -p "$E2E" && cd "$E2E"
+          npm init -y >/dev/null 2>&1
+
+          # Resolve tarballs by glob so version bumps cannot break this job.
+          META_TGZ="$(ls "$GITHUB_WORKSPACE/npm"/surreal-knowledge-base-*.tgz)"
+          PLAT_TGZ="$(ls "$GITHUB_WORKSPACE/npm/packages/darwin-arm64"/surreal-knowledge-base-darwin-arm64-*.tgz)"
+          npm install "$META_TGZ"
+          npm install "$PLAT_TGZ"
+
           cat > skb.toml << EOF
           [storage]
-          path = "target/e2e-macos-db"
+          path = "../e2e-macos-db"
           [embedding]
           onnx_path = "mock"
           dimension = 8
           tokenizer = "$GITHUB_WORKSPACE/npm/smoke-tokenizer.json"
           EOF
-          node "$GITHUB_WORKSPACE/npm/smoke-mcp.mjs" "$PWD/npm-out/packages/darwin-arm64/bin/skb-mcp"
+
+          SKB_BIN="$(dirname "$(node -p "require.resolve('@surreal-knowledge-base/darwin-arm64/package.json')")")/bin/skb-mcp"
+          cd "$E2E"
+          node "$GITHUB_WORKSPACE/npm/smoke-mcp.mjs" "$SKB_BIN"
+
+      - name: Wrapper launch via node (npx-style) and bun
+        run: |
+          E2E="$GITHUB_WORKSPACE/target/e2e-macos"
+          cd "$E2E"
+          WRAPPER="$(node -p "require.resolve('surreal-knowledge-base/bin/skb-mcp.js')")"
+          # macOS lacks GNU timeout; use gtimeout if available, otherwise run without timeout (wrapper exits quickly)
+          if command -v gtimeout >/dev/null 2>&1; then
+            TIMEOUT="gtimeout 60"
+          elif command -v timeout >/dev/null 2>&1; then
+            TIMEOUT="timeout 60"
+          else
+            TIMEOUT=""
+          fi
+          echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"node-wrapper","version":"1.0"}}}' \
+            | $TIMEOUT node "$WRAPPER" >node.out 2>node.log || true
+          grep -q 'protocolVersion' node.out \
+            || { echo "node wrapper launch failed; stderr:"; cat node.log; exit 1; }
+          echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"bun-wrapper","version":"1.0"}}}' \
+            | $TIMEOUT bun "$WRAPPER" >bun.out 2>bun.log || true
+          grep -q 'protocolVersion' bun.out \
+            || { echo "bun wrapper launch failed; stderr:"; cat bun.log; exit 1; }
 
   e2e-windows:
     name: E2E (win32-x64)
@@ -375,10 +547,19 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 22
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.19
       - uses: actions/download-artifact@v8
         with:
           name: npm-win32-x64
           path: npm-out/
+      - name: Populate npm package with binary
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path npm/packages/win32-x64/bin | Out-Null
+          Copy-Item npm-out/packages/win32-x64/bin/skb-mcp.exe npm/packages/win32-x64/bin/skb-mcp.exe
+          Copy-Item npm/THIRD_PARTY_LICENSES.md npm/packages/win32-x64/THIRD_PARTY_LICENSES.md
       - name: Check imported DLLs (VC++ runtime prerequisite)
         shell: pwsh
         run: |
@@ -386,7 +567,7 @@ jobs:
           $vsPath = & $vswhere -latest -property installationPath
           $dumpbin = Get-ChildItem "$vsPath\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1
           if (-not $dumpbin) { Write-Error "dumpbin not found"; exit 1 }
-          $deps = & $dumpbin.FullName /dependents npm-out\packages\win32-x64\bin\skb-mcp.exe
+          $deps = & $dumpbin.FullName /dependents npm/packages/win32-x64/bin/skb-mcp.exe
           $deps | Select-String '\.dll'
           if ($deps | Select-String 'onnxruntime') { Write-Error "onnxruntime.dll must not be imported"; exit 1 }
           # Reject any OpenSSL-related DLL: versioned (libssl-3-x64.dll,
@@ -397,16 +578,115 @@ jobs:
           if (-not ($deps | Select-String 'MSVCP140.dll')) { Write-Error "MSVCP140.dll (VC++ runtime) must be imported"; exit 1 }
           if (-not ($deps | Select-String 'VCRUNTIME140.dll')) { Write-Error "VCRUNTIME140.dll (VC++ runtime) must be imported"; exit 1 }
           Write-Output "VC++ runtime present on runner: $(Test-Path "$env:WINDIR\System32\vcruntime140.dll")"
-      - name: MCP E2E flow (initialize -> tools/list -> upload -> search)
+      - name: Verify certificate store (Windows)
         shell: pwsh
         run: |
-          $tok = (Join-Path $env:GITHUB_WORKSPACE "npm\smoke-tokenizer.json").Replace('\', '/')
+          Write-Output "Checking Windows certificate store"
+          certutil -store Root > certs.txt
+          if ($LASTEXITCODE -ne 0) { Write-Error "cert store not accessible"; exit 1 }
+          Get-Content certs.txt | Select-Object -First 20
+          Write-Output "Windows certificate store accessible"
+      - name: Verify npm package contents
+        shell: pwsh
+        run: |
+          Set-Location "$env:GITHUB_WORKSPACE/npm/packages/win32-x64"
+          npm pack --dry-run 2>&1 | Select-Object -Last 20
+          npm pack | Out-Null
+          $tar = (Get-ChildItem "$env:GITHUB_WORKSPACE/npm/packages/win32-x64/surreal-knowledge-base-win32-x64-*.tgz")[0].FullName
+          if (-not (tar -tzf $tar | Select-String "package/bin/skb-mcp")) { Write-Error "bin/skb-mcp.exe missing in win32-x64 package"; tar -tzf $tar; exit 1 }
+          if (-not (tar -tzf $tar | Select-String "THIRD_PARTY_LICENSES.md")) { Write-Error "THIRD_PARTY_LICENSES.md missing"; tar -tzf $tar; exit 1 }
+          Write-Output "win32-x64 package contents OK"
+      - name: Smoke test (pack, install, full MCP flow)
+        shell: pwsh
+        run: |
+          Set-Location "$env:GITHUB_WORKSPACE/npm"
+          npm pack
+          Set-Location "$env:GITHUB_WORKSPACE/npm/packages/win32-x64"
+          npm pack
+
+          $E2E = "$env:GITHUB_WORKSPACE/target/e2e-windows"
+          if (Test-Path $E2E) { Remove-Item -Recurse -Force $E2E }
+          New-Item -ItemType Directory -Force -Path $E2E | Out-Null
+          Set-Location $E2E
+          npm init -y | Out-Null
+
+          # Resolve tarballs by glob so version bumps cannot break this job.
+          $metaTar = (Get-ChildItem "$env:GITHUB_WORKSPACE/npm/surreal-knowledge-base-*.tgz")[0].FullName
+          $platTar = (Get-ChildItem "$env:GITHUB_WORKSPACE/npm/packages/win32-x64/surreal-knowledge-base-win32-x64-*.tgz")[0].FullName
+          npm install $metaTar
+          npm install $platTar
+
+          $tok = (Join-Path $env:GITHUB_WORKSPACE "npm/smoke-tokenizer.json").Replace('\', '/')
           @"
           [storage]
-          path = "target/e2e-windows-db"
+          path = "../e2e-windows-db"
           [embedding]
           onnx_path = "mock"
           dimension = 8
           tokenizer = "$tok"
           "@ | Set-Content -Encoding ascii skb.toml
-          node "$env:GITHUB_WORKSPACE/npm/smoke-mcp.mjs" "$env:GITHUB_WORKSPACE/npm-out/packages/win32-x64/bin/skb-mcp.exe"
+
+          $pkgJson = node -p "require.resolve('@surreal-knowledge-base/win32-x64/package.json')"
+          $skbBin = Join-Path (Split-Path $pkgJson) "bin/skb-mcp.exe"
+          $skbBinForward = $skbBin.Replace('\', '/')
+          node "$env:GITHUB_WORKSPACE/npm/smoke-mcp.mjs" "$skbBinForward"
+      - name: Wrapper launch via node (npx-style) and bun
+        shell: pwsh
+        run: |
+          $E2E = "$env:GITHUB_WORKSPACE/target/e2e-windows"
+          Set-Location $E2E
+          $wrapper = node -p "require.resolve('surreal-knowledge-base/bin/skb-mcp.js')"
+          $init = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"node-wrapper","version":"1.0"}}}'
+          # Each launcher gets a hard 60 s budget via Start-Process +
+          # WaitForExit(60000), killed and failed when the budget elapses.
+          # pwsh does not turn native exit codes into terminating errors by
+          # default; capture ExitCode explicitly, reset after output checks
+          # so a stray non-zero exit does not fail the step post-validation.
+          Set-Content -Path init.jsonl -Value $init -Encoding ascii
+          function Invoke-WrappedLaunch {
+            param([string]$Launcher, [string]$OutFile, [string]$LogFile)
+            $p = Start-Process -FilePath $Launcher -ArgumentList "`"$wrapper`"" `
+              -WorkingDirectory $E2E `
+              -RedirectStandardInput (Join-Path $E2E 'init.jsonl') `
+              -RedirectStandardOutput (Join-Path $E2E $OutFile) `
+              -RedirectStandardError (Join-Path $E2E $LogFile) `
+              -NoNewWindow -PassThru
+            if (-not $p.WaitForExit(60000)) {
+              Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+              Write-Error "${Launcher} wrapper launch timed out after 60 s"
+              Get-Content (Join-Path $E2E $LogFile)
+              exit 1
+            }
+            return $p.ExitCode
+          }
+
+          $nodeExit = Invoke-WrappedLaunch node node.out node.log
+          if (-not (Select-String -Path node.out -Pattern 'protocolVersion')) { Write-Error "node wrapper launch failed"; Get-Content node.log; exit 1 }
+          if ($nodeExit -ne 0) { Write-Warning "node wrapper exited $nodeExit after producing valid output" }
+          $LASTEXITCODE = 0
+
+          $bunExit = Invoke-WrappedLaunch bun bun.out bun.log
+          if (-not (Select-String -Path bun.out -Pattern 'protocolVersion')) { Write-Error "bun wrapper launch failed"; Get-Content bun.log; exit 1 }
+          if ($bunExit -ne 0) { Write-Warning "bun wrapper exited $bunExit after producing valid output" }
+          $LASTEXITCODE = 0
+
+  gate:
+    name: CI gate (required)
+    runs-on: ubuntu-24.04
+    if: always()
+    needs: [test, build, smoke, e2e-linux-arm64, e2e-macos, e2e-windows]
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Check all jobs succeeded
+        run: |
+          results="${{ join(needs.*.result, ' ') }}"
+          echo "Job results: $results"
+          for r in $results; do
+            if [ "$r" != "success" ] && [ "$r" != "skipped" ]; then
+              echo "gate failed: job result $r"
+              exit 1
+            fi
+          done
+          echo "All required jobs succeeded"
