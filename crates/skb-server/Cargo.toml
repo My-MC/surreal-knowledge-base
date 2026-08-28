@@ -1,0 +1,10 @@
+[package]
+name = "skb-server"
+version = "0.1.0"
+edition = "2021"
+rust-version.workspace = true
+description = "Surreal Knowledge Base - HTTP API server"
+
+[dependencies]
+skb-core = { path = "../skb-core" }
+tokio = { version = "1", features = ["full"] }

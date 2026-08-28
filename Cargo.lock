@@ -5269,6 +5269,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "skb-server"
+version = "0.1.0"
+dependencies = [
+ "skb-core",
+ "tokio",
+]
+
+[[package]]
 name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
