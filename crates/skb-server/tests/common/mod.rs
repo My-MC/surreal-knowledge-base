@@ -19,11 +19,11 @@ pub fn unique_id() -> usize {
     TEST_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
 }
 
-/// Mock-embedder state with a store path unique per process AND per test:
-/// the pid qualifier keeps a re-run off the dirty store a previously failed
-/// run left behind (a reused store would skip uploads with identical
-/// content). Never /tmp. Returns the store path for cleanup.
-pub async fn test_state() -> (AppState, PathBuf) {
+/// Mock-embedder core Config with a store path unique per process AND per
+/// test: the pid qualifier keeps a re-run off the dirty store a previously
+/// failed run left behind (a reused store would skip uploads with identical
+/// content). Never /tmp. Returns (config, store path for cleanup).
+pub fn test_config() -> (Config, PathBuf) {
     let n = unique_id();
     let mut core = Config::default();
     core.embedding.onnx_path = "mock".into();
@@ -33,6 +33,13 @@ pub async fn test_state() -> (AppState, PathBuf) {
         std::process::id()
     ));
     let db_path = core.storage.path.clone();
+    (core, db_path)
+}
+
+/// Mock-embedder state with a unique store path (see `test_config`).
+/// Returns the store path for cleanup.
+pub async fn test_state() -> (AppState, PathBuf) {
+    let (core, db_path) = test_config();
     let kb = KnowledgeBase::open(core)
         .await
         .expect("open mock knowledge base");
@@ -41,6 +48,29 @@ pub async fn test_state() -> (AppState, PathBuf) {
         server_cfg: ServerConfig::default(),
     };
     (state, db_path)
+}
+
+/// Start the full router on an ephemeral 127.0.0.1 port in a background
+/// task (port 0 = the OS picks the port, mirroring the binary's
+/// `--port 0` protocol). Returns (base URL, store path for cleanup, task
+/// handle — abort it to tear the server down).
+// Harness infrastructure for later todos (T6 SSE tests drive a base URL);
+// current test binaries do not consume it yet, and each test file compiles
+// this module separately, which trips dead_code per binary.
+#[allow(dead_code)]
+pub async fn spawn_server() -> (String, PathBuf, tokio::task::JoinHandle<()>) {
+    let (state, db_path) = test_state().await;
+    let router = build_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let port = listener.local_addr().expect("local_addr").port();
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .await
+            .expect("in-process server failed");
+    });
+    (format!("http://127.0.0.1:{port}"), db_path, handle)
 }
 
 /// Build the full application router for a test state.

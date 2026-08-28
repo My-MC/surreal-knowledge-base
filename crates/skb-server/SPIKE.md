@@ -84,3 +84,20 @@ cargo clippy -p skb-server -- -D warnings                               # zero w
 ```
 
 Evidence: `target/evidence/01/{spike-run-1,spike-run-2,multi-process-test,failure,missing-parent}.log`
+
+## Verification commands
+
+Repository QA gates (run from the workspace root):
+
+```
+cargo test --workspace -- --test-threads=1   # full suite, serial (embedded SurrealKV)
+cargo clippy --workspace -- -D warnings      # zero warnings
+cargo fmt --all -- --check                   # formatting clean
+cargo tree -i openssl-sys                    # must exit NON-ZERO (package absent)
+cargo tree -i native-tls                     # must exit NON-ZERO (package absent)
+```
+
+The two `cargo tree -i` guards enforce the rustls-only TLS policy
+(CONTRIBUTING.md "TLS") and are mirrored by
+`crates/skb-server/tests/tls_guard.rs`, which runs them offline against
+Cargo.lock inside the normal test suite.
