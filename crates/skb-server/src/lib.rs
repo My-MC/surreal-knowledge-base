@@ -5,6 +5,7 @@
 //! [`build_router`] / [`AppState`] in-process.
 
 pub mod api;
+pub mod auth;
 pub mod config;
 pub mod dto;
 pub mod error;

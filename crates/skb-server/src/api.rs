@@ -12,7 +12,9 @@ use utoipa::OpenApi;
 use utoipa::ToSchema;
 use utoipa_swagger_ui::SwaggerUi;
 
+use crate::auth;
 use crate::config::ServerConfig;
+use crate::dto::auth::{AuthResponse, LoginRequest, RegisterRequest};
 use crate::dto::chat::ChatStreamRequest;
 use crate::dto::documents::{
     DocumentDetailResponse, DocumentSummaryResponse, UpdateDocumentResponse, UploadDocumentRequest,
@@ -23,7 +25,7 @@ use crate::dto::graph::{
     GraphQueryRequest, GraphQueryResult,
 };
 use crate::dto::search::{SearchHit, SearchRequest, SearchResponse};
-use crate::handlers::{chat, documents, graph, search};
+use crate::handlers::{blog, chat, documents, graph, search};
 
 /// Shared handler state. `kb` is the single embedded-DB owner for the whole
 /// process (see SPIKE.md); `server_cfg` carries the resolved listen address.
@@ -64,6 +66,10 @@ async fn health() -> Json<HealthResponse> {
         graph::graph_query,
         graph::document_backlinks,
         chat::chat_stream,
+        auth::register,
+        auth::login,
+        blog::list_posts,
+        blog::publish_post,
     ),
     components(schemas(
         HealthResponse,
@@ -85,6 +91,11 @@ async fn health() -> Json<HealthResponse> {
         BacklinksResponse,
         BacklinkDocument,
         ChatStreamRequest,
+        RegisterRequest,
+        LoginRequest,
+        AuthResponse,
+        blog::BlogPostSummary,
+        blog::PublishResponse,
     ))
 )]
 pub struct ApiDoc;
@@ -111,6 +122,13 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/search/expand", post(graph::expand_search))
         .route("/api/graph/query", post(graph::graph_query))
         .route("/api/chat/stream", post(chat::chat_stream))
+        .route("/api/auth/register", post(auth::register))
+        .route("/api/auth/login", post(auth::login))
+        .route("/api/blog/posts", get(blog::list_posts))
+        .route(
+            "/api/blog/posts/{document_id}/publish",
+            post(blog::publish_post),
+        )
         .merge(SwaggerUi::new("/swagger-ui").url("/api/openapi.json", ApiDoc::openapi()))
         .with_state(state)
 }

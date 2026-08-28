@@ -37,12 +37,17 @@ pub fn test_config() -> (Config, PathBuf) {
 }
 
 /// Mock-embedder state with a unique store path (see `test_config`).
-/// Returns the store path for cleanup.
+/// The server-owned schema (user/blog_post) is applied exactly like the
+/// binary does after `KnowledgeBase::open`. Returns the store path for
+/// cleanup.
 pub async fn test_state() -> (AppState, PathBuf) {
     let (core, db_path) = test_config();
     let kb = KnowledgeBase::open(core)
         .await
         .expect("open mock knowledge base");
+    skb_server::auth::apply_server_schema(&kb)
+        .await
+        .expect("apply server schema");
     let state = AppState {
         kb: Arc::new(kb),
         server_cfg: ServerConfig::default(),
@@ -108,6 +113,9 @@ pub async fn send(
 }
 
 /// POST a content/title document and assert the 201 + id contract.
+// The auth/blog suite drives uploads with cookies + metadata through its own
+// helper; per-binary dead_code otherwise (same situation as spawn_server).
+#[allow(dead_code)]
 pub async fn upload(router: axum::Router, content: &str, title: &str) -> String {
     let (status, body) = send(
         router,

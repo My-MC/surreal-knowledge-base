@@ -45,6 +45,12 @@ async fn run(cli: Cli) -> Result<(), SkbError> {
     let server_cfg = ServerConfig::load(cli.port, cli.host)?;
     let core_cfg = core_config()?;
     let kb = Arc::new(KnowledgeBase::open(core_cfg).await?);
+    skb_server::auth::apply_server_schema(&kb).await?;
+    if std::env::var("SKB_SERVER_JWT_SECRET").is_err() {
+        tracing::warn!(
+            "SKB_SERVER_JWT_SECRET is not set; authenticated endpoints return 503 E_CONFIG (public routes unaffected)"
+        );
+    }
     let state = AppState { kb, server_cfg };
 
     let host = state.server_cfg.host.clone();

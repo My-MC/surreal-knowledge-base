@@ -11,11 +11,13 @@ use skb_core::error::{ErrorCode, SkbError};
 use skb_core::ingest::UploadRequest;
 
 use crate::api::AppState;
+use crate::auth::OptionalAuth;
 use crate::dto::documents::{
     DocumentDetailResponse, DocumentSummaryResponse, ErrorResponse, GetDocumentParams,
     ListDocumentsParams, UpdateDocumentResponse, UploadDocumentRequest, UploadDocumentResponse,
 };
 use crate::error::ApiError;
+use crate::handlers::blog;
 
 /// Scan bound for the cursor emulation in [`list_with_cursor`]: core caps
 /// list limits at 10_000 (its `MAX_LIST_LIMIT`, also this app's document
@@ -25,6 +27,11 @@ const CURSOR_SCAN_LIMIT: usize = 10_000;
 /// Ingest a new document. The request body is a transparent
 /// [`UploadRequest`] passthrough; exactly one of `path`/`url`/`content`/
 /// `content_base64` must be set (enforced by core).
+///
+/// Uploads marked `metadata.app == "blog"` require an author JWT (401 for
+/// missing/invalid tokens or reader role, 503 when the JWT secret is
+/// unconfigured) and auto-create the `blog_post` registry row; other
+/// uploads are unchanged and need no auth.
 #[utoipa::path(
     post,
     path = "/api/documents",
@@ -32,16 +39,31 @@ const CURSOR_SCAN_LIMIT: usize = 10_000;
     responses(
         (status = 201, description = "Document ingested", body = UploadDocumentResponse),
         (status = 400, description = "Invalid upload request", body = ErrorResponse),
+        (status = 401, description = "Blog upload without an author session", body = ErrorResponse),
         (status = 415, description = "Unsupported source format", body = ErrorResponse),
         (status = 500, description = "Server fault", body = ErrorResponse),
+        (status = 503, description = "JWT secret not configured", body = ErrorResponse),
     )
 )]
 pub async fn create_document(
     State(state): State<AppState>,
+    auth: OptionalAuth,
     Json(req): Json<UploadDocumentRequest>,
 ) -> Result<(StatusCode, Json<UploadDocumentResponse>), ApiError> {
     req.validate()?;
+    let is_blog = req
+        .metadata
+        .as_ref()
+        .is_some_and(|m| m.get("app").is_some_and(|v| v == "blog"));
+    let author = if is_blog {
+        Some(auth.0?.require_author()?)
+    } else {
+        None
+    };
     let result = state.kb.upload(req.into()).await?;
+    if let (Some(user), Some(document_id)) = (author, result.document_id.clone()) {
+        blog::create_blog_post(&state, &document_id, &user.email).await?;
+    }
     Ok((StatusCode::CREATED, Json(result.into())))
 }
 
@@ -171,18 +193,23 @@ pub async fn update_document(
 ) -> Result<Json<UpdateDocumentResponse>, ApiError> {
     req.validate()?;
     // The old document must exist; a miss maps to E_DOCUMENT_NOT_FOUND (404).
-    state
+    let old = state
         .kb
         .get_document(&GetDocumentRequest {
             id: id.clone(),
             include_chunks: None,
         })
         .await?;
+    // Blog registry state must be read before the old document is deleted.
+    let was_blog = blog::document_is_blog(&state, &old.id).await?;
     let mut core_req = UploadRequest::from(req);
     core_req.force = None;
     let result = state.kb.upload(core_req).await?;
     let document_id = match result.document_id {
         Some(new_id) if new_id != id => {
+            if was_blog {
+                blog::migrate_blog_post(&state, &old.id, &new_id).await?;
+            }
             state
                 .kb
                 .delete_document(&DeleteDocumentRequest { id })
@@ -198,7 +225,10 @@ pub async fn update_document(
     Ok(Json(UpdateDocumentResponse { document_id }))
 }
 
-/// Delete a document and its chunks. Responds 204 with no body.
+/// Delete a document and its chunks. Responds 204 with no body. The
+/// `blog_post` registry row (if any) is dropped first so the published-post
+/// listing never references a deleted document; the targeted delete is a
+/// no-op for documents without a post.
 #[utoipa::path(
     delete,
     path = "/api/documents/{id}",
@@ -213,6 +243,11 @@ pub async fn delete_document(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
+    // Unconditional: a PUT can migrate a post onto a replacement document
+    // whose metadata no longer carries app=blog, so the metadata marker is
+    // not a reliable existence test. A missing document still surfaces as
+    // the core-owned 404 below.
+    blog::delete_blog_post(&state, &id).await?;
     state
         .kb
         .delete_document(&DeleteDocumentRequest { id })
