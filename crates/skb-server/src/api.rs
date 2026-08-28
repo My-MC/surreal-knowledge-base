@@ -17,7 +17,12 @@ use crate::dto::documents::{
     DocumentDetailResponse, DocumentSummaryResponse, UpdateDocumentResponse, UploadDocumentRequest,
     UploadDocumentResponse,
 };
-use crate::handlers::documents;
+use crate::dto::graph::{
+    BacklinkDocument, BacklinksResponse, ExpandRequest, ExpandResponse, GraphEdge, GraphNode,
+    GraphQueryRequest, GraphQueryResult,
+};
+use crate::dto::search::{SearchHit, SearchRequest, SearchResponse};
+use crate::handlers::{documents, graph, search};
 
 /// Shared handler state. `kb` is the single embedded-DB owner for the whole
 /// process (see SPIKE.md); `server_cfg` carries the resolved listen address.
@@ -53,6 +58,10 @@ async fn health() -> Json<HealthResponse> {
         documents::get_document,
         documents::update_document,
         documents::delete_document,
+        search::search,
+        graph::expand_search,
+        graph::graph_query,
+        graph::document_backlinks,
     ),
     components(schemas(
         HealthResponse,
@@ -62,6 +71,17 @@ async fn health() -> Json<HealthResponse> {
         DocumentDetailResponse,
         UpdateDocumentResponse,
         crate::dto::ErrorResponse,
+        SearchRequest,
+        SearchResponse,
+        SearchHit,
+        ExpandRequest,
+        ExpandResponse,
+        GraphQueryRequest,
+        GraphQueryResult,
+        GraphNode,
+        GraphEdge,
+        BacklinksResponse,
+        BacklinkDocument,
     ))
 )]
 pub struct ApiDoc;
@@ -80,6 +100,13 @@ pub fn build_router(state: AppState) -> Router {
                 .put(documents::update_document)
                 .delete(documents::delete_document),
         )
+        .route(
+            "/api/documents/{id}/backlinks",
+            get(graph::document_backlinks),
+        )
+        .route("/api/search", post(search::search))
+        .route("/api/search/expand", post(graph::expand_search))
+        .route("/api/graph/query", post(graph::graph_query))
         .merge(SwaggerUi::new("/swagger-ui").url("/api/openapi.json", ApiDoc::openapi()))
         .with_state(state)
 }
