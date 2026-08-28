@@ -1,0 +1,33 @@
+{
+  "name": "@skb/ui",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@shikijs/rehype": "4.4.3",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "rehype-react": "8.0.0",
+    "remark-gfm": "4.0.1",
+    "remark-parse": "11.0.0",
+    "remark-rehype": "11.1.2",
+    "shiki": "4.4.3",
+    "unified": "11.0.5",
+    "unist-util-visit": "5.1.0"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.0",
+    "@types/hast": "3.0.5",
+    "@types/mdast": "4.0.4",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.5",
+    "typescript": "7.0.2"
+  }
+}
