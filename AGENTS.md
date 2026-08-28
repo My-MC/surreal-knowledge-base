@@ -19,6 +19,7 @@ Local-first knowledge base: SurrealDB (embedded SurrealKV) + BAAI/bge-m3 embeddi
 - After opening a PR, wait for the CodeRabbitAI review to be published before merging. Inspect both the review summary and every inline comment, including suppressed comments when available.
 - Address valid CodeRabbitAI findings, or document the rationale for not addressing them, then re-run the relevant checks and request/wait for a follow-up review after any code, documentation, or configuration change.
 - Do not merge a PR while its CodeRabbitAI review is pending unless the user explicitly authorizes an exception.
+- Track each task in the repository's linked GitHub Project (Projects V2): open an issue per task, add it with `gh project item-add`, and keep its Status current (Todo → In Progress → In Review → Done) at branch creation, PR open, and merge via `gh project item-edit`. Requires the `project` auth scope (`gh auth refresh -s project`).
 
 ## Commands
 
