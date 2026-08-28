@@ -13,6 +13,7 @@ use utoipa::ToSchema;
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::config::ServerConfig;
+use crate::dto::chat::ChatStreamRequest;
 use crate::dto::documents::{
     DocumentDetailResponse, DocumentSummaryResponse, UpdateDocumentResponse, UploadDocumentRequest,
     UploadDocumentResponse,
@@ -22,7 +23,7 @@ use crate::dto::graph::{
     GraphQueryRequest, GraphQueryResult,
 };
 use crate::dto::search::{SearchHit, SearchRequest, SearchResponse};
-use crate::handlers::{documents, graph, search};
+use crate::handlers::{chat, documents, graph, search};
 
 /// Shared handler state. `kb` is the single embedded-DB owner for the whole
 /// process (see SPIKE.md); `server_cfg` carries the resolved listen address.
@@ -62,6 +63,7 @@ async fn health() -> Json<HealthResponse> {
         graph::expand_search,
         graph::graph_query,
         graph::document_backlinks,
+        chat::chat_stream,
     ),
     components(schemas(
         HealthResponse,
@@ -82,6 +84,7 @@ async fn health() -> Json<HealthResponse> {
         GraphEdge,
         BacklinksResponse,
         BacklinkDocument,
+        ChatStreamRequest,
     ))
 )]
 pub struct ApiDoc;
@@ -107,6 +110,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/search", post(search::search))
         .route("/api/search/expand", post(graph::expand_search))
         .route("/api/graph/query", post(graph::graph_query))
+        .route("/api/chat/stream", post(chat::chat_stream))
         .merge(SwaggerUi::new("/swagger-ui").url("/api/openapi.json", ApiDoc::openapi()))
         .with_state(state)
 }

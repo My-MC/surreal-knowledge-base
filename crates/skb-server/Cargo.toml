@@ -20,6 +20,10 @@ skb-core = { path = "../skb-core" }
 # skb-core — a literal `=1`/`=4` would pin 1.0.0/4.0.0 and break the workspace.
 axum = "=0.8.9"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
+# reqwest 0.13 renamed the 0.12 `rustls-tls` feature to `rustls`; with
+# `default-features = false` this stays rustls-only (TLS guard: no native-tls).
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "json"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
 tower-http = { version = "=0.7.0", features = ["cors", "trace", "timeout", "fs", "compression-gzip"] }
 utoipa = "=5.5.0"
 utoipa-swagger-ui = { version = "=9.0.2", features = ["axum"] }
@@ -36,3 +40,5 @@ clap = { version = "4", features = ["derive"] }
 tower = { version = "0.5", features = ["util"] }
 # In-process router tests (oneshot) and the port-0 spawn protocol test.
 tokio = { version = "1", features = ["io-util", "process"] }
+# Mock OpenAI LLM upstream for the chat SSE tests.
+wiremock = "0.6"

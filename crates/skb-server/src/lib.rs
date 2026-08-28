@@ -9,6 +9,7 @@ pub mod config;
 pub mod dto;
 pub mod error;
 pub mod handlers;
+pub mod llm;
 
 pub use api::{build_router, ApiDoc, AppState};
 pub use config::ServerConfig;
