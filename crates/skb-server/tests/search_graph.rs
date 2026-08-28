@@ -60,26 +60,29 @@ async fn hybrid_search_returns_scored_hits_with_fields() {
             "score must be positive: {hit}"
         );
         assert!(hit["document_id"].is_string(), "{hit}");
+        assert!(
+            hit["document_id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("document:")),
+            "document_id must be the full record id: {hit}"
+        );
         assert!(hit["chunk_idx"].is_u64(), "{hit}");
         assert!(hit["content"].is_string(), "{hit}");
         assert!(hit["title"].is_string(), "{hit}");
         assert!(hit["source"].is_string(), "{hit}");
     }
-    // SearchHit.document_id is the bare record key (core's meta::id passthrough),
-    // while upload() returns the full `document:<key>` id.
-    fn bare(full: &str) -> &str {
-        full.strip_prefix("document:").unwrap_or(full)
-    }
+    // document_id is normalized to the full `document:<key>` record id, so it
+    // compares equal to the upload response ids (usable on /api/documents/{id}).
     let hit_docs: Vec<&str> = hits
         .iter()
         .filter_map(|h| h["document_id"].as_str())
         .collect();
     assert!(
-        hit_docs.contains(&bare(&doc_a)),
+        hit_docs.contains(&doc_a.as_str()),
         "doc A must hit, got {hit_docs:?}"
     );
     assert!(
-        hit_docs.contains(&bare(&doc_b)),
+        hit_docs.contains(&doc_b.as_str()),
         "doc B must hit, got {hit_docs:?}"
     );
 
@@ -118,6 +121,9 @@ async fn search_expand_returns_hits_and_entity_origins() {
     .await;
     assert_eq!(status, StatusCode::OK, "expand failed: {body}");
     assert!(body["hits"].is_array());
+    // Round-trip proof: the hits above carry `document:<key>` ids; populated
+    // entity_origins means the reverse conversion stripped the prefix before
+    // core rebuilt its document RecordIds.
     let origins = body["entity_origins"].as_object().expect("origins object");
     assert!(
         !origins.is_empty(),

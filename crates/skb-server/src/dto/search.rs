@@ -61,10 +61,28 @@ pub struct SearchHit {
     pub matched_entities: Option<Vec<String>>,
 }
 
+/// Search hits expose the full record id (`document:<key>`) so an id from any
+/// search response works directly against the document endpoints (which
+/// reject bare keys with 400). Core uses bare keys internally — its expand
+/// path rebuilds `RecordId::new("document", document_id)` — so the reverse
+/// conversion strips the prefix again. Both directions are idempotent on
+/// already-prefixed and empty ids.
+fn with_document_prefix(id: &str) -> String {
+    if id.is_empty() || id.starts_with("document:") {
+        id.to_string()
+    } else {
+        format!("document:{id}")
+    }
+}
+
+fn strip_document_prefix(id: &str) -> String {
+    id.strip_prefix("document:").unwrap_or(id).to_string()
+}
+
 impl From<CoreSearchHit> for SearchHit {
     fn from(hit: CoreSearchHit) -> Self {
         Self {
-            document_id: hit.document_id,
+            document_id: with_document_prefix(&hit.document_id),
             chunk_idx: hit.chunk_idx,
             content: hit.content,
             score: hit.score,
@@ -79,7 +97,7 @@ impl From<CoreSearchHit> for SearchHit {
 impl From<SearchHit> for CoreSearchHit {
     fn from(hit: SearchHit) -> Self {
         Self {
-            document_id: hit.document_id,
+            document_id: strip_document_prefix(&hit.document_id),
             chunk_idx: hit.chunk_idx,
             content: hit.content,
             score: hit.score,
