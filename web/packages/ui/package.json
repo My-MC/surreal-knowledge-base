@@ -11,7 +11,10 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@react-sigma/core": "5.0.6",
     "@shikijs/rehype": "4.4.3",
+    "graphology": "0.26.0",
+    "openapi-fetch": "0.17.0",
     "react": "19.2.8",
     "react-dom": "19.2.8",
     "rehype-react": "8.0.0",
@@ -19,15 +22,20 @@
     "remark-parse": "11.0.0",
     "remark-rehype": "11.1.2",
     "shiki": "4.4.3",
+    "sigma": "3.0.3",
     "unified": "11.0.5",
     "unist-util-visit": "5.1.0"
   },
   "devDependencies": {
+    "@happy-dom/global-registrator": "20.11.15",
+    "@testing-library/dom": "10.4.1",
+    "@testing-library/react": "16.3.3",
     "@types/bun": "1.4.0",
     "@types/hast": "3.0.5",
     "@types/mdast": "4.0.4",
     "@types/react": "19.2.18",
     "@types/react-dom": "19.2.5",
+    "happy-dom": "20.11.15",
     "typescript": "7.0.2"
   }
 }
