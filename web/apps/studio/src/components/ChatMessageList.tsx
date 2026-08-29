@@ -46,7 +46,7 @@ function ChatBubble({ message, streaming }: { message: ChatMessage; streaming: b
     );
   }
   return (
-    <div className={styles.rowAssistant}>
+    <div className={styles.rowAssistant} data-testid="chat-bubble-assistant">
       <div className={styles.bubbleAssistant}>
         {message.content === "" && !message.stopped && message.error === undefined && streaming ? (
           <p className={styles.hint}>回答を生成中…</p>
@@ -58,18 +58,6 @@ function ChatBubble({ message, streaming }: { message: ChatMessage; streaming: b
           <p className={styles.error} role="alert">
             {message.error.code}: {message.error.message}
           </p>
-        )}
-        {message.citations !== undefined && message.citations.length > 0 && (
-          <div className={styles.citations}>
-            <h3 className={styles.citationsTitle}>引用</h3>
-            <ul className={styles.citationsList}>
-              {message.citations.map((hit) => (
-                <li key={`${hit.document_id}:${hit.chunk_idx}`} className={styles.citation}>
-                  {hit.title ?? hit.document_id}
-                </li>
-              ))}
-            </ul>
-          </div>
         )}
       </div>
     </div>

@@ -67,30 +67,3 @@
   color: var(--color-error);
   overflow-wrap: anywhere;
 }
-
-.citations {
-  margin-top: var(--space-2);
-  padding-top: var(--space-2);
-  border-top: 1px solid var(--color-border);
-}
-
-.citationsTitle {
-  margin: 0 0 var(--space-1);
-  font-size: var(--font-size-xs);
-  font-weight: 600;
-  opacity: 0.7;
-}
-
-.citationsList {
-  margin: 0;
-  padding: 0;
-  list-style: none;
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-}
-
-.citation {
-  font-size: var(--font-size-xs);
-  overflow-wrap: anywhere;
-}

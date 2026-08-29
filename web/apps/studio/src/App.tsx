@@ -1,8 +1,16 @@
-import { useChatStream } from "@skb/api-client";
+import { type SearchHit, useChatStream } from "@skb/api-client";
 import { useEffect, useRef } from "react";
 import { ChatComposer } from "./components/ChatComposer";
 import { ChatMessageList } from "./components/ChatMessageList";
+import { CitationPanel } from "./components/CitationPanel";
+import type { ChatMessage } from "./store/session";
 import { useSessionStore } from "./store/session";
+
+/** Citations follow the latest assistant message; an empty transcript shows none. */
+function lastAssistantCitations(messages: ChatMessage[]): SearchHit[] {
+  const lastAssistant = [...messages].reverse().find((message) => message.role === "assistant");
+  return lastAssistant?.citations ?? [];
+}
 
 /**
  * Studio chat: the transcript lives in the persisted session store; the
@@ -49,7 +57,10 @@ export function ChatApp() {
   const send = (text: string) => {
     syncedTokensRef.current = 0;
     appendMessage({ role: "user", content: text });
-    appendMessage({ role: "assistant", content: "" });
+    // Citations start empty so the panel resets per message; the citation
+    // event (which always arrives, even with 0 hits) is then represented
+    // without a separate "no citations yet" state.
+    appendMessage({ role: "assistant", content: "", citations: [] });
     setStatus("streaming");
     void stream.start(text);
   };
@@ -61,15 +72,18 @@ export function ChatApp() {
   };
 
   return (
-    <div className="studio-layout">
-      <header className="studio-header">
-        <h1 className="studio-title">skb Studio</h1>
-        <button type="button" className="studio-clear" onClick={clearSession}>
-          新規セッション
-        </button>
-      </header>
-      <ChatMessageList messages={messages} streaming={status === "streaming"} />
-      <ChatComposer streaming={status === "streaming"} onSend={send} onStop={stop} />
+    <div className="studio-shell">
+      <div className="studio-layout">
+        <header className="studio-header">
+          <h1 className="studio-title">skb Studio</h1>
+          <button type="button" className="studio-clear" onClick={clearSession}>
+            新規セッション
+          </button>
+        </header>
+        <ChatMessageList messages={messages} streaming={status === "streaming"} />
+        <ChatComposer streaming={status === "streaming"} onSend={send} onStop={stop} />
+      </div>
+      <CitationPanel hits={lastAssistantCitations(messages)} />
     </div>
   );
 }
