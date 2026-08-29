@@ -2,10 +2,11 @@ import { mock } from "bun:test";
 import { createElement } from "react";
 
 /**
- * Replaces @skb/api-client's createClient BEFORE src/api.ts evaluates (this
- * module must be statically imported first). api.ts then builds its typed
- * wrapper around this spyable fake, so toApiError/query wrappers stay real
- * and only the transport is faked.
+ * Replaces openapi-fetch's createClient BEFORE src/api.ts evaluates (this
+ * module must be statically imported first). api.ts builds its typed wrapper
+ * around this spyable fake, so toApiError/query wrappers stay real and only
+ * the transport is faked. The paths type import from @skb/api-client is
+ * type-only and needs no mock.
  */
 export type FakeResponse = {
   data?: unknown;
@@ -21,8 +22,8 @@ export const fakeClient = {
   POST: mock<FakeMethod>(),
 };
 
-mock.module("@skb/api-client", () => ({
-  createClient: () => fakeClient,
+mock.module("openapi-fetch", () => ({
+  default: () => fakeClient,
 }));
 
 /**

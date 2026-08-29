@@ -1,12 +1,19 @@
-import { createClient } from "@skb/api-client";
+import type { paths } from "@skb/api-client";
 import { queryOptions } from "@tanstack/react-query";
+import createOpenApiFetchClient from "openapi-fetch";
+import { blogFetch } from "./blogFetch";
 
 /**
  * Typed OpenAPI client. The empty baseUrl keeps request URLs relative so the
  * Vite dev proxy (vite.config.ts, SKB_SERVER_PORT-driven) owns routing to
- * skb-server. Every network call in this app goes through this client.
+ * skb-server. Every network call in this app goes through this client; the
+ * credentials/401 behavior lives in the shared blogFetch (see blogFetch.ts).
  */
-export const api = createClient("");
+export const api = createBlogClient("");
+
+export function createBlogClient(baseUrl: string) {
+  return createOpenApiFetchClient<paths>({ baseUrl, fetch: blogFetch });
+}
 
 /** Error carrying the server's machine-readable code (ErrorResponse). */
 export class ApiError extends Error {
@@ -121,19 +128,75 @@ export const relatedQuery = (id: string) =>
 /**
  * おすすめ — vector search seeded by the post title (content head fallback),
  * self excluded, capped at 5. SearchHit.document_id is already the full
- * `document:<key>` record id, directly comparable with the route id.
+ * `document:<key>` record id, directly comparable with the route id. Vector
+ * search spans unpublished documents too, so hits are joined against the
+ * published list (T18 residual) — only posts actually listed on "/" survive.
  */
 export const recommendedQuery = (id: string, title: string, content: string) =>
   queryOptions({
     queryKey: ["blog", "recommended", id],
     queryFn: async () => {
       const seed = title.trim().length > 0 ? title : content.slice(0, 200);
-      const { data, error, response } = await api.POST("/api/search", {
-        body: { query: seed, mode: "vector", top_k: 6 },
-      });
-      if (error !== undefined || data === undefined) {
-        throw toApiError(error, response.status);
+      const [search, posts] = await Promise.all([
+        api.POST("/api/search", {
+          body: { query: seed, mode: "vector", top_k: 6 },
+        }),
+        api.GET("/api/blog/posts"),
+      ]);
+      if (search.error !== undefined || search.data === undefined) {
+        throw toApiError(search.error, search.response.status);
       }
-      return data.hits.filter((hit) => hit.document_id !== id).slice(0, 5);
+      if (posts.error !== undefined || posts.data === undefined) {
+        throw toApiError(posts.error, posts.response.status);
+      }
+      const published = new Set(posts.data.map((post) => post.document_id));
+      return search.data.hits
+        .filter((hit) => hit.document_id !== id && published.has(hit.document_id))
+        .slice(0, 5);
     },
   });
+
+export async function loginQuery(email: string, password: string) {
+  const { data, error, response } = await api.POST("/api/auth/login", {
+    body: { email, password },
+  });
+  if (error !== undefined || data === undefined) {
+    throw toApiError(error, response.status);
+  }
+  return data;
+}
+
+export async function registerQuery(email: string, password: string, role: string) {
+  const { data, error, response } = await api.POST("/api/auth/register", {
+    body: { email, password, role },
+  });
+  if (error !== undefined || data === undefined) {
+    throw toApiError(error, response.status);
+  }
+  return data;
+}
+
+/**
+ * Author upload. document_id is null when the exact content was already
+ * ingested (sha256 skip) — callers treat that as an error because there is
+ * nothing new to publish.
+ */
+export async function createPostQuery(title: string, content: string) {
+  const { data, error, response } = await api.POST("/api/documents", {
+    body: { title, content, metadata: { app: "blog" } },
+  });
+  if (error !== undefined || data === undefined) {
+    throw toApiError(error, response.status);
+  }
+  return data;
+}
+
+export async function publishPostQuery(documentId: string) {
+  const { data, error, response } = await api.POST("/api/blog/posts/{document_id}/publish", {
+    params: { path: { document_id: documentId } },
+  });
+  if (error !== undefined || data === undefined) {
+    throw toApiError(error, response.status);
+  }
+  return data;
+}

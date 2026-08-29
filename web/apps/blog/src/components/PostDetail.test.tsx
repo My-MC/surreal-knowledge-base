@@ -88,7 +88,7 @@ const flush = () =>
  * Route every endpoint by path. Unexpected paths throw so a wiring mistake
  * surfaces as the query error state instead of a silently green assertion.
  */
-function mockDetailApi(hits: ReturnType<typeof hit>[], doc = docFixture) {
+function mockDetailApi(hits: ReturnType<typeof hit>[], doc = docFixture, posts = postsFixture) {
   fakeClient.GET.mockImplementation(async (path: string) => {
     if (path === "/api/documents/{id}") {
       return ok(doc);
@@ -97,7 +97,7 @@ function mockDetailApi(hits: ReturnType<typeof hit>[], doc = docFixture) {
       return ok(backlinksFixture);
     }
     if (path === "/api/blog/posts") {
-      return ok(postsFixture);
+      return ok(posts);
     }
     throw new Error(`unexpected GET ${path}`);
   });
@@ -200,21 +200,33 @@ describe("PostDetail", () => {
     });
   });
 
-  test("caps recommended at 5 hits", async () => {
-    mockDetailApi([
-      hit("document:o1", "記事1"),
-      hit("document:o2", "記事2"),
-      hit("document:o3", "記事3"),
-      hit("document:o4", "記事4"),
-      hit("document:o5", "記事5"),
-      hit("document:o6", "記事6"),
-    ]);
+  test("caps recommended at 5 published hits", async () => {
+    const published = ["o1", "o2", "o3", "o4", "o5", "o6", "o7"].map((key, index) => ({
+      document_id: `document:${key}`,
+      title: `記事${index + 1}`,
+      created_at: "2026-08-28T10:00:00Z",
+      author: "qa@example.com",
+    }));
+    mockDetailApi(
+      published.slice(0, 6).map((post, index) => hit(post.document_id, `記事${index + 1}`)),
+      docFixture,
+      published,
+    );
     await renderDetail();
 
     const recommended = within(screen.getByTestId("recommended"));
     expect(recommended.getAllByRole("link")).toHaveLength(5);
     expect(recommended.getByRole("link", { name: "記事5" })).toBeTruthy();
     expect(recommended.queryByRole("link", { name: "記事6" })).toBeNull();
+  });
+
+  test("filters recommended hits to published posts", async () => {
+    mockDetailApi([hit(OTHER_ID, "SurrealDB グラフ機能"), hit(UNPUBLISHED_ID, "未公開ドラフト")]);
+    await renderDetail();
+
+    const recommended = within(screen.getByTestId("recommended"));
+    expect(recommended.getByRole("link", { name: "SurrealDB グラフ機能" })).toBeTruthy();
+    expect(recommended.queryByRole("link", { name: "未公開ドラフト" })).toBeNull();
   });
 
   test("shows the empty states when no entities and no other hits exist", async () => {
