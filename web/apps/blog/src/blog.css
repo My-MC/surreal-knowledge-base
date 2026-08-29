@@ -49,6 +49,26 @@ body {
   text-decoration: underline;
 }
 
+.blog-nav-email {
+  font-size: var(--font-size-sm);
+  color: var(--color-text);
+  opacity: 0.8;
+}
+
+.blog-nav-logout {
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--color-primary);
+  font-family: inherit;
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+}
+
+.blog-nav-logout:hover {
+  text-decoration: underline;
+}
+
 .blog-main {
   max-width: 760px;
   margin: 0 auto;

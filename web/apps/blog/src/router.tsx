@@ -1,8 +1,9 @@
 import { QueryClient } from "@tanstack/react-query";
-import { createRootRoute, createRoute, createRouter } from "@tanstack/react-router";
+import { createRootRoute, createRoute, createRouter, redirect } from "@tanstack/react-router";
 import { AppLayout } from "./App";
-import { AuthStub } from "./components/AuthStub";
-import { NewPostStub } from "./components/NewPostStub";
+import { useAuthStore } from "./auth";
+import { AuthForm } from "./components/AuthForm";
+import { NewPost } from "./components/NewPost";
 import { PostDetail } from "./components/PostDetail";
 import { PostList } from "./components/PostList";
 
@@ -22,23 +23,29 @@ const postRoute = createRoute({
   component: PostDetail,
 });
 
-// Skeletons only — todo 19 implements the auth UI and the posting flow.
 const loginRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/login",
-  component: () => <AuthStub mode="login" />,
+  component: () => <AuthForm mode="login" />,
 });
 
 const registerRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/register",
-  component: () => <AuthStub mode="register" />,
+  component: () => <AuthForm mode="register" />,
 });
 
 const newRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/new",
-  component: NewPostStub,
+  component: NewPost,
+  // Author guard: the role is the client-side echo of the session JWT's
+  // claim; without it (logged out, or a reader) there is nothing to do here.
+  beforeLoad: () => {
+    if (useAuthStore.getState().role !== "author") {
+      throw redirect({ to: "/login" });
+    }
+  },
 });
 
 const routeTree = rootRoute.addChildren([

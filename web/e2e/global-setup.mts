@@ -7,11 +7,13 @@ const SERVER_PORT = 18080;
 const MOCK_LLM_PORT = 18081;
 const DEV_PORT = 5173;
 const STUDIO_DEV_PORT = 5174;
+const BLOG_DEV_PORT = 5175;
 const DB_PATH = path.join(repoRoot, "target", "skb-e2e-db");
 const SERVER_BIN = path.join(repoRoot, "target", "debug", "skb-server");
 const MOCK_LLM_BIN = path.join(repoRoot, "target", "debug", "examples", "mock_llm");
 const VAULT_APP_DIR = path.join(repoRoot, "web", "apps", "vault");
 const STUDIO_APP_DIR = path.join(repoRoot, "web", "apps", "studio");
+const BLOG_APP_DIR = path.join(repoRoot, "web", "apps", "blog");
 
 const SERVER_START_TIMEOUT_MS = 120_000;
 const CHILD_START_TIMEOUT_MS = 30_000;
@@ -115,7 +117,7 @@ async function killAll(): Promise<void> {
 /**
  * Spawns the e2e stack: mock_llm (prebuilt example binary), skb-server
  * (prebuilt binary, mock embeddings, wiped throwaway DB, fixed ports) and the
- * vault + studio dev servers proxying to it. All server binaries must be
+ * vault + studio + blog dev servers proxying to it. All server binaries must be
  * built up front (`cargo build -p skb-server --bin skb-server --examples`) —
  * cargo is deliberately not invoked from inside Playwright.
  */
@@ -186,6 +188,22 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
   await waitForHttp(
     "studio dev server",
     `http://localhost:${STUDIO_DEV_PORT}/`,
+    null,
+    CHILD_START_TIMEOUT_MS,
+  );
+
+  spawnDetached(
+    "blog vite",
+    "bun",
+    ["--bun", "run", "dev", "--port", String(BLOG_DEV_PORT), "--strictPort"],
+    {
+      cwd: BLOG_APP_DIR,
+      env: { ...process.env, SKB_SERVER_PORT: String(SERVER_PORT) },
+    },
+  );
+  await waitForHttp(
+    "blog dev server",
+    `http://localhost:${BLOG_DEV_PORT}/`,
     null,
     CHILD_START_TIMEOUT_MS,
   );
