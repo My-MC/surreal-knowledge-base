@@ -7,6 +7,7 @@ import CodeMirror from "@uiw/react-codemirror";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { documentsQuery } from "../api";
 import styles from "./DocumentEditor.module.css";
+import { QaOverlay } from "./QaOverlay";
 import { SaveStatusIndicator } from "./SaveStatusIndicator";
 import { useAutosave } from "./useAutosave";
 import { wikilinkCompletionSource } from "./wikilinkCompletion";
@@ -31,6 +32,30 @@ export function EditorSurface({ doc }: EditorSurfaceProps) {
   const contentRef = useRef(doc.content);
   const navigate = useNavigate();
   const { status, schedule, retry } = useAutosave(doc.id);
+
+  const editorShellRef = useRef<HTMLDivElement | null>(null);
+  const [selection, setSelection] = useState("");
+  const [qaQuestion, setQaQuestion] = useState<string | null>(null);
+  const qaOpenRef = useRef(false);
+  qaOpenRef.current = qaQuestion !== null;
+
+  // Track editor-scoped text selection for the QA floating button. While the
+  // QA overlay is open the captured selection is frozen (the overlay's own
+  // focus changes would otherwise collapse it).
+  useEffect(() => {
+    const onSelectionChange = () => {
+      if (qaOpenRef.current) return;
+      const domSelection = window.getSelection();
+      const text = domSelection?.toString() ?? "";
+      const anchor = domSelection?.anchorNode;
+      const container = editorShellRef.current;
+      const inEditor =
+        anchor !== null && anchor !== undefined && (container?.contains(anchor) ?? false);
+      setSelection(inEditor && text.trim() !== "" ? text : "");
+    };
+    document.addEventListener("selectionchange", onSelectionChange);
+    return () => document.removeEventListener("selectionchange", onSelectionChange);
+  }, []);
 
   useEffect(() => {
     if (doc.content === contentRef.current) return;
@@ -109,7 +134,7 @@ export function EditorSurface({ doc }: EditorSurfaceProps) {
         <SaveStatusIndicator status={status} onRetry={retry} />
       </div>
       {tab === "editor" ? (
-        <div className={styles.editorShell}>
+        <div className={styles.editorShell} ref={editorShellRef}>
           <CodeMirror
             value={content}
             extensions={extensions}
@@ -118,6 +143,24 @@ export function EditorSurface({ doc }: EditorSurfaceProps) {
             basicSetup={{ autocompletion: false }}
             className={styles.codemirror}
           />
+          {selection !== "" && qaQuestion === null && (
+            <button
+              type="button"
+              className={styles.qaFloating}
+              data-testid="qa-floating-button"
+              // preventDefault keeps the DOM selection alive through the
+              // click — a plain mousedown would collapse it and unmount
+              // this button before onClick fires.
+              onMouseDown={(event) => event.preventDefault()}
+              onClick={() => {
+                setQaQuestion(
+                  `文書「${doc.title}」の次の選択範囲について説明してください:\n\n${selection}`,
+                );
+              }}
+            >
+              選択範囲について質問
+            </button>
+          )}
         </div>
       ) : (
         // biome-ignore lint/a11y/noStaticElementInteractions: click delegation on rendered markdown; the interactive targets are wikilink anchors, which packages/ui renders without href (not focusable, so a keyboard handler here would be dead code)
@@ -125,6 +168,9 @@ export function EditorSurface({ doc }: EditorSurfaceProps) {
         <div className={styles.preview} onClick={onPreviewClick}>
           <MarkdownView content={content} />
         </div>
+      )}
+      {qaQuestion !== null && (
+        <QaOverlay question={qaQuestion} onClose={() => setQaQuestion(null)} />
       )}
     </div>
   );

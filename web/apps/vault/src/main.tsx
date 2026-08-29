@@ -5,7 +5,9 @@ import { createRoot } from "react-dom/client";
 // @skb/ui's exports map only exposes "." — deep CSS subpaths are blocked, so
 // the design tokens are imported relatively from the workspace package.
 import "../../../packages/ui/src/tokens.css";
+import "../../../packages/ui/src/graph/graph.css";
 import "../../../packages/ui/src/markdown/markdown.css";
+import "../../../packages/ui/src/search/search.css";
 import { queryClient, router } from "./router";
 import "./vault.css";
 

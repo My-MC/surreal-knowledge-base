@@ -80,3 +80,53 @@ export const documentQuery = (id: string) =>
       return data;
     },
   });
+
+/** Reverse-mentions backlinks for one document (id is the full record id). */
+export const backlinksQuery = (id: string) =>
+  queryOptions({
+    queryKey: ["backlinks", id],
+    queryFn: async () => {
+      const { data, error, response } = await api.GET("/api/documents/{id}/backlinks", {
+        params: { path: { id } },
+      });
+      if (error !== undefined || data === undefined) {
+        throw toApiError(error, response.status);
+      }
+      return data;
+    },
+  });
+
+/**
+ * Depth-1 forward-mentions graph around one document. The route param is
+ * already the full `document:<key>` record id — core treats anything without
+ * a `table:` prefix as an entity NAME, so a title here would silently return
+ * an empty graph (graph.rs resolves `document:`/`entity:` ids as-is).
+ */
+export const graphQueryOptions = (id: string) =>
+  queryOptions({
+    queryKey: ["graph", id],
+    queryFn: async () => {
+      const { data, error, response } = await api.POST("/api/graph/query", {
+        body: { from: id, depth: 1 },
+      });
+      if (error !== undefined || data === undefined) {
+        throw toApiError(error, response.status);
+      }
+      return data;
+    },
+  });
+
+/**
+ * SearchPalette search fn over the typed client (hybrid, top_k 8 — the same
+ * contract as @skb/ui's fetch-based createSearch default). Structurally
+ * compatible with the palette's SearchHit, so it plugs in without adapters.
+ */
+export const searchHits = async (query: string) => {
+  const { data, error, response } = await api.POST("/api/search", {
+    body: { query, mode: "hybrid", top_k: 8 },
+  });
+  if (error !== undefined || data === undefined) {
+    throw toApiError(error, response.status);
+  }
+  return data.hits;
+};
