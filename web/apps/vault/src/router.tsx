@@ -1,7 +1,7 @@
 import { QueryClient } from "@tanstack/react-query";
 import { createRootRoute, createRoute, createRouter } from "@tanstack/react-router";
 import { AppLayout } from "./App";
-import { DocumentPlaceholder } from "./components/DocumentPlaceholder";
+import { DocumentEditor } from "./components/DocumentEditor";
 import { IndexView } from "./components/IndexView";
 
 export const queryClient = new QueryClient();
@@ -17,7 +17,7 @@ const indexRoute = createRoute({
 const docRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/doc/$id",
-  component: DocumentPlaceholder,
+  component: DocumentEditor,
 });
 
 const routeTree = rootRoute.addChildren([indexRoute, docRoute]);

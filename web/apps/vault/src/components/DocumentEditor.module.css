@@ -1,0 +1,116 @@
+.editor {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-height: 60vh;
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.tabs {
+  display: flex;
+  gap: var(--space-1);
+}
+
+.tab {
+  padding: var(--space-1) var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface);
+  color: var(--color-text);
+  font-size: var(--font-size-sm);
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.tabActive {
+  background: var(--color-primary);
+  border-color: var(--color-primary);
+  color: var(--color-surface);
+}
+
+.saveStatus {
+  margin: 0;
+  font-size: var(--font-size-sm);
+  opacity: 0.7;
+}
+
+.saveError {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: 0;
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--color-error);
+  border-radius: var(--radius-sm);
+  color: var(--color-error);
+  font-size: var(--font-size-sm);
+}
+
+.saveErrorText {
+  margin: 0;
+}
+
+.retryButton {
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--color-error);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-error);
+  font-size: var(--font-size-sm);
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.editorShell {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface);
+  overflow: hidden;
+}
+
+.editorShell :global(.cm-editor) {
+  background: var(--color-surface);
+}
+
+.editorShell :global(.cm-editor.cm-focused) {
+  outline: none;
+}
+
+.editorShell :global(.cm-gutters) {
+  background: var(--color-background);
+  border-right: 1px solid var(--color-border);
+}
+
+.codemirror {
+  flex: 1;
+}
+
+.preview {
+  flex: 1;
+  padding: var(--space-4);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface);
+  overflow-y: auto;
+}
+
+.preview :global(.md-wikilink) {
+  color: var(--color-primary);
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.loadStatus {
+  margin: 0;
+  font-size: var(--font-size-sm);
+  opacity: 0.7;
+}

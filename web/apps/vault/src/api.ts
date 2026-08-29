@@ -66,3 +66,17 @@ export const documentsQuery = () =>
       return data;
     },
   });
+
+export const documentQuery = (id: string) =>
+  queryOptions({
+    queryKey: ["documents", id],
+    queryFn: async () => {
+      const { data, error, response } = await api.GET("/api/documents/{id}", {
+        params: { path: { id, include_chunks: null } },
+      });
+      if (error !== undefined || data === undefined) {
+        throw toApiError(error, response.status);
+      }
+      return data;
+    },
+  });
