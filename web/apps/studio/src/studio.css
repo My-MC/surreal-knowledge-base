@@ -1,5 +1,5 @@
 /*
- * Studio app shell — single-column chat layout.
+ * Studio app shell — chat column (left/center) + citation panel (right).
  * All colors and spacing reference @skb/ui tokens.css.
  */
 
@@ -14,12 +14,49 @@ body {
   color: var(--color-text);
 }
 
+.studio-shell {
+  display: flex;
+  height: 100vh;
+}
+
 .studio-layout {
+  flex: 1;
+  min-width: 0;
   display: flex;
   flex-direction: column;
-  height: 100vh;
   max-width: 860px;
   margin: 0 auto;
+}
+
+/*
+ * Citation rail: fixed right column so the chat width stays stable when
+ * hits arrive. Narrow viewports stack it under the chat instead of hiding
+ * it — the なぜ引用されたか context stays reachable while composing.
+ */
+.studio-panel {
+  width: 320px;
+  flex-shrink: 0;
+  overflow-y: auto;
+  padding: var(--space-3) var(--space-4);
+  border-left: 1px solid var(--color-border);
+  background: var(--color-surface);
+}
+
+@media (max-width: 900px) {
+  .studio-shell {
+    flex-direction: column;
+  }
+
+  .studio-layout {
+    max-width: none;
+  }
+
+  .studio-panel {
+    width: auto;
+    max-height: 40vh;
+    border-left: none;
+    border-top: 1px solid var(--color-border);
+  }
 }
 
 .studio-header {
