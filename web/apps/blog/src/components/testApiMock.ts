@@ -20,10 +20,16 @@ export const fakeClient = {
   GET: mock<FakeMethod>(),
   PUT: mock<FakeMethod>(),
   POST: mock<FakeMethod>(),
+  DELETE: mock<FakeMethod>(),
 };
 
+// bun test runs all suites in one process and mock.module is process-global:
+// api-client's client.test.ts executes against this fake after the blog
+// suites, so the fake must expose the real client's full surface (named
+// createClient plus DELETE) for that surface assertion to stay meaningful.
 mock.module("openapi-fetch", () => ({
   default: () => fakeClient,
+  createClient: () => fakeClient,
 }));
 
 /**

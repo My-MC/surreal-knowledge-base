@@ -67,7 +67,7 @@ export const documentQuery = (id: string) =>
     queryKey: ["blog", "document", id],
     queryFn: async () => {
       const { data, error, response } = await api.GET("/api/documents/{id}", {
-        params: { path: { id, include_chunks: null } },
+        params: { path: { id } },
       });
       if (error !== undefined || data === undefined) {
         throw toApiError(error, response.status);
@@ -174,6 +174,19 @@ export async function registerQuery(email: string, password: string) {
     throw toApiError(error, response.status);
   }
   return data;
+}
+
+/**
+ * Server-side logout: the endpoint revokes the session's jti and expires the
+ * skb_session cookie, so the cookie's remaining 24h lifetime is worthless
+ * even if it was copied. A 401 (session already invalid) is a normal outcome
+ * here — callers sign out locally regardless.
+ */
+export async function logoutQuery() {
+  const { error, response } = await api.POST("/api/auth/logout");
+  if (error !== undefined) {
+    throw toApiError(error, response.status);
+  }
 }
 
 /**

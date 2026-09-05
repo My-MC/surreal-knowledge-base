@@ -175,7 +175,7 @@ describe("PostDetail", () => {
       body: { query: TITLE, mode: "vector", top_k: 6 },
     });
     expect(fakeClient.GET).toHaveBeenCalledWith("/api/documents/{id}", {
-      params: { path: { id: DOC_ID, include_chunks: null } },
+      params: { path: { id: DOC_ID } },
     });
     expect(fakeClient.GET).toHaveBeenCalledWith("/api/documents/{id}/backlinks", {
       params: { path: { id: DOC_ID } },
