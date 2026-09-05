@@ -577,19 +577,20 @@ async fn put_migrates_blog_post_and_delete_removes_it() {
     );
 }
 
-/// Given: the invite list holds `email:token` pairs (empty tokens ignored).
+/// Given: the invite list holds `email:token` pairs, including a wrong-token
+///        entry and an ignored empty-token entry.
 /// When:  a listed email registers without a token, with a wrong token, and
-///        with the matching token; an unlisted email registers with a stolen
-///        token.
+///        with the matching token; an empty-token entry is claimed; an
+///        unlisted email registers with a stolen token.
 /// Then:  only the matching invite mints an author — registration never
-///        verifies email ownership, so a bare or wrong claim must stay a
-///        reader (CWE-269).
+///        verifies email ownership, so a bare, wrong, or stolen claim must
+///        stay a reader (CWE-269).
 #[tokio::test]
 async fn author_role_requires_the_matching_invite_token() {
     let _secret = EnvGuard::set(SECRET);
     let _invites = EnvGuard::set_key(
         "SKB_SERVER_AUTHOR_INVITES",
-        "listed@example.com:invite-token-0123456789,wrong@listed.example:,,,also@listed.example:x",
+        "listed@example.com:invite-token-0123456789,wrong@listed.example:expected-wrong-token,never@listed.example:,also@listed.example:x",
     );
     let (router, _db) = setup().await;
 
@@ -611,8 +612,16 @@ async fn author_role_requires_the_matching_invite_token() {
     assert_eq!(wrong.status, StatusCode::CREATED);
     assert_eq!(
         wrong.body["role"], "reader",
-        "the wrong token must stay a reader: {}",
+        "a listed email with the wrong token must stay a reader: {}",
         wrong.body
+    );
+
+    let ignored = register_with_invite(&router, "never@listed.example", "pw", "any-guess").await;
+    assert_eq!(ignored.status, StatusCode::CREATED);
+    assert_eq!(
+        ignored.body["role"], "reader",
+        "an empty-token entry is ignored, so the claim must stay a reader: {}",
+        ignored.body
     );
 
     let unlisted = register_with_invite(
