@@ -1,4 +1,4 @@
-import { mkdirSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { expect, test } from "@playwright/test";
 import { repoRoot } from "./helpers.mts";
@@ -20,6 +20,33 @@ import { repoRoot } from "./helpers.mts";
 const BLOG_URL = "http://localhost:5175/";
 const evidenceDir = path.join(repoRoot, "target", "evidence", "19");
 
+/**
+ * The run's author identities: global-setup composed them before spawning
+ * skb-server so the allowlist (exact emails only, note 4) covers them.
+ */
+function readAuthFixture(): { seederEmail: string; bloggerEmail: string } {
+  const raw: unknown = JSON.parse(
+    readFileSync(path.join(repoRoot, "target", "e2e-auth.json"), "utf8"),
+  );
+  if (
+    typeof raw !== "object" ||
+    raw === null ||
+    !("seederEmail" in raw) ||
+    !("bloggerEmail" in raw)
+  ) {
+    throw new Error(
+      "target/e2e-auth.json missing or malformed — was the playwright globalSetup run?",
+    );
+  }
+  const { seederEmail, bloggerEmail } = raw as {
+    seederEmail: string;
+    bloggerEmail: string;
+  };
+  return { seederEmail, bloggerEmail };
+}
+
+const authFixture = readAuthFixture();
+
 interface UploadResponse {
   document_id: string | null;
   entities: string[];
@@ -30,8 +57,8 @@ test("blog: register, login, post, publish, and related posts", async ({ page, r
   mkdirSync(evidenceDir, { recursive: true });
   const ts = Date.now();
   const seedTitle = `SeedPost${ts}`;
-  const seedEmail = `seeder${ts}@example.com`;
-  const bloggerEmail = `blogger${ts}@example.com`;
+  const seedEmail = authFixture.seederEmail;
+  const bloggerEmail = authFixture.bloggerEmail;
   const password = "blog-e2e-passw0rd";
 
   // -- Step 1: seed one published post via the API (self-contained) ----------
@@ -53,6 +80,11 @@ test("blog: register, login, post, publish, and related posts", async ({ page, r
   expect(seeded.status()).toBe(201);
   const seedDoc = (await seeded.json()) as UploadResponse;
   const seedDocId = seedDoc.document_id;
+  // Unique per-run content cannot hit the sha256 skip; a null id here means
+  // the seeding assumptions broke.
+  if (seedDocId === null) {
+    throw new Error("seed upload was skipped (document_id null) — seeding content is not unique");
+  }
   expect(seedDocId).toMatch(/^document:/);
   // The heading must have minted the entity the wikilink will target.
   expect(seedDoc.entities).toContain(seedTitle);
