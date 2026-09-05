@@ -53,6 +53,9 @@ async fn pipeline(
     message: String,
     tx: tokio::sync::mpsc::Sender<Result<Event, std::convert::Infallible>>,
 ) {
+    // Every long wait races the client disconnect channel: once `tx.closed()`
+    // wins, the pipeline (and its upstream LLM connection, via LlmStream
+    // drop) must stop instead of running to completion unobserved.
     let search_req = CoreSearchRequest {
         query: message.clone(),
         mode: None,
@@ -60,7 +63,11 @@ async fn pipeline(
         graph_expand: Some(expand_depth()),
         filter: None,
     };
-    let hits: Vec<SearchHit> = match state.kb.search(search_req).await {
+    let search = tokio::select! {
+        _ = tx.closed() => return,
+        result = state.kb.search(search_req) => result,
+    };
+    let hits: Vec<SearchHit> = match search {
         Ok(resp) => resp.hits.into_iter().map(Into::into).collect(),
         Err(e) => {
             send_error(&tx, e.code.code_str(), &e.message).await;
@@ -78,7 +85,11 @@ async fn pipeline(
             return;
         }
     };
-    let mut stream = match client.stream_chat(&prompt).await {
+    let connect = tokio::select! {
+        _ = tx.closed() => return,
+        result = client.stream_chat(&prompt) => result,
+    };
+    let mut stream = match connect {
         Ok(stream) => stream,
         Err(e) => {
             send_error(&tx, e.code(), &e.to_string()).await;
@@ -86,7 +97,11 @@ async fn pipeline(
         }
     };
     loop {
-        match stream.next_fragment().await {
+        let fragment = tokio::select! {
+            _ = tx.closed() => return,
+            fragment = stream.next_fragment() => fragment,
+        };
+        match fragment {
             Ok(Some(text)) => send_json(&tx, "token", &json!({ "text": text })).await,
             Ok(None) => break,
             Err(e) => {
@@ -117,29 +132,38 @@ fn token_budget() -> usize {
         .unwrap_or(DEFAULT_TOKEN_BUDGET)
 }
 
-/// Build the LLM prompt from hit chunks under a TOTAL char budget. Chars
-/// approximate tokens (~4 chars/token for English) — documented MVP
-/// approximation; a real tokenizer is deliberately not pulled in here.
+/// Build the LLM prompt under a TOTAL char budget that covers the fixed
+/// instruction, the question, and the excerpts. Chars approximate tokens
+/// (~4 chars/token for English) — documented MVP approximation; a real
+/// tokenizer is deliberately not pulled in here. The question keeps its
+/// priority: the excerpts share whatever budget remains after the (possibly
+/// truncated) question.
 fn build_prompt(message: &str, hits: &[SearchHit], budget: usize) -> String {
+    const INSTRUCTION: &str = "You are a knowledge-base assistant. Answer the question using the document excerpts below when they are relevant.\n\n";
+    const QUESTION_LABEL: &str = "Question: ";
+    let reserved = INSTRUCTION.len() + QUESTION_LABEL.len();
+    let message_budget = budget.saturating_sub(reserved);
+    let message = truncate_at_char_boundary(message, message_budget);
+
+    let excerpt_budget = budget
+        .saturating_sub(reserved)
+        .saturating_sub(message.len());
     let mut excerpts = String::new();
     let mut used = 0usize;
     for (i, hit) in hits.iter().enumerate() {
         let title = hit.title.as_deref().unwrap_or("(untitled)");
         let header = format!("Excerpt {} — {title} ({}):\n", i + 1, hit.document_id);
-        if used + header.len() >= budget {
+        if used + header.len() >= excerpt_budget {
             break;
         }
-        let remaining = budget - used - header.len();
+        let remaining = excerpt_budget - used - header.len();
         let content = truncate_at_char_boundary(&hit.content, remaining);
         used += header.len() + content.len() + 2; // + blank-line separator
         excerpts.push_str(&header);
         excerpts.push_str(content);
         excerpts.push_str("\n\n");
     }
-    format!(
-        "You are a knowledge-base assistant. Answer the question using the \
-         document excerpts below when they are relevant.\n\n{excerpts}Question: {message}"
-    )
+    format!("{INSTRUCTION}{excerpts}{QUESTION_LABEL}{message}")
 }
 
 fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> &str {

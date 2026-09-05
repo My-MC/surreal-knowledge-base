@@ -68,6 +68,7 @@ async fn health() -> Json<HealthResponse> {
         chat::chat_stream,
         auth::register,
         auth::login,
+        auth::logout,
         blog::list_posts,
         blog::publish_post,
     ),
@@ -124,6 +125,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/chat/stream", post(chat::chat_stream))
         .route("/api/auth/register", post(auth::register))
         .route("/api/auth/login", post(auth::login))
+        .route("/api/auth/logout", post(auth::logout))
         .route("/api/blog/posts", get(blog::list_posts))
         .route(
             "/api/blog/posts/{document_id}/publish",

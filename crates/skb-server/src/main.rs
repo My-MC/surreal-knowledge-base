@@ -46,20 +46,24 @@ async fn run(cli: Cli) -> Result<(), SkbError> {
     let core_cfg = core_config()?;
     let kb = Arc::new(KnowledgeBase::open(core_cfg).await?);
     skb_server::auth::apply_server_schema(&kb).await?;
-    if std::env::var("SKB_SERVER_JWT_SECRET").is_err() {
-        tracing::warn!(
+    match std::env::var("SKB_SERVER_JWT_SECRET") {
+        Err(_) => tracing::warn!(
             "SKB_SERVER_JWT_SECRET is not set; authenticated endpoints return 503 E_CONFIG (public routes unaffected)"
-        );
+        ),
+        Ok(secret) if secret.len() < 32 => tracing::warn!(
+            "SKB_SERVER_JWT_SECRET is shorter than 32 characters; authenticated endpoints return 503 E_CONFIG"
+        ),
+        Ok(_) => {}
     }
     let state = AppState { kb, server_cfg };
 
     let host = state.server_cfg.host.clone();
     let port = state.server_cfg.port;
-    let addr = format!("{host}:{port}");
-    // Bind BEFORE printing so the announced port is already accepting.
-    let listener = tokio::net::TcpListener::bind(&addr)
+    // Bind via the (host, port) pair, not a pre-joined string: "addr:port"
+    // stringification breaks IPv6 literals (`::1:0` is not a socket address).
+    let listener = tokio::net::TcpListener::bind((host.as_str(), port))
         .await
-        .map_err(|e| SkbError::new(ErrorCode::Io, format!("bind {addr}: {e}")))?;
+        .map_err(|e| SkbError::new(ErrorCode::Io, format!("bind {host}:{port}: {e}")))?;
     let bound_port = listener
         .local_addr()
         .map_err(|e| SkbError::new(ErrorCode::Io, format!("local_addr: {e}")))?

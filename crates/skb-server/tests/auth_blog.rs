@@ -13,31 +13,41 @@ use tower::ServiceExt;
 
 use common::{test_router, test_state};
 
-const SECRET: &str = "test-secret";
+const SECRET: &str = "test-secret-0123456789abcdef-0123456789abcdef";
 
-/// Restores the previous `SKB_SERVER_JWT_SECRET` value on drop (the
-/// config.rs EnvGuard pattern).
-struct EnvGuard(Option<String>);
+/// Restores the previous values of the touched env keys on drop (the
+/// config.rs EnvGuard pattern). Guards compose — one per key.
+struct EnvGuard(Vec<(&'static str, Option<String>)>);
 
 impl EnvGuard {
     fn set(value: &str) -> Self {
-        let old = std::env::var("SKB_SERVER_JWT_SECRET").ok();
-        std::env::set_var("SKB_SERVER_JWT_SECRET", value);
-        Self(old)
+        Self::set_key("SKB_SERVER_JWT_SECRET", value)
     }
 
     fn remove() -> Self {
-        let old = std::env::var("SKB_SERVER_JWT_SECRET").ok();
-        std::env::remove_var("SKB_SERVER_JWT_SECRET");
-        Self(old)
+        Self::remove_key("SKB_SERVER_JWT_SECRET")
+    }
+
+    fn set_key(key: &'static str, value: &str) -> Self {
+        let old = std::env::var(key).ok();
+        std::env::set_var(key, value);
+        Self(vec![(key, old)])
+    }
+
+    fn remove_key(key: &'static str) -> Self {
+        let old = std::env::var(key).ok();
+        std::env::remove_var(key);
+        Self(vec![(key, old)])
     }
 }
 
 impl Drop for EnvGuard {
     fn drop(&mut self) {
-        match self.0.take() {
-            Some(value) => std::env::set_var("SKB_SERVER_JWT_SECRET", value),
-            None => std::env::remove_var("SKB_SERVER_JWT_SECRET"),
+        for (key, old) in self.0.drain(..) {
+            match old {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
         }
     }
 }
@@ -92,21 +102,12 @@ async fn setup() -> (axum::Router, std::path::PathBuf) {
     (test_router(state), db_path)
 }
 
-async fn register(
-    router: &axum::Router,
-    email: &str,
-    password: &str,
-    role: Option<&str>,
-) -> TestResponse {
-    let mut body = json!({"email": email, "password": password});
-    if let Some(role) = role {
-        body["role"] = json!(role);
-    }
+async fn register(router: &axum::Router, email: &str, password: &str) -> TestResponse {
     send(
         router.clone(),
         "POST",
         "/api/auth/register",
-        Some(body),
+        Some(json!({"email": email, "password": password})),
         &[],
     )
     .await
@@ -123,6 +124,11 @@ async fn login(router: &axum::Router, email: &str, password: &str) -> TestRespon
     .await
 }
 
+async fn register_and_login(router: &axum::Router, email: &str, password: &str) -> TestResponse {
+    register(router, email, password).await;
+    login(router, email, password).await
+}
+
 /// The `skb_session=<jwt>` pair from the login response's Set-Cookie header.
 fn session_cookie(response: &TestResponse) -> String {
     let raw = response
@@ -136,6 +142,7 @@ fn session_cookie(response: &TestResponse) -> String {
         raw.contains("SameSite=Lax"),
         "cookie must be SameSite=Lax: {raw}"
     );
+    assert!(raw.contains("Secure"), "cookie must be Secure: {raw}");
     raw.split(';').next().unwrap().to_string()
 }
 
@@ -183,9 +190,10 @@ async fn list_posts(router: &axum::Router) -> TestResponse {
 #[tokio::test]
 async fn blog_full_flow_hides_until_publish_then_lists() {
     let _secret = EnvGuard::set(SECRET);
+    let _authors = EnvGuard::set_key("SKB_SERVER_AUTHOR_EMAILS", "author@example.com");
     let (router, _db) = setup().await;
 
-    let reg = register(&router, "author@example.com", "pw-author", Some("author")).await;
+    let reg = register(&router, "author@example.com", "pw-author").await;
     assert_eq!(reg.status, StatusCode::CREATED, "register: {}", reg.body);
     assert_eq!(reg.body["email"], "author@example.com");
     assert_eq!(reg.body["role"], "author");
@@ -228,9 +236,10 @@ async fn blog_full_flow_hides_until_publish_then_lists() {
 #[tokio::test]
 async fn reader_cookie_is_unauthorized_for_blog_upload() {
     let _secret = EnvGuard::set(SECRET);
+    let _no_authors = EnvGuard::remove_key("SKB_SERVER_AUTHOR_EMAILS");
     let (router, _db) = setup().await;
 
-    let reg = register(&router, "reader@example.com", "pw-reader", None).await;
+    let reg = register(&router, "reader@example.com", "pw-reader").await;
     assert_eq!(reg.status, StatusCode::CREATED);
     let login = login(&router, "reader@example.com", "pw-reader").await;
     assert_eq!(login.body["role"], "reader");
@@ -252,6 +261,7 @@ async fn reader_cookie_is_unauthorized_for_blog_upload() {
 #[tokio::test]
 async fn missing_token_is_unauthorized_for_blog_upload_and_publish() {
     let _secret = EnvGuard::set(SECRET);
+    let _authors = EnvGuard::set_key("SKB_SERVER_AUTHOR_EMAILS", "author@example.com");
     let (router, _db) = setup().await;
 
     let upload = upload_blog(&router, None, "anon content", "Anon Post").await;
@@ -262,7 +272,7 @@ async fn missing_token_is_unauthorized_for_blog_upload_and_publish() {
         upload.body
     );
 
-    register(&router, "author@example.com", "pw", Some("author")).await;
+    register(&router, "author@example.com", "pw").await;
     let login = login(&router, "author@example.com", "pw").await;
     let cookie = session_cookie(&login);
     let upload = upload_blog(&router, Some(&cookie), "content", "T").await;
@@ -300,6 +310,142 @@ async fn unset_jwt_secret_degrades_auth_paths_but_not_public_routes() {
     assert_eq!(posts.body, json!([]));
 }
 
+/// Given: two concurrent registrations with the same email.
+/// When:  both pass the pre-lookup and race the unique index.
+/// Then:  exactly one 201 and one 409 — the index violation maps to the
+///        documented 409 contract, never to a 500.
+#[tokio::test]
+async fn concurrent_duplicate_registration_yields_one_201_and_one_409() {
+    let _secret = EnvGuard::set(SECRET);
+    let _no_authors = EnvGuard::remove_key("SKB_SERVER_AUTHOR_EMAILS");
+    let (router, _db) = setup().await;
+
+    let (first, second) = tokio::join!(
+        register(&router, "race@example.com", "pw"),
+        register(&router, "race@example.com", "pw"),
+    );
+    let mut statuses = [first.status, second.status];
+    statuses.sort();
+    assert_eq!(
+        statuses,
+        [StatusCode::CREATED, StatusCode::CONFLICT],
+        "first: {} / second: {}",
+        first.body,
+        second.body
+    );
+}
+
+/// Given: a published blog document owned by author A.
+/// When:  an anonymous client, a reader, or author B PUTs or DELETEs it.
+/// Then:  anonymous/reader calls get 401, author B gets 403, and the
+///        document plus registry row are untouched; a non-blog document
+///        stays publicly writable.
+#[tokio::test]
+async fn blog_documents_are_owner_only_for_put_and_delete() {
+    let _secret = EnvGuard::set(SECRET);
+    let _authors = EnvGuard::set_key(
+        "SKB_SERVER_AUTHOR_EMAILS",
+        "owner@example.com,other@example.com",
+    );
+    let (router, _db) = setup().await;
+
+    let login = |email: &'static str| register_and_login(&router, email, "pw");
+    let owner_cookie = session_cookie(&login("owner@example.com").await);
+    let other_cookie = session_cookie(&login("other@example.com").await);
+
+    let upload = upload_blog(&router, Some(&owner_cookie), "owned content", "Owned").await;
+    let document_id = upload.body["document_id"].as_str().unwrap().to_string();
+
+    for method in ["PUT", "DELETE"] {
+        let anonymous = send(
+            router.clone(),
+            method,
+            &format!("/api/documents/{document_id}"),
+            method.eq("PUT").then(|| json!({"content": "v2"})),
+            &[],
+        )
+        .await;
+        assert_eq!(
+            anonymous.status,
+            StatusCode::UNAUTHORIZED,
+            "anonymous {method}: {}",
+            anonymous.body
+        );
+
+        let reader_cookie = session_cookie(&login("reader@example.com").await);
+        let reader = send(
+            router.clone(),
+            method,
+            &format!("/api/documents/{document_id}"),
+            method.eq("PUT").then(|| json!({"content": "v2"})),
+            &[("cookie", reader_cookie)],
+        )
+        .await;
+        assert_eq!(
+            reader.status,
+            StatusCode::UNAUTHORIZED,
+            "reader {method}: {}",
+            reader.body
+        );
+
+        let stranger = send(
+            router.clone(),
+            method,
+            &format!("/api/documents/{document_id}"),
+            method.eq("PUT").then(|| json!({"content": "v2"})),
+            &[("cookie", other_cookie.clone())],
+        )
+        .await;
+        assert_eq!(
+            stranger.status,
+            StatusCode::FORBIDDEN,
+            "other author {method}: {}",
+            stranger.body
+        );
+    }
+
+    let listed = list_posts(&router).await;
+    assert_eq!(
+        listed.body.as_array().unwrap().len(),
+        0,
+        "still unpublished"
+    );
+
+    // The non-blog knowledge document keeps its public write surface.
+    let plain = send(
+        router.clone(),
+        "POST",
+        "/api/documents",
+        Some(json!({"content": "plain kb content", "title": "Plain"})),
+        &[],
+    )
+    .await;
+    assert_eq!(plain.status, StatusCode::CREATED, "plain: {}", plain.body);
+    let plain_id = plain.body["document_id"].as_str().unwrap().to_string();
+    let put = send(
+        router.clone(),
+        "PUT",
+        &format!("/api/documents/{plain_id}"),
+        Some(json!({"content": "plain kb content v2", "title": "Plain"})),
+        &[],
+    )
+    .await;
+    assert_eq!(put.status, StatusCode::OK, "plain PUT: {}", put.body);
+}
+
+/// Given: SKB_SERVER_JWT_SECRET is set but shorter than 32 characters.
+/// When:  calling an authenticated path.
+/// Then:  503 E_CONFIG — weak secrets must not back HS256 sessions.
+#[tokio::test]
+async fn weak_jwt_secret_is_rejected_like_an_unset_one() {
+    let _secret = EnvGuard::set("too-short");
+    let (router, _db) = setup().await;
+
+    let login = login(&router, "nobody@example.com", "pw").await;
+    assert_eq!(login.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(login.body["code"], "E_CONFIG");
+}
+
 /// Given: a registered user.
 /// When:  logging in with a wrong password, logging in as an unknown user,
 ///        or registering a duplicate email.
@@ -307,9 +453,10 @@ async fn unset_jwt_secret_degrades_auth_paths_but_not_public_routes() {
 #[tokio::test]
 async fn wrong_password_is_401_and_duplicate_email_is_409() {
     let _secret = EnvGuard::set(SECRET);
+    let _no_authors = EnvGuard::remove_key("SKB_SERVER_AUTHOR_EMAILS");
     let (router, _db) = setup().await;
 
-    let reg = register(&router, "dup@example.com", "pw", None).await;
+    let reg = register(&router, "dup@example.com", "pw").await;
     assert_eq!(reg.status, StatusCode::CREATED);
 
     let bad = login(&router, "dup@example.com", "wrong-password").await;
@@ -324,7 +471,7 @@ async fn wrong_password_is_401_and_duplicate_email_is_409() {
     let unknown = login(&router, "ghost@example.com", "pw").await;
     assert_eq!(unknown.status, StatusCode::UNAUTHORIZED);
 
-    let dup = register(&router, "dup@example.com", "other", None).await;
+    let dup = register(&router, "dup@example.com", "other").await;
     assert_eq!(dup.status, StatusCode::CONFLICT, "dup: {}", dup.body);
     assert_eq!(dup.body["code"], "E_VALIDATION");
 }
@@ -337,9 +484,10 @@ async fn wrong_password_is_401_and_duplicate_email_is_409() {
 #[tokio::test]
 async fn put_migrates_blog_post_and_delete_removes_it() {
     let _secret = EnvGuard::set(SECRET);
+    let _authors = EnvGuard::set_key("SKB_SERVER_AUTHOR_EMAILS", "author@example.com");
     let (router, _db) = setup().await;
 
-    register(&router, "author@example.com", "pw", Some("author")).await;
+    register(&router, "author@example.com", "pw").await;
     let login = login(&router, "author@example.com", "pw").await;
     let cookie = session_cookie(&login);
 
@@ -348,12 +496,14 @@ async fn put_migrates_blog_post_and_delete_removes_it() {
     let publish = publish(&router, &old_id, Some(&cookie)).await;
     assert_eq!(publish.status, StatusCode::OK);
 
+    // The blog document is author-owned: the owning author's session rides
+    // on both the PUT and the DELETE.
     let put = send(
         router.clone(),
         "PUT",
         &format!("/api/documents/{old_id}"),
         Some(json!({"content": "version two", "title": "Migrated Post"})),
-        &[],
+        &[("cookie", cookie.clone())],
     )
     .await;
     assert_eq!(put.status, StatusCode::OK, "put: {}", put.body);
@@ -370,7 +520,7 @@ async fn put_migrates_blog_post_and_delete_removes_it() {
         "DELETE",
         &format!("/api/documents/{new_id}"),
         None,
-        &[],
+        &[("cookie", cookie)],
     )
     .await;
     assert_eq!(del.status, StatusCode::NO_CONTENT, "delete: {}", del.body);
@@ -381,5 +531,111 @@ async fn put_migrates_blog_post_and_delete_removes_it() {
         json!([]),
         "posts after DELETE: {}",
         listed.body
+    );
+}
+
+/// Given: the allowlist grants an entire domain (`@example.com`).
+/// When:  an email at that domain registers (and one outside it).
+/// Then:  the in-domain email becomes an author; the other stays a reader.
+#[tokio::test]
+async fn author_allowlist_supports_domain_entries() {
+    let _secret = EnvGuard::set(SECRET);
+    let _authors = EnvGuard::set_key("SKB_SERVER_AUTHOR_EMAILS", "@example.com");
+    let (router, _db) = setup().await;
+
+    let insider = register(&router, "dynamic-42@example.com", "pw").await;
+    assert_eq!(
+        insider.status,
+        StatusCode::CREATED,
+        "insider: {}",
+        insider.body
+    );
+    assert_eq!(insider.body["role"], "author");
+
+    let outsider = register(&router, "stranger@elsewhere.org", "pw").await;
+    assert_eq!(outsider.status, StatusCode::CREATED);
+    assert_eq!(outsider.body["role"], "reader");
+}
+
+/// Given: an author with a valid session cookie.
+/// When:  logging out, then replaying the same cookie.
+/// Then:  the logout is 204 with a cleared `skb_session` cookie (Max-Age=0),
+///        the replayed token is 401 (revoked via the jti list), a cookie-less
+///        logout is 401, and a fresh login works again.
+#[tokio::test]
+async fn logout_revokes_the_token_and_clears_the_cookie() {
+    let _secret = EnvGuard::set(SECRET);
+    let _authors = EnvGuard::set_key("SKB_SERVER_AUTHOR_EMAILS", "logout@example.com");
+    let (router, _db) = setup().await;
+
+    let registered = register(&router, "logout@example.com", "pw").await;
+    assert_eq!(registered.body["role"], "author");
+    let login_response = login(&router, "logout@example.com", "pw").await;
+    let cookie = session_cookie(&login_response);
+
+    let before = upload_blog(&router, Some(&cookie), "content", "T").await;
+    assert_eq!(
+        before.status,
+        StatusCode::CREATED,
+        "session must work before logout: {}",
+        before.body
+    );
+
+    let anonymous = send(router.clone(), "POST", "/api/auth/logout", None, &[]).await;
+    assert_eq!(
+        anonymous.status,
+        StatusCode::UNAUTHORIZED,
+        "logout without a token: {}",
+        anonymous.body
+    );
+
+    let out = send(
+        router.clone(),
+        "POST",
+        "/api/auth/logout",
+        None,
+        &[("cookie", cookie.clone())],
+    )
+    .await;
+    assert_eq!(out.status, StatusCode::NO_CONTENT, "logout: {}", out.body);
+    let cleared = out
+        .headers
+        .get(header::SET_COOKIE)
+        .unwrap_or_else(|| panic!("logout must clear the cookie"))
+        .to_str()
+        .unwrap();
+    assert!(
+        cleared.starts_with("skb_session=;"),
+        "cleared cookie: {cleared}"
+    );
+    assert!(cleared.contains("Max-Age=0"), "cleared cookie: {cleared}");
+    assert!(cleared.contains("HttpOnly"), "cleared cookie: {cleared}");
+    assert!(
+        cleared.contains("SameSite=Lax"),
+        "cleared cookie: {cleared}"
+    );
+
+    let replay = upload_blog(&router, Some(&cookie), "content", "T").await;
+    assert_eq!(
+        replay.status,
+        StatusCode::UNAUTHORIZED,
+        "the logged-out token must be revoked: {}",
+        replay.body
+    );
+
+    let relogin_response = login(&router, "logout@example.com", "pw").await;
+    assert_eq!(
+        relogin_response.status,
+        StatusCode::OK,
+        "relogin: {}",
+        relogin_response.body
+    );
+    let fresh = session_cookie(&relogin_response);
+    let after = upload_blog(&router, Some(&fresh), "content", "T").await;
+    assert_eq!(
+        after.status,
+        StatusCode::CREATED,
+        "a fresh login must work again: {}",
+        after.body
     );
 }

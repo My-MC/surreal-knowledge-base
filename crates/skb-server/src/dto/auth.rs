@@ -3,13 +3,12 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-/// Body of `POST /api/auth/register`.
+/// Body of `POST /api/auth/register`. The role is decided by the server
+/// (`SKB_SERVER_AUTHOR_EMAILS` allowlist); clients cannot request one.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct RegisterRequest {
     pub email: String,
     pub password: String,
-    /// `reader` (default) or `author`.
-    pub role: Option<String>,
 }
 
 /// Body of `POST /api/auth/login`.

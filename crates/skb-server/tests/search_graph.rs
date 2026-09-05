@@ -262,3 +262,21 @@ async fn backlinks_missing_id_404_and_entityless_document_empty() {
 
     let _ = std::fs::remove_dir_all(db);
 }
+
+#[tokio::test]
+async fn search_expand_rejects_max_expand_above_the_core_cap() {
+    let (state, db) = test_state().await;
+    let router = test_router(state);
+
+    let (status, body) = send(
+        router,
+        "POST",
+        "/api/search/expand",
+        Some(json!({"hits": [], "max_expand": 6})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "expand: {body}");
+    assert_eq!(body["code"], "E_VALIDATION", "{body}");
+
+    let _ = std::fs::remove_dir_all(db);
+}
