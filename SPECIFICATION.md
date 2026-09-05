@@ -814,7 +814,7 @@ SurrealDB は組込みモード（SurrealKV）で動作するため、DB ファ�
 
 注3: `blog_post` レジストリ行を持つ document の PUT / DELETE は **その投稿の author 本人のみ** が実行できる（トークン無し・無効・reader ロールは 401、別 author は 403）。レジストリ行の存在が blog 判定の唯一の根拠であり、`metadata.app` は目安に過ぎない（後続 PUT で欠落し得る）。`blog_post` を持たない document（通常の KB 編集、Vault の autosave 含む）は公開のままである。
 
-注4: 登録時のロールはクライアントが選べない。`SKB_SERVER_AUTHOR_EMAILS`（カンマ区切り）に**完全一致**する email は `author`、それ以外は `reader` として登録される。`@domain` 形式などの部分一致は認めない — email の所有確認がない公開登録で、ドメイン内の任意アドレスが author を自己申告できる経路は権限の自己付与になる（CWE-269）。動的なアドレスが必要な E2E ハーネスは、サーバー起動前に完全一致アドレスを env へ渡す。
+注4: 登録時のロールはクライアントが選べず、公開登録は**常に `reader`** を発行する。`author` は招待トークン方式のみ: `SKB_SERVER_AUTHOR_INVITES`（カンマ区切りの `email:token` ペア）に登録した email について、リクエストが `invite` フィールドで**一致するトークン**を提示した場合に限り `author` として登録される（トークン比較は定数時間）。email の所有確認がない公開登録では、allowlist 形式（クライアントが email を先に登録すれば効果を持つ）や `@domain` 形式の部分一致は権限の自己付与になるため許可しない（CWE-269）。トークンは運用者が配布する招待情報であり、空トークンのエントリは無効として扱う。動的なアドレスが必要な E2E ハーネスは、サーバー起動前に実行固有の `email:token` ペアを env へ渡す。
 
 注2: `/api/blog/*` はフロントエンド実装仕様書の §API設計表に無い **追加エンドポイント** であり、同書 §Blog の公開範囲管理（`published` フラグ + reader/author ロール）を実現するために設けた。サーバー所有スキーマは `crates/skb-server/schema/002_server.surql`（`user` / `blog_post` テーブル、起動時に冪等適用）。
 
@@ -862,7 +862,7 @@ port = 8080
 | `SKB_CHAT_EXPAND_DEPTH` | 2 | チャット検索の `graph_expand` 深さ。上限 5（コア `MAX_GRAPH_EXPAND`、超過は切り詰め）、パース不能値は既定 |
 | `SKB_CHAT_TOKEN_BUDGET` | 4000 | プロンプト全体の文字予算（固定指示文 + 質問文 + 引用断片の合計）。超過する質問文は文字境界で切り詰められ、引用断片は残り予算を共有する。文字ベースの近似（約 4 文字/トークン）。実トークナイザは意図的に導入しない |
 | `SKB_SERVER_JWT_SECRET` | 未設定 | JWT 署名鍵（HS256、有効期限 24 時間）。**未設定でも起動は継続** し warning を出力する。JWT 検証を要するパス（login、publish、`app=blog` の POST /api/documents の author 必須分岐、blog document の PUT/DELETE）は 503 `E_CONFIG` を返す。register と公開 GET は影響を受けない。**32 文字未満の弱い secret も未設定と同等に 503** する（総当たり可能な鍵で HS256 トークンを偽造できないようにするため） |
-| `SKB_SERVER_AUTHOR_EMAILS` | 未設定 | 登録時に `author` を付与する email のカンマ区切りリスト（**完全一致のみ**、注4）。未設定なら全員 `reader` で登録される |
+| `SKB_SERVER_AUTHOR_INVITES` | 未設定 | 登録時に `author` を付与する `email:token` ペアのカンマ区切りリスト。リクエストの `invite` フィールドが一致するトークンの場合のみ `author`（**公開登録の既定は `reader`**、注4）。未設定なら招待は存在しない |
 
 LLM 系環境変数と JWT secret はリクエスト毎に読まれる（テストや E2E がプロセス再起動なしで向き先を変えられる）。
 
