@@ -62,7 +62,22 @@ pub async fn create_document(
     };
     let result = state.kb.upload(req.into()).await?;
     if let (Some(user), Some(document_id)) = (author, result.document_id.clone()) {
-        blog::create_blog_post(&state, &document_id, &user.email).await?;
+        if let Err(e) =
+            blog::create_blog_post(&state, &document_id, &user.email, false).await
+        {
+            // Compensate: roll the just-ingested document back so the store
+            // holds no registry-less blog content and a client retry starts
+            // clean. If even the compensation fails, the original error
+            // still surfaces and the stray document is reported.
+            if let Err(del_err) = state
+                .kb
+                .delete_document(&DeleteDocumentRequest { id: document_id })
+                .await
+            {
+                tracing::warn!("create_document: registry failed ({e:?}) and the compensation delete also failed: {del_err:?}");
+            }
+            return Err(e);
+        }
     }
     Ok((StatusCode::CREATED, Json(result.into())))
 }
@@ -209,24 +224,48 @@ pub async fn update_document(
     // truth), read BEFORE the old document is deleted: replacing a blog
     // document requires its owning author, and the same lookup decides
     // whether a minted replacement id must inherit the registry row.
-    let post_author = blog::blog_post_author(&state, &old.id).await?;
-    let owner = match &post_author {
-        Some(email) => Some(require_blog_owner(auth, email)?),
-        None => None,
-    };
+    let post_owner = blog::blog_post_owner(&state, &old.id).await?;
+    if let Some(owner) = &post_owner {
+        require_blog_owner(auth, &owner.email)?;
+    }
     let mut core_req = UploadRequest::from(req);
     core_req.force = None;
     let result = state.kb.upload(core_req).await?;
     let document_id = match result.document_id {
         Some(new_id) if new_id != id => {
-            if post_author.is_some() {
-                blog::migrate_blog_post(&state, &old.id, &new_id).await?;
+            if post_owner.is_some() {
+                if let Err(e) = blog::migrate_blog_post(&state, &old.id, &new_id).await {
+                    // Compensate: drop the replacement so the registry keeps
+                    // pointing at the intact original and the client can
+                    // retry the whole PUT.
+                    if let Err(del_err) = state
+                        .kb
+                        .delete_document(&DeleteDocumentRequest { id: new_id.clone() })
+                        .await
+                    {
+                        tracing::warn!("update_document: migration failed ({e:?}) and the compensation delete also failed: {del_err:?}");
+                    }
+                    return Err(e);
+                }
             }
-            state
+            match state
                 .kb
                 .delete_document(&DeleteDocumentRequest { id })
-                .await?;
-            new_id
+                .await
+            {
+                Ok(_) => new_id,
+                Err(e) => {
+                    // The registry already points at the replacement: the
+                    // logical update succeeded and the old document is an
+                    // unreferenced duplicate. Report success — returning the
+                    // error would make clients re-run an already-applied
+                    // update against the wrong id.
+                    tracing::warn!(
+                        "update_document: migrated to {new_id} but deleting the old document failed: {e:?}"
+                    );
+                    new_id
+                }
+            }
         }
         // Same id cannot occur with force stripped (identical sha256 is
         // skipped first); if it ever did, keeping the record is the safe arm.
@@ -279,13 +318,28 @@ pub async fn delete_document(
     // single source of truth for authorship, and the unconditional
     // registry delete below also covers PUT-migrated successors whose
     // metadata no longer carries app=blog.
-    if let Some(owner_email) = blog::blog_post_author(&state, &id).await? {
-        require_blog_owner(auth, &owner_email)?;
+    let owner = blog::blog_post_owner(&state, &id).await?;
+    if let Some(owner) = &owner {
+        require_blog_owner(auth, &owner.email)?;
     }
     blog::delete_blog_post(&state, &id).await?;
-    state
+    if let Err(e) = state
         .kb
-        .delete_document(&DeleteDocumentRequest { id })
-        .await?;
+        .delete_document(&DeleteDocumentRequest { id: id.clone() })
+        .await
+    {
+        // Compensate: restore the registry row with its exact author and
+        // published flag so the failed delete is retryable instead of
+        // leaving a listed post pointing at a document that is still there
+        // but invisible to the registry.
+        if let Some(owner) = &owner {
+            if let Err(restore_err) =
+                blog::create_blog_post(&state, &id, &owner.email, owner.published).await
+            {
+                tracing::warn!("delete_document: document delete failed ({e:?}) and the registry restore also failed: {restore_err:?}");
+            }
+        }
+        return Err(ApiError::from(e));
+    }
     Ok(StatusCode::NO_CONTENT)
 }
