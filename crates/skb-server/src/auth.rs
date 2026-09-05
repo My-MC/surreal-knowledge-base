@@ -30,6 +30,10 @@ use crate::error::ApiError;
 const SERVER_SCHEMA_SQL: &str = include_str!("../schema/002_server.surql");
 
 const JWT_SECRET_ENV: &str = "SKB_SERVER_JWT_SECRET";
+/// Minimum accepted JWT secret length (bytes). Short secrets fall to
+/// brute-force and forged-token attacks (HS256), so a configured-but-weak
+/// secret is treated the same as an unset one: 503 `E_CONFIG`.
+const JWT_SECRET_MIN_LEN: usize = 32;
 const TOKEN_TTL_SECS: usize = 24 * 60 * 60;
 const SESSION_COOKIE_PREFIX: &str = "skb_session=";
 
@@ -72,7 +76,19 @@ fn unauthorized(message: &'static str) -> ApiError {
 }
 
 fn jwt_secret() -> Result<String, ApiError> {
-    std::env::var(JWT_SECRET_ENV).map_err(|_| secret_unconfigured())
+    let secret = std::env::var(JWT_SECRET_ENV).map_err(|_| secret_unconfigured())?;
+    if secret.len() < JWT_SECRET_MIN_LEN {
+        return Err(ApiError::with_status(
+            SkbError::new(
+                ErrorCode::Config,
+                format!(
+                    "{JWT_SECRET_ENV} must be at least {JWT_SECRET_MIN_LEN} characters to resist brute-forced HS256 tokens"
+                ),
+            ),
+            StatusCode::SERVICE_UNAVAILABLE,
+        ));
+    }
+    Ok(secret)
 }
 
 fn issue_token(email: &str, role: &str, secret: &str) -> Result<String, ApiError> {

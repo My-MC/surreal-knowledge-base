@@ -13,7 +13,7 @@ use tower::ServiceExt;
 
 use common::{test_router, test_state};
 
-const SECRET: &str = "test-secret";
+const SECRET: &str = "test-secret-0123456789abcdef-0123456789abcdef";
 
 /// Restores the previous `SKB_SERVER_JWT_SECRET` value on drop (the
 /// config.rs EnvGuard pattern).
@@ -298,6 +298,19 @@ async fn unset_jwt_secret_degrades_auth_paths_but_not_public_routes() {
     let posts = list_posts(&router).await;
     assert_eq!(posts.status, StatusCode::OK);
     assert_eq!(posts.body, json!([]));
+}
+
+/// Given: SKB_SERVER_JWT_SECRET is set but shorter than 32 characters.
+/// When:  calling an authenticated path.
+/// Then:  503 E_CONFIG — weak secrets must not back HS256 sessions.
+#[tokio::test]
+async fn weak_jwt_secret_is_rejected_like_an_unset_one() {
+    let _secret = EnvGuard::set("too-short");
+    let (router, _db) = setup().await;
+
+    let login = login(&router, "nobody@example.com", "pw").await;
+    assert_eq!(login.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(login.body["code"], "E_CONFIG");
 }
 
 /// Given: a registered user.

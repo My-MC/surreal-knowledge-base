@@ -46,10 +46,14 @@ async fn run(cli: Cli) -> Result<(), SkbError> {
     let core_cfg = core_config()?;
     let kb = Arc::new(KnowledgeBase::open(core_cfg).await?);
     skb_server::auth::apply_server_schema(&kb).await?;
-    if std::env::var("SKB_SERVER_JWT_SECRET").is_err() {
-        tracing::warn!(
+    match std::env::var("SKB_SERVER_JWT_SECRET") {
+        Err(_) => tracing::warn!(
             "SKB_SERVER_JWT_SECRET is not set; authenticated endpoints return 503 E_CONFIG (public routes unaffected)"
-        );
+        ),
+        Ok(secret) if secret.len() < 32 => tracing::warn!(
+            "SKB_SERVER_JWT_SECRET is shorter than 32 characters; authenticated endpoints return 503 E_CONFIG"
+        ),
+        Ok(_) => {}
     }
     let state = AppState { kb, server_cfg };
 
