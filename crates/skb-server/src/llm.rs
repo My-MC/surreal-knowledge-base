@@ -4,11 +4,14 @@
 //! body is parsed incrementally and text fragments (`choices[0].delta.content`)
 //! are yielded as they arrive until `data: [DONE]`. Connection/HTTP/protocol
 //! failures surface as typed [`LlmError`]s so the chat handler can emit them
-//! as in-band SSE error events.
+//! as in-band SSE error events. The client caps hostile-upstream blast
+//! radius: error bodies and single SSE frames are size-capped, idle chunk
+//! reads time out, and an API key is never sent over plain HTTP.
 
-use reqwest::Client;
+use reqwest::{redirect, Client};
 use serde_json::json;
 use std::fmt;
+use std::time::Duration;
 
 /// Environment variable selecting the OpenAI-compatible base URL.
 pub const ENV_BASE_URL: &str = "SKB_LLM_BASE_URL";
@@ -20,6 +23,15 @@ pub const ENV_API_KEY: &str = "SKB_LLM_API_KEY";
 const DEFAULT_BASE_URL: &str = "http://localhost:11434/v1";
 const DEFAULT_MODEL: &str = "llama3.1";
 
+/// Cap on the non-2xx error body captured into `LlmError::Status` — a
+/// hostile upstream must not turn one failed request into unbounded memory.
+const MAX_ERROR_BODY: usize = 8 * 1024;
+/// Cap on a single SSE line held in memory before its newline arrives.
+const MAX_SSE_FRAME: usize = 64 * 1024;
+/// Idle cap between SSE chunks — a silent upstream must not pin the chat
+/// pipeline's task and connection forever.
+const READ_TIMEOUT: Duration = Duration::from_secs(60);
+
 #[derive(Debug)]
 pub enum LlmError {
     /// DNS/connect/timeout/body-read failure against the LLM upstream.
@@ -28,6 +40,9 @@ pub enum LlmError {
     Status { status: u16, body: String },
     /// The SSE body violated the OpenAI streaming contract.
     Protocol(String),
+    /// The configured client options are unusable (e.g. an API key over
+    /// plain HTTP).
+    Config(String),
 }
 
 impl LlmError {
@@ -37,6 +52,7 @@ impl LlmError {
             LlmError::Connection(_) => "E_LLM_CONNECTION",
             LlmError::Status { .. } => "E_LLM_STATUS",
             LlmError::Protocol(_) => "E_LLM_PROTOCOL",
+            LlmError::Config(_) => "E_LLM_CONFIG",
         }
     }
 }
@@ -49,6 +65,7 @@ impl fmt::Display for LlmError {
                 write!(f, "LLM returned HTTP {status}: {body}")
             }
             LlmError::Protocol(detail) => write!(f, "LLM stream protocol error: {detail}"),
+            LlmError::Config(detail) => write!(f, "LLM client misconfigured: {detail}"),
         }
     }
 }
@@ -76,8 +93,27 @@ impl LlmClient {
         let base_url = std::env::var(ENV_BASE_URL).unwrap_or_else(|_| DEFAULT_BASE_URL.into());
         let model = std::env::var(ENV_MODEL).unwrap_or_else(|_| DEFAULT_MODEL.into());
         let api_key = std::env::var(ENV_API_KEY).ok().filter(|k| !k.is_empty());
+        if api_key.is_some() && !base_url.trim_start().starts_with("https://") {
+            // A bearer token over plain HTTP leaks the credential and every
+            // prompt to whoever can sniff the wire — including a local
+            // process that grabbed the port before the LLM came up.
+            return Err(LlmError::Config(
+                "SKB_LLM_API_KEY requires an https:// SKB_LLM_BASE_URL".to_string(),
+            ));
+        }
         let http = Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
+            .read_timeout(READ_TIMEOUT)
+            .redirect(redirect::Policy::custom(|attempt| {
+                // A 307/308 replays the POST body — the prompt — at the new
+                // location, so never follow a scheme downgrade to plain
+                // HTTP; bound hops so a redirect loop cannot spin.
+                if attempt.previous().len() >= 5 || attempt.url().scheme() != "https" {
+                    attempt.stop()
+                } else {
+                    attempt.follow()
+                }
+            }))
             .build()
             .map_err(LlmError::Connection)?;
         Ok(Self {
@@ -103,7 +139,7 @@ impl LlmClient {
         let response = request.send().await.map_err(LlmError::Connection)?;
         let status = response.status();
         if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
+            let body = read_body_capped(response, MAX_ERROR_BODY).await;
             return Err(LlmError::Status {
                 status: status.as_u16(),
                 body,
@@ -125,6 +161,27 @@ pub struct LlmStream {
     finished: bool,
 }
 
+/// Read at most `cap` bytes of a response body (lossy-UTF8), dropping the
+/// rest — error bodies are diagnostic, never a data source.
+async fn read_body_capped(response: reqwest::Response, cap: usize) -> String {
+    let mut response = response;
+    let mut body: Vec<u8> = Vec::new();
+    while body.len() < cap {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                let remaining = cap - body.len();
+                let end = chunk.len().min(remaining);
+                body.extend_from_slice(&chunk[..end]);
+                if end < chunk.len() {
+                    break;
+                }
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&body).into_owned()
+}
+
 enum SseLine {
     Delta(String),
     Done,
@@ -140,6 +197,12 @@ impl LlmStream {
                 return Ok(None);
             }
             if let Some(pos) = self.buffer.iter().position(|&b| b == b'\n') {
+                if pos > MAX_SSE_FRAME {
+                    self.finished = true;
+                    return Err(LlmError::Protocol(format!(
+                        "SSE line exceeds {MAX_SSE_FRAME} bytes"
+                    )));
+                }
                 let line = String::from_utf8_lossy(&self.buffer[..pos]).into_owned();
                 self.buffer.drain(..=pos);
                 match Self::parse_line(line.trim_end_matches('\r'))? {
@@ -152,7 +215,23 @@ impl LlmStream {
                 }
             }
             match self.response.chunk().await {
-                Ok(Some(chunk)) => self.buffer.extend_from_slice(&chunk),
+                Ok(Some(chunk)) => {
+                    self.buffer.extend_from_slice(&chunk);
+                    // The trailing (newline-less) segment is the frame being
+                    // accumulated; a newline-terminated giant line is caught
+                    // by the per-line cap in the parse arm above.
+                    let last_newline = self.buffer.iter().rposition(|&b| b == b'\n');
+                    let trailing = match last_newline {
+                        Some(pos) => &self.buffer[pos + 1..],
+                        None => &self.buffer[..],
+                    };
+                    if trailing.len() > MAX_SSE_FRAME {
+                        self.finished = true;
+                        return Err(LlmError::Protocol(format!(
+                            "SSE frame exceeds {MAX_SSE_FRAME} bytes without a newline"
+                        )));
+                    }
+                }
                 Ok(None) => {
                     self.finished = true;
                     if self.buffer.is_empty() {

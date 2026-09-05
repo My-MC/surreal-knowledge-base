@@ -243,3 +243,103 @@ async fn chat_stream_llm_unreachable_yields_terminal_in_band_error() {
 
     let _ = std::fs::remove_dir_all(db);
 }
+
+#[tokio::test]
+async fn chat_stream_rejects_oversized_sse_frames() {
+    // A VALID OpenAI delta whose single line exceeds the frame cap: the
+    // per-line limit must reject it, not malformed JSON.
+    let oversized = format!(
+        "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{}\"}}}}]}}\n\n",
+        "a".repeat(100_000)
+    );
+    let _server = mount_llm(200, &oversized).await;
+
+    let (state, db) = test_state().await;
+    let router = test_router(state);
+    upload(
+        router.clone(),
+        "Delta notes with unique zzzframeterm content.",
+        "frame-doc",
+    )
+    .await;
+
+    let (_status, _content_type, body) = post_chat(router, "zzzframeterm").await;
+    let events = parse_sse(&body);
+    assert_eq!(
+        event_names(&events).last(),
+        Some(&"error"),
+        "oversized frame must be terminal: {body}"
+    );
+    let error = data_of(&events, "error");
+    assert_eq!(error["code"], "E_LLM_PROTOCOL", "{body}");
+
+    let _ = std::fs::remove_dir_all(db);
+}
+
+#[tokio::test]
+async fn chat_stream_llm_error_body_is_size_capped() {
+    let huge = format!("E{}", "x".repeat(1_000_000));
+    let _server = mount_llm(500, &huge).await;
+
+    let (state, db) = test_state().await;
+    let router = test_router(state);
+    upload(
+        router.clone(),
+        "Epsilon notes with unique zzzerrbodyterm content.",
+        "errbody-doc",
+    )
+    .await;
+
+    let (_status, _content_type, body) = post_chat(router, "zzzerrbodyterm").await;
+    let events = parse_sse(&body);
+    let error = data_of(&events, "error");
+    assert_eq!(error["code"], "E_LLM_STATUS", "{body}");
+    let message = error["message"].as_str().expect("error message");
+    assert!(
+        message.len() < 64 * 1024,
+        "error body must be capped, got {} bytes",
+        message.len()
+    );
+
+    let _ = std::fs::remove_dir_all(db);
+}
+
+/// Restores touched env keys on drop so the test leaves no `SKB_LLM_*`
+/// residue for later suites (the workspace runs with --test-threads=1, which
+/// is what keeps concurrent env access out of scope).
+struct EnvGuard(Vec<(&'static str, Option<String>)>);
+
+impl EnvGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let old = std::env::var(key).ok();
+        std::env::set_var(key, value);
+        Self(vec![(key, old)])
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (key, old) in self.0.drain(..) {
+            match old {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
+/// Given: SKB_LLM_API_KEY set and SKB_LLM_BASE_URL on plain http.
+/// When:  resolving the LLM client.
+/// Then:  E_LLM_CONFIG — bearer tokens and prompts never travel cleartext.
+#[tokio::test]
+async fn llm_api_key_rejects_http_base_url() {
+    let _env = (
+        EnvGuard::set("SKB_LLM_API_KEY", "secret-token"),
+        EnvGuard::set("SKB_LLM_BASE_URL", "http://127.0.0.1:1/v1"),
+    );
+    let err = match skb_server::llm::LlmClient::from_env() {
+        Err(err) => err,
+        Ok(_) => panic!("http + api key must fail"),
+    };
+    assert_eq!(err.code(), "E_LLM_CONFIG");
+}

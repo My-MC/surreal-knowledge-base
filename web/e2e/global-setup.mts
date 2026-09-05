@@ -1,5 +1,5 @@
 import { type ChildProcess, spawn } from "node:child_process";
-import { existsSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { repoRoot } from "./helpers.mts";
 
@@ -7,11 +7,24 @@ const SERVER_PORT = 18080;
 const MOCK_LLM_PORT = 18081;
 const DEV_PORT = 5173;
 const STUDIO_DEV_PORT = 5174;
+const BLOG_DEV_PORT = 5175;
 const DB_PATH = path.join(repoRoot, "target", "skb-e2e-db");
 const SERVER_BIN = path.join(repoRoot, "target", "debug", "skb-server");
 const MOCK_LLM_BIN = path.join(repoRoot, "target", "debug", "examples", "mock_llm");
 const VAULT_APP_DIR = path.join(repoRoot, "web", "apps", "vault");
 const STUDIO_APP_DIR = path.join(repoRoot, "web", "apps", "studio");
+const BLOG_APP_DIR = path.join(repoRoot, "web", "apps", "blog");
+const AUTH_FIXTURE_PATH = path.join(repoRoot, "target", "e2e-auth.json");
+
+// Run-unique invite identities, composed before the server spawns. Public
+// registration is reader-only (CWE-269): the server mints `author` only when
+// the register request presents the token paired with the exact email in
+// SKB_SERVER_AUTHOR_INVITES. The fixture file is the handoff to the specs.
+const E2E_RUN_ID = Date.now();
+const E2E_SEEDER_EMAIL = `seeder${E2E_RUN_ID}@example.com`;
+const E2E_BLOGGER_EMAIL = `blogger${E2E_RUN_ID}@example.com`;
+const E2E_SEEDER_INVITE = `seed-invite-${E2E_RUN_ID}`;
+const E2E_BLOGGER_INVITE = `blog-invite-${E2E_RUN_ID}`;
 
 const SERVER_START_TIMEOUT_MS = 120_000;
 const CHILD_START_TIMEOUT_MS = 30_000;
@@ -115,7 +128,7 @@ async function killAll(): Promise<void> {
 /**
  * Spawns the e2e stack: mock_llm (prebuilt example binary), skb-server
  * (prebuilt binary, mock embeddings, wiped throwaway DB, fixed ports) and the
- * vault + studio dev servers proxying to it. All server binaries must be
+ * vault + studio + blog dev servers proxying to it. All server binaries must be
  * built up front (`cargo build -p skb-server --bin skb-server --examples`) —
  * cargo is deliberately not invoked from inside Playwright.
  */
@@ -128,6 +141,16 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
     }
   }
   rmSync(DB_PATH, { recursive: true, force: true });
+  mkdirSync(path.dirname(AUTH_FIXTURE_PATH), { recursive: true });
+  writeFileSync(
+    AUTH_FIXTURE_PATH,
+    JSON.stringify({
+      seederEmail: E2E_SEEDER_EMAIL,
+      bloggerEmail: E2E_BLOGGER_EMAIL,
+      seederInvite: E2E_SEEDER_INVITE,
+      bloggerInvite: E2E_BLOGGER_INVITE,
+    }),
+  );
 
   spawnDetached("mock_llm", MOCK_LLM_BIN, ["--port", String(MOCK_LLM_PORT)]);
   await waitForHttp(
@@ -146,8 +169,11 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
       SKB_EMBEDDING_TOKENIZER: "auto",
       SKB_EMBEDDING_MODEL: "BAAI/bge-m3",
       SKB_SERVER_HOST: "127.0.0.1",
-      // Auth endpoints 503 E_CONFIG without it (todo 7 semantics).
-      SKB_SERVER_JWT_SECRET: "skb-e2e-secret",
+      // Auth endpoints 503 E_CONFIG without it (todo 7 semantics). The
+      // 32+ char floor rejects weak secrets (503), so keep it long.
+      SKB_SERVER_JWT_SECRET: "skb-e2e-secret-0123456789abcdef-0123456789abcdef",
+      // Invite tokens for this run's two author identities (note 4).
+      SKB_SERVER_AUTHOR_INVITES: `${E2E_SEEDER_EMAIL}:${E2E_SEEDER_INVITE},${E2E_BLOGGER_EMAIL}:${E2E_BLOGGER_INVITE}`,
       SKB_LLM_BASE_URL: `http://127.0.0.1:${MOCK_LLM_PORT}/v1`,
     },
   });
@@ -186,6 +212,22 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
   await waitForHttp(
     "studio dev server",
     `http://localhost:${STUDIO_DEV_PORT}/`,
+    null,
+    CHILD_START_TIMEOUT_MS,
+  );
+
+  spawnDetached(
+    "blog vite",
+    "bun",
+    ["--bun", "run", "dev", "--port", String(BLOG_DEV_PORT), "--strictPort"],
+    {
+      cwd: BLOG_APP_DIR,
+      env: { ...process.env, SKB_SERVER_PORT: String(SERVER_PORT) },
+    },
+  );
+  await waitForHttp(
+    "blog dev server",
+    `http://localhost:${BLOG_DEV_PORT}/`,
     null,
     CHILD_START_TIMEOUT_MS,
   );

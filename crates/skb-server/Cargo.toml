@@ -34,6 +34,12 @@ validator = { version = "=0.21.0", features = ["derive"] }
 # guard green (no ring/aws-lc-rs/openssl in the graph).
 argon2 = "0.6"
 jsonwebtoken = { version = "11", features = ["rust_crypto"] }
+# Logout revocation ids: v4 jti per issued session token (os-random, no
+# native-TLS involvement — the TLS guard stays green).
+uuid = { version = "1", features = ["v4"] }
+# Constant-time comparison of author invite tokens (no timing oracle on the
+# HTTP handler path).
+subtle = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 schemars = { workspace = true }

@@ -797,25 +797,32 @@ SurrealDB は組込みモード（SurrealKV）で動作するため、DB ファ�
 | POST | `/api/documents` | 公開（注1） | 201 | 取り込み。`metadata.app == "blog"` の場合は author JWT 必須 |
 | GET | `/api/documents` | 公開 | 200 | 一覧。`limit` / `offset` / `order` / `after` カーソル |
 | GET | `/api/documents/{id}` | 公開 | 200 | 詳細。`?include_chunks=true` でチャンク付き |
-| PUT | `/api/documents/{id}` | 公開 | 200 | 内容差し替え（複合操作、本文参照）。レスポンス `{"document_id"}` |
-| DELETE | `/api/documents/{id}` | 公開 | 204 | 削除（レスポンスボディなし） |
+| PUT | `/api/documents/{id}` | 公開（注3） | 200 | 内容差し替え（複合操作、本文参照）。レスポンス `{"document_id"}` |
+| DELETE | `/api/documents/{id}` | 公開（注3） | 204 | 削除（レスポンスボディなし） |
 | GET | `/api/documents/{id}/backlinks` | 公開 | 200 | 逆方向 mentions ウォークによるバックリンク（`{documents: [{id, title}]}`） |
 | POST | `/api/search` | 公開 | 200 | 検索（既定 hybrid、透過パススルー）。`{hits, mode, elapsed_ms}` |
 | POST | `/api/search/expand` | 公開 | 200 | 検索ヒットのグラフ拡張。`{hits, entity_origins}`（§20.6-4 の既知制限あり） |
 | POST | `/api/graph/query` | 公開 | 200 | グラフ照会。`depth` 1〜5（範囲外は 400）。`{nodes, edges}` |
 | POST | `/api/chat/stream` | 公開 | 200 | SSE チャット（§20.3） |
-| POST | `/api/auth/register` | 公開 | 201 | ユーザー登録（Argon2id）。email 重複は 409 |
+| POST | `/api/auth/register` | 公開（注4） | 201 | ユーザー登録（Argon2id）。email 重複は 409（同時登録の競合も 409） |
 | POST | `/api/auth/login` | 公開 | 200 | ログイン。`Set-Cookie: skb_session=<JWT>` |
+| POST | `/api/auth/logout` | 認証済み | 204 | ログアウト。トークンの jti を `revoked_session` に記録（以後そのトークンは401）し、`Set-Cookie: skb_session=; Max-Age=0` で Cookie を失効させる |
 | GET | `/api/blog/posts` | 公開 | 200 | 公開済み（`published = true`）投稿のみを新着順で返す |
 | POST | `/api/blog/posts/{document_id}/publish` | author | 200 | 公開フラグの設定。author ロール必須 |
 
-注1: `metadata.app == "blog"` を含む `POST /api/documents` は author JWT を要求する（トークン無し・無効・reader ロールは 401、`SKB_SERVER_JWT_SECRET` 未設定は 503）。それ以外のアップロードは認証不要のままである。blog アップロード成功時は `blog_post` レジストリ行（`published = false`、author は JWT の email から解決）が自動作成される。
+注1: `metadata.app == "blog"` を含む `POST /api/documents` は author JWT を要求する（トークン無し・無効・reader ロールは 401、`SKB_SERVER_JWT_SECRET` 未設定・32文字未満は 503）。それ以外のアップロードは認証不要のままである。blog アップロード成功時は `blog_post` レジストリ行（`published = false`、author は JWT の email から解決）が自動作成される。
+
+注3: `blog_post` レジストリ行を持つ document の PUT / DELETE は **その投稿の author 本人のみ** が実行できる（トークン無し・無効・reader ロールは 401、別 author は 403）。レジストリ行の存在が blog 判定の唯一の根拠であり、`metadata.app` は目安に過ぎない（後続 PUT で欠落し得る）。`blog_post` を持たない document（通常の KB 編集、Vault の autosave 含む）は公開のままである。
+
+注4: 登録時のロールはクライアントが選べず、公開登録は**常に `reader`** を発行する。`author` は招待トークン方式のみ: `SKB_SERVER_AUTHOR_INVITES`（カンマ区切りの `email:token` ペア）に登録した email について、リクエストが `invite` フィールドで**一致するトークン**を提示した場合に限り `author` として登録される（トークン比較は定数時間）。email の所有確認がない公開登録では、allowlist 形式（クライアントが email を先に登録すれば効果を持つ）や `@domain` 形式の部分一致は権限の自己付与になるため許可しない（CWE-269）。トークンは運用者が配布する招待情報であり、空トークンのエントリは無効として扱う。動的なアドレスが必要な E2E ハーネスは、サーバー起動前に実行固有の `email:token` ペアを env へ渡す。
 
 注2: `/api/blog/*` はフロントエンド実装仕様書の §API設計表に無い **追加エンドポイント** であり、同書 §Blog の公開範囲管理（`published` フラグ + reader/author ロール）を実現するために設けた。サーバー所有スキーマは `crates/skb-server/schema/002_server.surql`（`user` / `blog_post` テーブル、起動時に冪等適用）。
 
-**PUT の複合動作**: コアに更新 API が無いため、旧ドキュメント取得（404）→ `force` を剥離した 1 回の upload → 応答分岐として実装する。内容が変わった場合（新 id 発行）は `blog_post` 行を新 id へ移行した上で旧ドキュメントを削除し、新 id を返す。同一内容（sha256 一致で `skipped`）の場合は旧ドキュメントを保持し旧 id を返す（ここで削除すると唯一のコピーが失われる）。`force` は PUT では常に無視される。クライアントはレスポンスの `document_id` へ保存済み参照を張り替えること。
+**PUT の複合動作**: コアに更新 API が無いため、旧ドキュメント取得（404）→ `force` を剥離した 1 回の upload → 応答分岐として実装する。内容が変わった場合（新 id 発行）は `blog_post` 行（レジストリ存在ベースで判定、注3）を新 id へ移行した上で旧ドキュメントを削除し、新 id を返す。同一内容（sha256 一致で `skipped`）の場合は旧ドキュメントを保持し旧 id を返す（ここで削除すると唯一のコピーが失われる）。`force` は PUT では常に無視される。クライアントはレスポンスの `document_id` へ保存済み参照を張り替えること。
 
-**DELETE の blog_post 後片付け**: ドキュメント削除時は `blog_post` 行を無条件に先に削除する。PUT 移行後の後継ドキュメントが `metadata.app=blog` を持たない場合があり、メタデータマーカーは存在判定として信頼できないためである（インデックスバック付きの DELETE で、投稿を持たないドキュメントに対しては no-op）。公開投稿一覧が削除済みドキュメントを参照し続けることを防ぐ。
+**複合操作の補償（compensation）**: コアにレジストリとドキュメントを跨ぐトランザクションは無いため、各複合操作は失敗時に補償して再試行可能な状態へ戻す。(1) blog upload 後のレジストリ作成失敗 → 取り込んだ document を削除してエラー。(2) PUT 中のレジストリ移行失敗 → 後継 document を削除してエラー（旧 document は無傷）。(3) DELETE でレジストリ削減後の document 削除失敗 → 既知の author / published フラグでレジストリ行を復元してエラー。唯一の不可逆ステップ（移行成功後の旧 document 削除）は、レジストリが既に新 id を指すため論理状態は正しく、警告ログとともに成功応答を返す。
+
+**DELETE の blog_post 後片付け**: ドキュメント削除時は `blog_post` 行を無条件に先に削除する。PUT 移行後の後継ドキュメントが `metadata.app=blog` を持たない場合があり、メタデータマーカーは存在判定として信頼できないためである（インデックスバック付きの DELETE で、投稿を持たないドキュメントに対しては no-op）。公開投稿一覧が削除済みドキュメントを参照し続けることを防ぐ。削除対象が `blog_post` を持つ場合は注3 の author 認可を先に要求する。
 
 ### 20.3 SSEイベント契約（`POST /api/chat/stream`）
 
@@ -829,7 +836,8 @@ SurrealDB は組込みモード（SurrealKV）で動作するため、DB ファ�
 | `error` | `{"code": "E_...", "message": "..."}` | 0 または 1（終端） |
 
 - パイプライン: `kb.search`（top_k 6、`graph_expand` は `SKB_CHAT_EXPAND_DEPTH`）→ citation → ヒットチャンクからプロンプト構築（文字ベースのトークン予算、§20.4）→ LLM ストリーミング転送（`choices[0].delta.content`）→ done。
-- 失敗時は `event: error` を送ってストリームを正常終了する。**HTTP ステータスは常に 200**（SSE エラーは in-band であり、ストリームエラーとして送らない）。エラーコードはコアの `E_*` に加え `E_LLM_CONNECTION` / `E_LLM_STATUS` / `E_LLM_PROTOCOL`。
+- **クライアント切断で即座に中止する**: 検索・LLM 接続・フラグメント待機の全ての長時間待機は切断チャネル（`tx.closed()`）と競合し、切断時はパイプラインのタスクと上流 LLM 接続を解放する。
+- 失敗時は `event: error` を送ってストリームを正常終了する。**HTTP ステータスは常に 200**（SSE エラーは in-band であり、ストリームエラーとして送らない）。エラーコードはコアの `E_*` に加え `E_LLM_CONNECTION` / `E_LLM_STATUS` / `E_LLM_PROTOCOL` / `E_LLM_CONFIG`。
 - keep-alive は axum の `KeepAlive::default()`（既定 15 秒間隔のコメント行）。
 - `EventSource` は GET 専用のため使用できない。フロントエンドは `fetch` + `ReadableStream` でパースする専用 hook を `packages/api-client` に置く（フロントエンド実装仕様書 §API設計と同一の方針）。
 
@@ -848,12 +856,13 @@ port = 8080
 | 環境変数 | 既定 | 意味 |
 |---|---|---|
 | `SKB_SERVER_HOST` / `SKB_SERVER_PORT` | toml 値（既定 127.0.0.1:8080） | リッスンアドレス。`SKB_SERVER_PORT` が数値でない場合は起動失敗（`E_CONFIG`） |
-| `SKB_LLM_BASE_URL` | `http://localhost:11434/v1` | OpenAI 互換 LLM のベース URL（`{base}/chat/completions` に POST） |
+| `SKB_LLM_BASE_URL` | `http://localhost:11434/v1` | OpenAI 互換 LLM のベース URL（`{base}/chat/completions` に POST）。上流からの応答には防御上限がある: エラー本文 8 KiB、SSE 1 フレーム 64 KiB（超過は `E_LLM_PROTOCOL`）、フラグメント間 60 秒の read timeout |
 | `SKB_LLM_MODEL` | `llama3.1` | チャットモデル |
-| `SKB_LLM_API_KEY` | 未設定 | Bearer トークン（空文字は未設定扱い） |
+| `SKB_LLM_API_KEY` | 未設定 | Bearer トークン（空文字は未設定扱い）。設定時は **`https://` の `SKB_LLM_BASE_URL` のみ許可**（HTTP URL はチャット要求が `E_LLM_CONFIG` で終端する。API キーとプロンプトの平文漏えい防止） |
 | `SKB_CHAT_EXPAND_DEPTH` | 2 | チャット検索の `graph_expand` 深さ。上限 5（コア `MAX_GRAPH_EXPAND`、超過は切り詰め）、パース不能値は既定 |
-| `SKB_CHAT_TOKEN_BUDGET` | 4000 | プロンプトに埋め込む引用断片の予算。文字ベースの近似（約 4 文字/トークン）。実トークナイザは意図的に導入しない |
-| `SKB_SERVER_JWT_SECRET` | 未設定 | JWT 署名鍵（HS256、有効期限 24 時間）。**未設定でも起動は継続** し warning を出力する。JWT 検証を要するパス（login、publish、`app=blog` の POST /api/documents の author 必須分岐）は 503 `E_CONFIG` を返す。register と公開 GET は影響を受けない |
+| `SKB_CHAT_TOKEN_BUDGET` | 4000 | プロンプト全体の文字予算（固定指示文 + 質問文 + 引用断片の合計）。超過する質問文は文字境界で切り詰められ、引用断片は残り予算を共有する。文字ベースの近似（約 4 文字/トークン）。実トークナイザは意図的に導入しない |
+| `SKB_SERVER_JWT_SECRET` | 未設定 | JWT 署名鍵（HS256、有効期限 24 時間）。**未設定でも起動は継続** し warning を出力する。JWT 検証を要するパス（login、publish、`app=blog` の POST /api/documents の author 必須分岐、blog document の PUT/DELETE）は 503 `E_CONFIG` を返す。register と公開 GET は影響を受けない。**32 文字未満の弱い secret も未設定と同等に 503** する（総当たり可能な鍵で HS256 トークンを偽造できないようにするため） |
+| `SKB_SERVER_AUTHOR_INVITES` | 未設定 | 登録時に `author` を付与する `email:token` ペアのカンマ区切りリスト。リクエストの `invite` フィールドが一致するトークンの場合のみ `author`（**公開登録の既定は `reader`**、注4）。未設定なら招待は存在しない |
 
 LLM 系環境変数と JWT secret はリクエスト毎に読まれる（テストや E2E がプロセス再起動なしで向き先を変えられる）。
 
@@ -876,8 +885,9 @@ LLM 系環境変数と JWT secret はリクエスト毎に読まれる（テス�
 |---|---|
 | 409 | register で email 重複（コードは `E_VALIDATION`） |
 | 401 | 認証失敗全般（トークン無し/無効/期限切れ、reader ロールによる author 操作、誤認証情報。コードは `E_VALIDATION`、ユーザー列挙防止のためメッセージは汎用） |
+| 403 | `blog_post` を持つ document の PUT/DELETE を別 author が試みた場合（コードは `E_VALIDATION`） |
 | 415 | 非対応ソース形式（`E_UNSUPPORTED_FORMAT`、既定マッピングと同一） |
-| 503 | `SKB_SERVER_JWT_SECRET` 未設定（`E_CONFIG`） |
+| 503 | `SKB_SERVER_JWT_SECRET` 未設定 **または 32 文字未満**（`E_CONFIG`） |
 
 ### 20.6 仕様差異（実装上の決定事項）
 
@@ -889,6 +899,8 @@ LLM 系環境変数と JWT secret はリクエスト毎に読まれる（テス�
 4. **`/api/search/expand` の拡張レグは現在無効（inert）**: skb-core の `expand_search_hits` が WHERE 句内の順方向グラフ走査（`FROM chunk WHERE ->mentions->entity.name IN ...`）を使っており、surrealdb 3.x ではこれが黙って 0 件に一致する（既存コアバグ、修正は上流待ち）。`entity_origins` は別の有効なステートメントで埋まるため応答自体は正常だが、拡張ヒットは空で返る。エンドポイントは透過パススルーとして正しく、フロントエンドはこのエンドポイントに依存しない。
 5. **`after` キーセットカーソルのサーバー側エミュレーション**: コアの行値比較 SQL（`(created_at, meta::id(id)) < (...)`）は surrealdb 3.x でパースできないため、サーバーは順序付き走査（上限 10,000 件）+ スライスでカーソルを再現する。カーソルがどのドキュメントにも一致しない場合は 400 を返す（黙って誤ったページを返さない）。コア修正後はこのシムを削除する。
 6. **検索ヒットの `document_id` は `document:<key>` の完全レコード形に正規化** する（サーバー DTO 境界で変換）。コアは素のキーを返すが、ドキュメント系エンドポイントは前置き付きの形しか受け付けない（素キーは 400）。これにより検索応答の id が全エンドポイントでそのまま使える。
+7. **HTTP 経由では `path` アップロードを受け付けない**: `POST`/`PUT /api/documents` の DTO は `url` / `content` / `content_base64` のみ。サーバー側ファイル読み込みを外部入力から解放するとパス走査（`/etc/passwd` 等）になるため（CLI / MCP は引き続き `path` を保持する）。
+8. **POST /api/search/expand の `max_expand` は API 境界で検証** する（コア `MAX_GRAPH_EXPAND` 超過は 400 `E_VALIDATION`。トラバーサル開始前に拒否する）。
 
 ### 20.7 MVPデスコープ
 

@@ -14,11 +14,12 @@ use std::str::FromStr;
 use utoipa::{IntoParams, ToSchema};
 
 /// Body of `POST /api/documents` and `PUT /api/documents/{id}`: a transparent
-/// [`UploadRequest`] passthrough.
+/// [`UploadRequest`] passthrough. `path` is deliberately NOT accepted over
+/// HTTP — a server-side file read from external input would be a path
+/// traversal surface (`/etc/passwd` is a valid "source"); use
+/// `content` / `content_base64` / `url`.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct UploadDocumentRequest {
-    /// File path to upload (server-side read).
-    pub path: Option<String>,
     /// URL to fetch and ingest.
     pub url: Option<String>,
     /// Inline UTF-8 content.
@@ -53,7 +54,9 @@ impl UploadDocumentRequest {
 impl From<UploadDocumentRequest> for UploadRequest {
     fn from(dto: UploadDocumentRequest) -> Self {
         Self {
-            path: dto.path,
+            // No `path`: server-side file reads are never exposed to HTTP
+            // callers (CWE-22); the CLI and MCP keep the field.
+            path: None,
             url: dto.url,
             content: dto.content,
             content_base64: dto.content_base64,
@@ -176,7 +179,12 @@ pub struct UpdateDocumentResponse {
 }
 
 /// Query parameters of `GET /api/documents`.
+///
+/// `parameter_in = Query` is explicit: utoipa's derive defaults to path
+/// parameters, which openapi-typescript then emits as required path
+/// placeholders — these are optional query string options, not path segments.
 #[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ListDocumentsParams {
     pub limit: Option<usize>,
     pub offset: Option<usize>,
@@ -215,6 +223,7 @@ impl ListDocumentsParams {
 
 /// Query parameters of `GET /api/documents/{id}`.
 #[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct GetDocumentParams {
     /// Include the document's chunks in the response.
     pub include_chunks: Option<bool>,
