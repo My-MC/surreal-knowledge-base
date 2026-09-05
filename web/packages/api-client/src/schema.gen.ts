@@ -57,9 +57,10 @@ export interface paths {
     put?: never;
     /**
      * Register a user (Argon2id hash; duplicate email → 409). The role is
-     *     server-decided: emails on the `SKB_SERVER_AUTHOR_EMAILS` allowlist
-     *     register as `author`, everyone else as `reader` — public registration
-     *     must never mint privileges from unauthenticated client input.
+     *     server-decided and public registration always mints `reader` unless the
+     *     request presents the invite token listed for the email in
+     *     `SKB_SERVER_AUTHOR_INVITES` — never privileges from unauthenticated
+     *     client input (CWE-269).
      */
     post: operations["register"];
     delete?: never;
@@ -428,11 +429,19 @@ export interface components {
       published: boolean;
     };
     /**
-     * @description Body of `POST /api/auth/register`. The role is decided by the server
-     *     (`SKB_SERVER_AUTHOR_EMAILS` allowlist); clients cannot request one.
+     * @description Body of `POST /api/auth/register`. The role is decided by the server:
+     *     registration is public and always mints `reader` unless the request
+     *     presents the invite token configured for the email
+     *     (`SKB_SERVER_AUTHOR_INVITES`); clients cannot request a role directly.
      */
     RegisterRequest: {
       email: string;
+      /**
+       * @description Author invite token for this email. Required only when the operator
+       *     listed the email in `SKB_SERVER_AUTHOR_INVITES`; omit it (or a wrong
+       *     token) registers a plain reader.
+       */
+      invite?: string | null;
       password: string;
     };
     /** @description One search result. */
