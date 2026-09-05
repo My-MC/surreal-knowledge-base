@@ -124,6 +124,10 @@ describe("useAutosave", () => {
   });
 
   afterEach(() => {
+    // Drain the fake clock before switching back: a task queued on it (e.g. a
+    // react scheduler delivery) is dropped by useRealTimers and wedges every
+    // later react update in the shared bun test process.
+    jest.runOnlyPendingTimers();
     jest.useRealTimers();
     cleanup();
   });
