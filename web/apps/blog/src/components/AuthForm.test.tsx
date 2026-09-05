@@ -140,13 +140,12 @@ describe("AuthForm", () => {
     });
     await renderAuth("register");
     fillCredentials("new@example.com", "secret");
-    fireEvent.change(screen.getByTestId("auth-role"), { target: { value: "author" } });
     fireEvent.click(screen.getByTestId("auth-submit"));
     await flush();
 
     expect(calls).toEqual(["/api/auth/register", "/api/auth/login"]);
     expect(fakeClient.POST).toHaveBeenCalledWith("/api/auth/register", {
-      body: { email: "new@example.com", password: "secret", role: "author" },
+      body: { email: "new@example.com", password: "secret" },
     });
     expect(useAuthStore.getState().role).toBe("author");
     expect(screen.getByTestId("home")).toBeTruthy();

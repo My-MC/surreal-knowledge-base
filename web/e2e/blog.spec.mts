@@ -36,7 +36,7 @@ test("blog: register, login, post, publish, and related posts", async ({ page, r
 
   // -- Step 1: seed one published post via the API (self-contained) ----------
   const registered = await request.post(`${BLOG_URL}api/auth/register`, {
-    data: { email: seedEmail, password, role: "author" },
+    data: { email: seedEmail, password },
   });
   expect(registered.status()).toBe(201);
   const loggedIn = await request.post(`${BLOG_URL}api/auth/login`, {
@@ -65,7 +65,6 @@ test("blog: register, login, post, publish, and related posts", async ({ page, r
   await page.goto(`${BLOG_URL}register`);
   await page.getByTestId("auth-email").fill(bloggerEmail);
   await page.getByTestId("auth-password").fill(password);
-  await page.getByTestId("auth-role").selectOption("author");
   await page.getByTestId("auth-submit").click();
   await page.waitForURL((url) => url.pathname === "/");
   await expect(page.getByTestId("header-email")).toHaveText(bloggerEmail);

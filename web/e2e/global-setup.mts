@@ -148,8 +148,12 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
       SKB_EMBEDDING_TOKENIZER: "auto",
       SKB_EMBEDDING_MODEL: "BAAI/bge-m3",
       SKB_SERVER_HOST: "127.0.0.1",
-      // Auth endpoints 503 E_CONFIG without it (todo 7 semantics).
-      SKB_SERVER_JWT_SECRET: "skb-e2e-secret",
+      // Auth endpoints 503 E_CONFIG without it (todo 7 semantics). The
+      // 32+ char floor rejects weak secrets (503), so keep it long.
+      SKB_SERVER_JWT_SECRET: "skb-e2e-secret-0123456789abcdef-0123456789abcdef",
+      // Dynamic per-run emails (seeder<b>ts</b>@example.com) — the @ form
+      // grants the whole domain at registration (server-side allowlist).
+      SKB_SERVER_AUTHOR_EMAILS: "@example.com",
       SKB_LLM_BASE_URL: `http://127.0.0.1:${MOCK_LLM_PORT}/v1`,
     },
   });

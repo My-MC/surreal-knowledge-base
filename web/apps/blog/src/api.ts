@@ -166,9 +166,9 @@ export async function loginQuery(email: string, password: string) {
   return data;
 }
 
-export async function registerQuery(email: string, password: string, role: string) {
+export async function registerQuery(email: string, password: string) {
   const { data, error, response } = await api.POST("/api/auth/register", {
-    body: { email, password, role },
+    body: { email, password },
   });
   if (error !== undefined || data === undefined) {
     throw toApiError(error, response.status);

@@ -16,7 +16,8 @@ const LABELS: Record<AuthFormProps["mode"], { title: string; submit: string }> =
 /**
  * /login and /register. Register auto-logins: the register response sets no
  * cookie, so the login call runs right after a 201 and the user lands on "/"
- * already signed in. Errors (409 duplicate email, 400 validation, 401 bad
+ * already signed in. The server decides the role (SKB_SERVER_AUTHOR_EMAILS
+ * allowlist); errors (409 duplicate email, 400 validation, 401 bad
  * credentials) render inline from the server message.
  */
 export function AuthForm({ mode }: AuthFormProps) {
@@ -25,7 +26,6 @@ export function AuthForm({ mode }: AuthFormProps) {
   const setAuth = useAuthStore((state) => state.setAuth);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [role, setRole] = useState("reader");
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -35,7 +35,7 @@ export function AuthForm({ mode }: AuthFormProps) {
     setError(null);
     try {
       if (mode === "register") {
-        await registerQuery(email, password, role);
+        await registerQuery(email, password);
       }
       const auth = await loginQuery(email, password);
       setAuth(auth.email, auth.role);
@@ -69,17 +69,6 @@ export function AuthForm({ mode }: AuthFormProps) {
           onChange={(event) => setPassword(event.target.value)}
           required
         />
-        {mode === "register" && (
-          <select
-            aria-label="権限"
-            data-testid="auth-role"
-            value={role}
-            onChange={(event) => setRole(event.target.value)}
-          >
-            <option value="reader">読者 (reader)</option>
-            <option value="author">投稿者 (author)</option>
-          </select>
-        )}
         <button type="submit" data-testid="auth-submit" disabled={pending}>
           {label.submit}
         </button>
