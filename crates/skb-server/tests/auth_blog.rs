@@ -556,3 +556,86 @@ async fn author_allowlist_supports_domain_entries() {
     assert_eq!(outsider.status, StatusCode::CREATED);
     assert_eq!(outsider.body["role"], "reader");
 }
+
+/// Given: an author with a valid session cookie.
+/// When:  logging out, then replaying the same cookie.
+/// Then:  the logout is 204 with a cleared `skb_session` cookie (Max-Age=0),
+///        the replayed token is 401 (revoked via the jti list), a cookie-less
+///        logout is 401, and a fresh login works again.
+#[tokio::test]
+async fn logout_revokes_the_token_and_clears_the_cookie() {
+    let _secret = EnvGuard::set(SECRET);
+    let _authors = EnvGuard::set_key("SKB_SERVER_AUTHOR_EMAILS", "logout@example.com");
+    let (router, _db) = setup().await;
+
+    let registered = register(&router, "logout@example.com", "pw").await;
+    assert_eq!(registered.body["role"], "author");
+    let login_response = login(&router, "logout@example.com", "pw").await;
+    let cookie = session_cookie(&login_response);
+
+    let before = upload_blog(&router, Some(&cookie), "content", "T").await;
+    assert_eq!(
+        before.status,
+        StatusCode::CREATED,
+        "session must work before logout: {}",
+        before.body
+    );
+
+    let anonymous = send(router.clone(), "POST", "/api/auth/logout", None, &[]).await;
+    assert_eq!(
+        anonymous.status,
+        StatusCode::UNAUTHORIZED,
+        "logout without a token: {}",
+        anonymous.body
+    );
+
+    let out = send(
+        router.clone(),
+        "POST",
+        "/api/auth/logout",
+        None,
+        &[("cookie", cookie.clone())],
+    )
+    .await;
+    assert_eq!(out.status, StatusCode::NO_CONTENT, "logout: {}", out.body);
+    let cleared = out
+        .headers
+        .get(header::SET_COOKIE)
+        .unwrap_or_else(|| panic!("logout must clear the cookie"))
+        .to_str()
+        .unwrap();
+    assert!(
+        cleared.starts_with("skb_session=;"),
+        "cleared cookie: {cleared}"
+    );
+    assert!(cleared.contains("Max-Age=0"), "cleared cookie: {cleared}");
+    assert!(cleared.contains("HttpOnly"), "cleared cookie: {cleared}");
+    assert!(
+        cleared.contains("SameSite=Lax"),
+        "cleared cookie: {cleared}"
+    );
+
+    let replay = upload_blog(&router, Some(&cookie), "content", "T").await;
+    assert_eq!(
+        replay.status,
+        StatusCode::UNAUTHORIZED,
+        "the logged-out token must be revoked: {}",
+        replay.body
+    );
+
+    let relogin_response = login(&router, "logout@example.com", "pw").await;
+    assert_eq!(
+        relogin_response.status,
+        StatusCode::OK,
+        "relogin: {}",
+        relogin_response.body
+    );
+    let fresh = session_cookie(&relogin_response);
+    let after = upload_blog(&router, Some(&fresh), "content", "T").await;
+    assert_eq!(
+        after.status,
+        StatusCode::CREATED,
+        "a fresh login must work again: {}",
+        after.body
+    );
+}

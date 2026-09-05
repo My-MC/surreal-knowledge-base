@@ -1,9 +1,10 @@
 //! Auth (plan todo 7): server-owned `user` table, register/login with
-//! Argon2id hashing, JWT (HS256) session cookies, and the request extractor.
+//! Argon2id hashing, JWT (HS256) session cookies, logout with a jti
+//! revocation list, and the request extractor.
 //!
 //! The JWT secret is read from `SKB_SERVER_JWT_SECRET` at request time: unset
-//! means every JWT-requiring path answers 503 `E_CONFIG` while startup and
-//! public routes are unaffected.
+//! or shorter than 32 characters means every JWT-requiring path answers 503
+//! `E_CONFIG` while startup and public routes are unaffected.
 
 use argon2::{
     password_hash::{phc::PasswordHash, PasswordHasher, PasswordVerifier},
@@ -11,7 +12,7 @@ use argon2::{
 };
 use axum::extract::{FromRequestParts, State};
 use axum::http::request::Parts;
-use axum::http::{header, HeaderName, StatusCode};
+use axum::http::{header, HeaderMap, HeaderName, StatusCode};
 use axum::Json;
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
@@ -36,11 +37,17 @@ const JWT_SECRET_ENV: &str = "SKB_SERVER_JWT_SECRET";
 const JWT_SECRET_MIN_LEN: usize = 32;
 const TOKEN_TTL_SECS: usize = 24 * 60 * 60;
 const SESSION_COOKIE_PREFIX: &str = "skb_session=";
+/// Mirrors the login cookie's attributes so the browser drops the session
+/// cookie instead of keeping a value-less one around.
+const CLEARED_SESSION_COOKIE: &str = "skb_session=; Max-Age=0; HttpOnly; SameSite=Lax; Path=/";
 
 const USER_BY_EMAIL_SQL: &str =
     "SELECT email, password_hash, role FROM user WHERE email = $email LIMIT 1";
 const EMAIL_TAKEN_SQL: &str = "SELECT email FROM user WHERE email = $email LIMIT 1";
 const CREATE_USER_SQL: &str = "CREATE user SET email = $email, password_hash = $hash, role = $role";
+const REVOKE_SESSION_SQL: &str = "CREATE revoked_session SET jti = $jti, exp = $exp";
+const SESSION_REVOKED_SQL: &str = "SELECT id FROM revoked_session WHERE jti = $jti LIMIT 1";
+const PURGE_EXPIRED_SQL: &str = "DELETE FROM revoked_session WHERE exp < $now";
 
 /// Apply the server-owned schema after `KnowledgeBase::open`. Called by the
 /// binary at startup and by the integration-test harness.
@@ -53,6 +60,9 @@ pub struct Claims {
     /// Subject: the user's email.
     pub sub: String,
     pub role: String,
+    /// Unique token id. Recorded in `revoked_session` by logout so a stolen
+    /// cookie is rejected for the rest of its 24h lifetime (CWE-613).
+    pub jti: String,
     pub exp: usize,
 }
 
@@ -143,6 +153,7 @@ fn issue_token(email: &str, role: &str, secret: &str) -> Result<String, ApiError
     let claims = Claims {
         sub: email.to_string(),
         role: role.to_string(),
+        jti: uuid::Uuid::new_v4().to_string(),
         exp: jsonwebtoken::get_current_timestamp() as usize + TOKEN_TTL_SECS,
     };
     encode(
@@ -156,23 +167,43 @@ fn issue_token(email: &str, role: &str, secret: &str) -> Result<String, ApiError
 /// Token from `Cookie: skb_session=...` (preferred) or
 /// `Authorization: Bearer ...`.
 fn request_token(parts: &Parts) -> Option<String> {
-    if let Some(cookies) = parts
-        .headers
-        .get(header::COOKIE)
-        .and_then(|v| v.to_str().ok())
-    {
+    request_token_from_headers(&parts.headers)
+}
+
+fn request_token_from_headers(headers: &HeaderMap) -> Option<String> {
+    if let Some(cookies) = headers.get(header::COOKIE).and_then(|v| v.to_str().ok()) {
         for pair in cookies.split(';') {
             if let Some(token) = pair.trim().strip_prefix(SESSION_COOKIE_PREFIX) {
                 return Some(token.to_string());
             }
         }
     }
-    parts
-        .headers
+    headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(str::to_string)
+}
+
+/// True when the token's `jti` was recorded by an earlier logout, so the
+/// remaining cookie lifetime is worthless. Expired rows are purged by the
+/// logout handler; an expired token is rejected by the JWT `exp` check before
+/// this lookup anyway.
+async fn session_revoked(kb: &KnowledgeBase, jti: &str) -> Result<bool, ApiError> {
+    let mut r = kb
+        .db()
+        .db
+        .query(SESSION_REVOKED_SQL)
+        .bind(("jti", jti.to_string()))
+        .await
+        .map_err(|e| ApiError::from(SkbError::new(ErrorCode::Db, format!("revoke lookup: {e}"))))?;
+    let rows: Vec<Value> = r.take(0).map_err(|e| {
+        ApiError::from(SkbError::new(
+            ErrorCode::Db,
+            format!("revoke lookup take: {e}"),
+        ))
+    })?;
+    Ok(!rows.is_empty())
 }
 
 /// Authenticated user resolved from the session JWT.
@@ -198,7 +229,7 @@ impl FromRequestParts<AppState> for AuthUser {
 
     async fn from_request_parts(
         parts: &mut Parts,
-        _state: &AppState,
+        state: &AppState,
     ) -> Result<Self, Self::Rejection> {
         let secret = jwt_secret()?;
         let token = request_token(parts).ok_or_else(|| unauthorized("missing session token"))?;
@@ -208,6 +239,9 @@ impl FromRequestParts<AppState> for AuthUser {
             &Validation::default(),
         )
         .map_err(|_| unauthorized("invalid or expired session token"))?;
+        if session_revoked(&state.kb, &data.claims.jti).await? {
+            return Err(unauthorized("session revoked"));
+        }
         Ok(Self {
             email: data.claims.sub,
             role: data.claims.role,
@@ -369,5 +403,71 @@ pub async fn login(
         StatusCode::OK,
         [(header::SET_COOKIE, cookie)],
         Json(AuthResponse { email, role }),
+    ))
+}
+
+/// Logout: record the session's `jti` in the revocation list (the cookie's
+/// remaining lifetime becomes worthless even if it was stolen) and expire the
+/// cookie. Re-logging-out the same token is a no-op (non-unique revocation
+/// rows).
+#[utoipa::path(
+    post,
+    path = "/api/auth/logout",
+    responses(
+        (status = 204, description = "Session revoked and cookie cleared"),
+        (status = 401, description = "Missing or invalid session", body = ErrorResponse),
+        (status = 500, description = "Server fault", body = ErrorResponse),
+        (status = 503, description = "JWT secret not configured or too weak", body = ErrorResponse),
+    )
+)]
+pub async fn logout(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, [(HeaderName, String); 1]), ApiError> {
+    let secret = jwt_secret()?;
+    let token = request_token_from_headers(&headers)
+        .ok_or_else(|| unauthorized("missing session token"))?;
+    let data = decode::<Claims>(
+        &token,
+        &DecodingKey::from_secret(secret.as_bytes()),
+        &Validation::default(),
+    )
+    .map_err(|_| unauthorized("invalid or expired session token"))?;
+
+    let mut r = state
+        .kb
+        .db()
+        .db
+        .query(REVOKE_SESSION_SQL)
+        .bind(("jti", data.claims.jti))
+        .bind(("exp", data.claims.exp as i64))
+        .await
+        .map_err(|e| ApiError::from(SkbError::new(ErrorCode::Db, format!("logout revoke: {e}"))))?;
+    let _revoked: Vec<Value> = r.take(0).map_err(|e| {
+        ApiError::from(SkbError::new(
+            ErrorCode::Db,
+            format!("logout revoke take: {e}"),
+        ))
+    })?;
+
+    let now = jsonwebtoken::get_current_timestamp() as i64;
+    let mut r = state
+        .kb
+        .db()
+        .db
+        .query(PURGE_EXPIRED_SQL)
+        .bind(("now", now))
+        .await
+        .map_err(|e| ApiError::from(SkbError::new(ErrorCode::Db, format!("logout purge: {e}"))))?;
+    let _purged: Vec<Value> = r.take(0).map_err(|e| {
+        ApiError::from(SkbError::new(
+            ErrorCode::Db,
+            format!("logout purge take: {e}"),
+        ))
+    })?;
+
+    Ok((
+        StatusCode::NO_CONTENT,
+        [(header::SET_COOKIE, CLEARED_SESSION_COOKIE.to_string())],
     ))
 }

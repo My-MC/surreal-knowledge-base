@@ -806,10 +806,11 @@ SurrealDB は組込みモード（SurrealKV）で動作するため、DB ファ�
 | POST | `/api/chat/stream` | 公開 | 200 | SSE チャット（§20.3） |
 | POST | `/api/auth/register` | 公開（注4） | 201 | ユーザー登録（Argon2id）。email 重複は 409（同時登録の競合も 409） |
 | POST | `/api/auth/login` | 公開 | 200 | ログイン。`Set-Cookie: skb_session=<JWT>` |
+| POST | `/api/auth/logout` | 認証済み | 204 | ログアウト。トークンの jti を `revoked_session` に記録（以後そのトークンは401）し、`Set-Cookie: skb_session=; Max-Age=0` で Cookie を失効させる |
 | GET | `/api/blog/posts` | 公開 | 200 | 公開済み（`published = true`）投稿のみを新着順で返す |
 | POST | `/api/blog/posts/{document_id}/publish` | author | 200 | 公開フラグの設定。author ロール必須 |
 
-注1: `metadata.app == "blog"` を含む `POST /api/documents` は author JWT を要求する（トークン無し・無効・reader ロールは 401、`SKB_SERVER_JWT_SECRET` 未設定は 503）。それ以外のアップロードは認証不要のままである。blog アップロード成功時は `blog_post` レジストリ行（`published = false`、author は JWT の email から解決）が自動作成される。
+注1: `metadata.app == "blog"` を含む `POST /api/documents` は author JWT を要求する（トークン無し・無効・reader ロールは 401、`SKB_SERVER_JWT_SECRET` 未設定・32文字未満は 503）。それ以外のアップロードは認証不要のままである。blog アップロード成功時は `blog_post` レジストリ行（`published = false`、author は JWT の email から解決）が自動作成される。
 
 注3: `blog_post` レジストリ行を持つ document の PUT / DELETE は **その投稿の author 本人のみ** が実行できる（トークン無し・無効・reader ロールは 401、別 author は 403）。レジストリ行の存在が blog 判定の唯一の根拠であり、`metadata.app` は目安に過ぎない（後続 PUT で欠落し得る）。`blog_post` を持たない document（通常の KB 編集、Vault の autosave 含む）は公開のままである。
 
