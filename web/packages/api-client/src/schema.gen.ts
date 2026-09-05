@@ -15,9 +15,31 @@ export interface paths {
     put?: never;
     /**
      * Login with email + password; success sets the `skb_session` JWT cookie
-     *     (HttpOnly, SameSite=Lax, Path=/) valid for 24 hours.
+     *     (Secure, HttpOnly, SameSite=Lax, Path=/) valid for 24 hours.
      */
     post: operations["login"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/auth/logout": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    /**
+     * Logout: record the session's `jti` in the revocation list (the cookie's
+     *     remaining lifetime becomes worthless even if it was stolen) and expire the
+     *     cookie. Re-logging-out the same token is a no-op (non-unique revocation
+     *     rows).
+     */
+    post: operations["logout"];
     delete?: never;
     options?: never;
     head?: never;
@@ -33,7 +55,12 @@ export interface paths {
     };
     get?: never;
     put?: never;
-    /** Register a user (Argon2id hash; duplicate email → 409). */
+    /**
+     * Register a user (Argon2id hash; duplicate email → 409). The role is
+     *     server-decided: emails on the `SKB_SERVER_AUTHOR_EMAILS` allowlist
+     *     register as `author`, everyone else as `reader` — public registration
+     *     must never mint privileges from unauthenticated client input.
+     */
     post: operations["register"];
     delete?: never;
     options?: never;
@@ -114,8 +141,9 @@ export interface paths {
     put?: never;
     /**
      * Ingest a new document. The request body is a transparent
-     *     [`UploadRequest`] passthrough; exactly one of `path`/`url`/`content`/
-     *     `content_base64` must be set (enforced by core).
+     *     [`UploadRequest`] passthrough (no `path` — server-side file reads are
+     *     never exposed over HTTP); exactly one of `url`/`content`/`content_base64`
+     *     must be set (enforced by core).
      * @description Uploads marked `metadata.app == "blog"` require an author JWT (401 for
      *     missing/invalid tokens or reader role, 503 when the JWT secret is
      *     unconfigured) and auto-create the `blog_post` registry row; other
@@ -148,15 +176,17 @@ export interface paths {
      *
      *     `force` is never honored on PUT: `force=true` upserts in place (keeping
      *     the id), and the subsequent old-id delete would destroy the just-updated
-     *     document.
+     *     document. Documents with a `blog_post` registry row are author-owned:
+     *     their owning author must hold the session, and a minted replacement id
+     *     inherits the registry row.
      */
     put: operations["update_document"];
     post?: never;
     /**
-     * Delete a document and its chunks. Responds 204 with no body. The
-     *     `blog_post` registry row (if any) is dropped first so the published-post
-     *     listing never references a deleted document; the targeted delete is a
-     *     no-op for documents without a post.
+     * Delete a document and its chunks. Responds 204 with no body. Documents
+     *     with a `blog_post` registry row are author-owned (their owning author
+     *     must hold the session); the registry row is dropped first so the
+     *     published-post listing never references a deleted document.
      */
     delete: operations["delete_document"];
     options?: never;
@@ -397,12 +427,13 @@ export interface components {
       document_id: string;
       published: boolean;
     };
-    /** @description Body of `POST /api/auth/register`. */
+    /**
+     * @description Body of `POST /api/auth/register`. The role is decided by the server
+     *     (`SKB_SERVER_AUTHOR_EMAILS` allowlist); clients cannot request one.
+     */
     RegisterRequest: {
       email: string;
       password: string;
-      /** @description `reader` (default) or `author`. */
-      role?: string | null;
     };
     /** @description One search result. */
     SearchHit: {
@@ -453,7 +484,10 @@ export interface components {
     };
     /**
      * @description Body of `POST /api/documents` and `PUT /api/documents/{id}`: a transparent
-     *     [`UploadRequest`] passthrough.
+     *     [`UploadRequest`] passthrough. `path` is deliberately NOT accepted over
+     *     HTTP — a server-side file read from external input would be a path
+     *     traversal surface (`/etc/passwd` is a valid "source"); use
+     *     `content` / `content_base64` / `url`.
      */
     UploadDocumentRequest: {
       /** @description Inline UTF-8 content. */
@@ -465,8 +499,6 @@ export interface components {
       metadata?: {
         [key: string]: string;
       } | null;
-      /** @description File path to upload (server-side read). */
-      path?: string | null;
       tags?: string[] | null;
       title?: string | null;
       /** @description URL to fetch and ingest. */
@@ -534,6 +566,51 @@ export interface operations {
         };
       };
       /** @description JWT secret not configured */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ErrorResponse"];
+        };
+      };
+    };
+  };
+  logout: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description Session revoked and cookie cleared */
+      204: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+      /** @description Missing or invalid session */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ErrorResponse"];
+        };
+      };
+      /** @description Server fault */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ErrorResponse"];
+        };
+      };
+      /** @description JWT secret not configured or too weak */
       503: {
         headers: {
           [name: string]: unknown;
@@ -709,16 +786,16 @@ export interface operations {
   };
   list_documents: {
     parameters: {
-      query?: never;
-      header?: never;
-      path: {
-        limit: number | null;
-        offset: number | null;
+      query?: {
+        limit?: number;
+        offset?: number;
         /** @description `created_desc` | `created_asc` | `title_asc` | `title_desc`. */
-        order: string | null;
+        order?: string;
         /** @description Keyset cursor `<created_at>,<id>` as returned by the previous page. */
-        after: string | null;
+        after?: string;
       };
+      header?: never;
+      path?: never;
       cookie?: never;
     };
     requestBody?: never;
@@ -823,13 +900,14 @@ export interface operations {
   };
   get_document: {
     parameters: {
-      query?: never;
+      query?: {
+        /** @description Include the document's chunks in the response. */
+        include_chunks?: boolean;
+      };
       header?: never;
       path: {
         /** @description Document record id (`document:<key>`) */
         id: string;
-        /** @description Include the document's chunks in the response. */
-        include_chunks: boolean | null;
       };
       cookie?: never;
     };
@@ -898,6 +976,24 @@ export interface operations {
           "application/json": components["schemas"]["ErrorResponse"];
         };
       };
+      /** @description Blog document without its author session */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ErrorResponse"];
+        };
+      };
+      /** @description Blog document owned by a different author */
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ErrorResponse"];
+        };
+      };
       /** @description Document not found */
       404: {
         headers: {
@@ -945,6 +1041,24 @@ export interface operations {
           [name: string]: unknown;
         };
         content?: never;
+      };
+      /** @description Blog document without its author session */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ErrorResponse"];
+        };
+      };
+      /** @description Blog document owned by a different author */
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ErrorResponse"];
+        };
       };
       /** @description Document not found */
       404: {
