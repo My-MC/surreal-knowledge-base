@@ -15,29 +15,39 @@ use common::{test_router, test_state};
 
 const SECRET: &str = "test-secret-0123456789abcdef-0123456789abcdef";
 
-/// Restores the previous `SKB_SERVER_JWT_SECRET` value on drop (the
-/// config.rs EnvGuard pattern).
-struct EnvGuard(Option<String>);
+/// Restores the previous values of the touched env keys on drop (the
+/// config.rs EnvGuard pattern). Guards compose — one per key.
+struct EnvGuard(Vec<(&'static str, Option<String>)>);
 
 impl EnvGuard {
     fn set(value: &str) -> Self {
-        let old = std::env::var("SKB_SERVER_JWT_SECRET").ok();
-        std::env::set_var("SKB_SERVER_JWT_SECRET", value);
-        Self(old)
+        Self::set_key("SKB_SERVER_JWT_SECRET", value)
     }
 
     fn remove() -> Self {
-        let old = std::env::var("SKB_SERVER_JWT_SECRET").ok();
-        std::env::remove_var("SKB_SERVER_JWT_SECRET");
-        Self(old)
+        Self::remove_key("SKB_SERVER_JWT_SECRET")
+    }
+
+    fn set_key(key: &'static str, value: &str) -> Self {
+        let old = std::env::var(key).ok();
+        std::env::set_var(key, value);
+        Self(vec![(key, old)])
+    }
+
+    fn remove_key(key: &'static str) -> Self {
+        let old = std::env::var(key).ok();
+        std::env::remove_var(key);
+        Self(vec![(key, old)])
     }
 }
 
 impl Drop for EnvGuard {
     fn drop(&mut self) {
-        match self.0.take() {
-            Some(value) => std::env::set_var("SKB_SERVER_JWT_SECRET", value),
-            None => std::env::remove_var("SKB_SERVER_JWT_SECRET"),
+        for (key, old) in self.0.drain(..) {
+            match old {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
         }
     }
 }
@@ -92,21 +102,12 @@ async fn setup() -> (axum::Router, std::path::PathBuf) {
     (test_router(state), db_path)
 }
 
-async fn register(
-    router: &axum::Router,
-    email: &str,
-    password: &str,
-    role: Option<&str>,
-) -> TestResponse {
-    let mut body = json!({"email": email, "password": password});
-    if let Some(role) = role {
-        body["role"] = json!(role);
-    }
+async fn register(router: &axum::Router, email: &str, password: &str) -> TestResponse {
     send(
         router.clone(),
         "POST",
         "/api/auth/register",
-        Some(body),
+        Some(json!({"email": email, "password": password})),
         &[],
     )
     .await
@@ -183,9 +184,10 @@ async fn list_posts(router: &axum::Router) -> TestResponse {
 #[tokio::test]
 async fn blog_full_flow_hides_until_publish_then_lists() {
     let _secret = EnvGuard::set(SECRET);
+    let _authors = EnvGuard::set_key("SKB_SERVER_AUTHOR_EMAILS", "author@example.com");
     let (router, _db) = setup().await;
 
-    let reg = register(&router, "author@example.com", "pw-author", Some("author")).await;
+    let reg = register(&router, "author@example.com", "pw-author").await;
     assert_eq!(reg.status, StatusCode::CREATED, "register: {}", reg.body);
     assert_eq!(reg.body["email"], "author@example.com");
     assert_eq!(reg.body["role"], "author");
@@ -228,9 +230,10 @@ async fn blog_full_flow_hides_until_publish_then_lists() {
 #[tokio::test]
 async fn reader_cookie_is_unauthorized_for_blog_upload() {
     let _secret = EnvGuard::set(SECRET);
+    let _no_authors = EnvGuard::remove_key("SKB_SERVER_AUTHOR_EMAILS");
     let (router, _db) = setup().await;
 
-    let reg = register(&router, "reader@example.com", "pw-reader", None).await;
+    let reg = register(&router, "reader@example.com", "pw-reader").await;
     assert_eq!(reg.status, StatusCode::CREATED);
     let login = login(&router, "reader@example.com", "pw-reader").await;
     assert_eq!(login.body["role"], "reader");
@@ -252,6 +255,7 @@ async fn reader_cookie_is_unauthorized_for_blog_upload() {
 #[tokio::test]
 async fn missing_token_is_unauthorized_for_blog_upload_and_publish() {
     let _secret = EnvGuard::set(SECRET);
+    let _authors = EnvGuard::set_key("SKB_SERVER_AUTHOR_EMAILS", "author@example.com");
     let (router, _db) = setup().await;
 
     let upload = upload_blog(&router, None, "anon content", "Anon Post").await;
@@ -262,7 +266,7 @@ async fn missing_token_is_unauthorized_for_blog_upload_and_publish() {
         upload.body
     );
 
-    register(&router, "author@example.com", "pw", Some("author")).await;
+    register(&router, "author@example.com", "pw").await;
     let login = login(&router, "author@example.com", "pw").await;
     let cookie = session_cookie(&login);
     let upload = upload_blog(&router, Some(&cookie), "content", "T").await;
@@ -320,9 +324,10 @@ async fn weak_jwt_secret_is_rejected_like_an_unset_one() {
 #[tokio::test]
 async fn wrong_password_is_401_and_duplicate_email_is_409() {
     let _secret = EnvGuard::set(SECRET);
+    let _no_authors = EnvGuard::remove_key("SKB_SERVER_AUTHOR_EMAILS");
     let (router, _db) = setup().await;
 
-    let reg = register(&router, "dup@example.com", "pw", None).await;
+    let reg = register(&router, "dup@example.com", "pw").await;
     assert_eq!(reg.status, StatusCode::CREATED);
 
     let bad = login(&router, "dup@example.com", "wrong-password").await;
@@ -337,7 +342,7 @@ async fn wrong_password_is_401_and_duplicate_email_is_409() {
     let unknown = login(&router, "ghost@example.com", "pw").await;
     assert_eq!(unknown.status, StatusCode::UNAUTHORIZED);
 
-    let dup = register(&router, "dup@example.com", "other", None).await;
+    let dup = register(&router, "dup@example.com", "other").await;
     assert_eq!(dup.status, StatusCode::CONFLICT, "dup: {}", dup.body);
     assert_eq!(dup.body["code"], "E_VALIDATION");
 }
@@ -350,9 +355,10 @@ async fn wrong_password_is_401_and_duplicate_email_is_409() {
 #[tokio::test]
 async fn put_migrates_blog_post_and_delete_removes_it() {
     let _secret = EnvGuard::set(SECRET);
+    let _authors = EnvGuard::set_key("SKB_SERVER_AUTHOR_EMAILS", "author@example.com");
     let (router, _db) = setup().await;
 
-    register(&router, "author@example.com", "pw", Some("author")).await;
+    register(&router, "author@example.com", "pw").await;
     let login = login(&router, "author@example.com", "pw").await;
     let cookie = session_cookie(&login);
 

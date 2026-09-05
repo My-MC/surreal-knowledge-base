@@ -75,6 +75,21 @@ fn unauthorized(message: &'static str) -> ApiError {
     )
 }
 
+/// Comma-separated emails granted the `author` role at registration
+/// (`SKB_SERVER_AUTHOR_EMAILS`). The only path to an author role — public
+/// registration otherwise always mints `reader`.
+fn author_allowlist() -> Vec<String> {
+    std::env::var("SKB_SERVER_AUTHOR_EMAILS")
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn jwt_secret() -> Result<String, ApiError> {
     let secret = std::env::var(JWT_SECRET_ENV).map_err(|_| secret_unconfigured())?;
     if secret.len() < JWT_SECRET_MIN_LEN {
@@ -184,7 +199,10 @@ impl FromRequestParts<AppState> for OptionalAuth {
     }
 }
 
-/// Register a user (Argon2id hash; duplicate email → 409).
+/// Register a user (Argon2id hash; duplicate email → 409). The role is
+/// server-decided: emails on the `SKB_SERVER_AUTHOR_EMAILS` allowlist
+/// register as `author`, everyone else as `reader` — public registration
+/// must never mint privileges from unauthenticated client input.
 #[utoipa::path(
     post,
     path = "/api/auth/register",
@@ -201,19 +219,17 @@ pub async fn register(
     Json(req): Json<RegisterRequest>,
 ) -> Result<(StatusCode, Json<AuthResponse>), ApiError> {
     let email = req.email.trim().to_string();
-    let role = req.role.as_deref().unwrap_or("reader").to_string();
     if email.is_empty() || req.password.is_empty() {
         return Err(ApiError::new(SkbError::new(
             ErrorCode::Validation,
             "email and password must not be empty",
         )));
     }
-    if role != "reader" && role != "author" {
-        return Err(ApiError::new(SkbError::new(
-            ErrorCode::Validation,
-            "role must be reader or author",
-        )));
-    }
+    let role = if author_allowlist().iter().any(|allowed| allowed == &email) {
+        "author"
+    } else {
+        "reader"
+    };
 
     let mut r = state
         .kb
@@ -245,13 +261,19 @@ pub async fn register(
         .query(CREATE_USER_SQL)
         .bind(("email", email.clone()))
         .bind(("hash", hash))
-        .bind(("role", role.clone()))
+        .bind(("role", role))
         .await
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("register create: {e}")))?;
     let _created: Vec<Value> = r
         .take(0)
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("register create take: {e}")))?;
-    Ok((StatusCode::CREATED, Json(AuthResponse { email, role })))
+    Ok((
+        StatusCode::CREATED,
+        Json(AuthResponse {
+            email,
+            role: role.to_string(),
+        }),
+    ))
 }
 
 /// Login with email + password; success sets the `skb_session` JWT cookie
