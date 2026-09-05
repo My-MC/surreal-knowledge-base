@@ -180,6 +180,7 @@ pub struct UpdateDocumentResponse {
 
 /// Query parameters of `GET /api/documents`.
 #[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ListDocumentsParams {
     pub limit: Option<usize>,
     pub offset: Option<usize>,
@@ -218,6 +219,7 @@ impl ListDocumentsParams {
 
 /// Query parameters of `GET /api/documents/{id}`.
 #[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct GetDocumentParams {
     /// Include the document's chunks in the response.
     pub include_chunks: Option<bool>,

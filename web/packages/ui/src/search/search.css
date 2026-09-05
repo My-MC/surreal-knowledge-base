@@ -1,0 +1,91 @@
+/* SearchPalette styles — tokens.css variables only. Apps import this file
+   (CSS is not imported from the TSX: bun test safety, T9/T11 convention). */
+
+.skb-palette {
+  position: fixed;
+  top: 20vh;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 1000;
+  width: min(560px, calc(100vw - 2 * var(--space-4)));
+  display: flex;
+  flex-direction: column;
+  background-color: var(--color-surface);
+  color: var(--color-text);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  font-family: var(--font-family-sans);
+}
+
+.skb-palette-input {
+  padding: var(--space-3) var(--space-4);
+  border: none;
+  border-bottom: 1px solid var(--color-border);
+  background-color: var(--color-surface);
+  color: var(--color-text);
+  font-family: inherit;
+  font-size: var(--font-size-md);
+  outline: none;
+}
+
+.skb-palette-input:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: -2px;
+}
+
+.skb-palette-list {
+  margin: 0;
+  padding: var(--space-1) 0;
+  list-style: none;
+  max-height: 50vh;
+  overflow-y: auto;
+}
+
+.skb-palette-item {
+  margin: 0;
+}
+
+.skb-palette-hit {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  width: 100%;
+  padding: var(--space-2) var(--space-4);
+  border: none;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.skb-palette-hit.is-selected {
+  background-color: var(--color-background);
+}
+
+.skb-palette-hit-title {
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+}
+
+.skb-palette-hit-content {
+  font-size: var(--font-size-xs);
+  color: var(--color-text);
+  opacity: 0.75;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.skb-palette-hit-score {
+  font-family: var(--font-family-mono);
+  font-size: var(--font-size-xs);
+  color: var(--color-primary);
+}
+
+.skb-palette-empty {
+  padding: var(--space-4);
+  font-size: var(--font-size-sm);
+  color: var(--color-text);
+}
