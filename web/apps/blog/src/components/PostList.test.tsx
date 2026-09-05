@@ -10,7 +10,7 @@ import {
   Outlet,
   RouterProvider,
 } from "@tanstack/react-router";
-import { act, cleanup, render, screen } from "@testing-library/react";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
 
 import { fakeClient } from "./testApiMock";
 
@@ -34,16 +34,6 @@ const POSTS = [
 ];
 
 const ok = (data: unknown) => ({ data, error: undefined, response: { status: 200 } });
-
-/**
- * Deterministic flush: TanStack Query v5 schedules notifications via
- * setTimeout(0) — a macrotask microtask flushes never see — so await a real
- * timer inside act's scope.
- */
-const flush = () =>
-  act(async () => {
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  });
 
 function renderList() {
   const rootRoute = createRootRoute({ component: () => <Outlet /> });
@@ -87,10 +77,11 @@ describe("PostList", () => {
   test("renders published posts with title, date, and author", async () => {
     fakeClient.GET.mockImplementation(async () => ok(POSTS));
     renderList();
-    await flush();
+    await waitFor(() => {
+      expect(screen.getByRole("link", { name: "最初の記事" })).toBeTruthy();
+    });
 
     expect(fakeClient.GET).toHaveBeenCalledWith("/api/blog/posts");
-    expect(screen.getByRole("link", { name: "最初の記事" })).toBeTruthy();
     expect(screen.getByRole("link", { name: "二番目の記事" })).toBeTruthy();
     expect(screen.getByText("qa@example.com")).toBeTruthy();
     expect(screen.getByText("other@example.com")).toBeTruthy();
@@ -101,7 +92,9 @@ describe("PostList", () => {
   test("shows the empty state when nothing is published", async () => {
     fakeClient.GET.mockImplementation(async () => ok([]));
     renderList();
-    await flush();
+    await waitFor(() => {
+      expect(screen.getByTestId("posts-empty")).toBeTruthy();
+    });
 
     expect(fakeClient.GET).toHaveBeenCalledWith("/api/blog/posts");
     expect(screen.getByTestId("posts-empty").textContent).toBe("公開中の記事はありません。");

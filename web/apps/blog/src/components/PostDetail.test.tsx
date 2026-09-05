@@ -10,7 +10,7 @@ import {
   Outlet,
   RouterProvider,
 } from "@tanstack/react-router";
-import { act, cleanup, render, screen, within } from "@testing-library/react";
+import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 
 import { fakeClient } from "./testApiMock";
 
@@ -75,16 +75,6 @@ const hit = (document_id: string, title: string) => ({
 const ok = (data: unknown) => ({ data, error: undefined, response: { status: 200 } });
 
 /**
- * Deterministic flush: TanStack Query v5 schedules notifications via
- * setTimeout(0) — a macrotask microtask flushes never see — so await a real
- * timer inside act's scope.
- */
-const flush = () =>
-  act(async () => {
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  });
-
-/**
  * Route every endpoint by path. Unexpected paths throw so a wiring mistake
  * surfaces as the query error state instead of a silently green assertion.
  */
@@ -134,10 +124,12 @@ async function renderDetail() {
       <RouterProvider router={router} />
     </QueryClientProvider>,
   );
-  // Two flushes: the document query settles first, and RecommendedPosts only
-  // mounts (and fetches) once the document render lands.
-  await flush();
-  await flush();
+  await waitFor(() => {
+    expect(screen.getByRole("article")).toBeTruthy();
+    expect(screen.getByTestId("related")).toBeTruthy();
+    expect(screen.getByTestId("recommended")).toBeTruthy();
+    expect(queryClient.isFetching()).toBe(0);
+  });
 }
 
 describe("PostDetail", () => {
