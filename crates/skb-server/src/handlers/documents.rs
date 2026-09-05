@@ -25,8 +25,9 @@ use crate::handlers::blog;
 const CURSOR_SCAN_LIMIT: usize = 10_000;
 
 /// Ingest a new document. The request body is a transparent
-/// [`UploadRequest`] passthrough; exactly one of `path`/`url`/`content`/
-/// `content_base64` must be set (enforced by core).
+/// [`UploadRequest`] passthrough (no `path` — server-side file reads are
+/// never exposed over HTTP); exactly one of `url`/`content`/`content_base64`
+/// must be set (enforced by core).
 ///
 /// Uploads marked `metadata.app == "blog"` require an author JWT (401 for
 /// missing/invalid tokens or reader role, 503 when the JWT secret is
