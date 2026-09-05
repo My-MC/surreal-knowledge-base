@@ -179,7 +179,12 @@ pub struct UpdateDocumentResponse {
 }
 
 /// Query parameters of `GET /api/documents`.
+///
+/// `parameter_in = Query` is explicit: utoipa's derive defaults to path
+/// parameters, which openapi-typescript then emits as required path
+/// placeholders — these are optional query string options, not path segments.
 #[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ListDocumentsParams {
     pub limit: Option<usize>,
     pub offset: Option<usize>,
@@ -218,6 +223,7 @@ impl ListDocumentsParams {
 
 /// Query parameters of `GET /api/documents/{id}`.
 #[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct GetDocumentParams {
     /// Include the document's chunks in the response.
     pub include_chunks: Option<bool>,
