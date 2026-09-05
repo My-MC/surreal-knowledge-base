@@ -1,9 +1,6 @@
 {
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
-    "paths": {
-      "react": ["./src/react-shim.d.ts"]
-    },
     "noEmit": true
   },
   "include": ["src"],

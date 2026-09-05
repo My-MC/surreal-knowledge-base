@@ -34,6 +34,9 @@ export function useChatStream(baseUrl: string): ChatStreamController {
       controllerRef.current?.abort();
       const controller = new AbortController();
       controllerRef.current = controller;
+      // Stale-request guard: once this start is superseded or aborted, none of
+      // its continuations may touch the active stream's state.
+      const isCurrent = () => controllerRef.current === controller && !controller.signal.aborted;
       setTokens("");
       setCitations([]);
       setError(null);
@@ -45,18 +48,28 @@ export function useChatStream(baseUrl: string): ChatStreamController {
           body: JSON.stringify({ message }),
           signal: controller.signal,
         });
+        if (!isCurrent()) return;
         if (!response.ok || response.body === null) {
-          setError(await errorFromResponse(response));
+          const streamError = await errorFromResponse(response);
+          if (!isCurrent()) return;
+          setError(streamError);
           setStatus("error");
           return;
         }
         await consumeSseStream(
           response,
           {
-            onCitation: (hits) => setCitations(hits),
-            onToken: (text) => setTokens((prev) => prev + text),
-            onDone: () => setStatus("done"),
+            onCitation: (hits) => {
+              if (isCurrent()) setCitations(hits);
+            },
+            onToken: (text) => {
+              if (isCurrent()) setTokens((prev) => prev + text);
+            },
+            onDone: () => {
+              if (isCurrent()) setStatus("done");
+            },
             onError: (code, errorMessage) => {
+              if (!isCurrent()) return;
               setError({ code, message: errorMessage });
               setStatus("error");
             },
@@ -64,7 +77,7 @@ export function useChatStream(baseUrl: string): ChatStreamController {
           controller.signal,
         );
       } catch (e) {
-        if (!controller.signal.aborted) {
+        if (isCurrent()) {
           setError({ code: "E_NETWORK", message: e instanceof Error ? e.message : String(e) });
           setStatus("error");
         }

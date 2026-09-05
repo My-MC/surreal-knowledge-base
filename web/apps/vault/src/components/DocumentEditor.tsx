@@ -15,6 +15,13 @@ export function DocumentEditor() {
     selectDoc(id);
   }, [id, selectDoc]);
 
+  // Clear the selection only when the /doc/$id route unmounts (navigation to
+  // "/") — not on doc-to-doc param changes, which re-run the effect above
+  // without unmounting and must keep the pane live throughout.
+  useEffect(() => {
+    return () => selectDoc(null);
+  }, [selectDoc]);
+
   const { data: doc, isPending, isError, error } = useQuery(documentQuery(id));
 
   if (isPending) {

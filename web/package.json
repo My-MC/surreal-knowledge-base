@@ -5,6 +5,9 @@
     "apps/*",
     "packages/*"
   ],
+  "files": [
+    "THIRD_PARTY_LICENSES.md"
+  ],
   "packageManager": "bun@1.4.0",
   "engines": {
     "bun": ">=1.4.0"

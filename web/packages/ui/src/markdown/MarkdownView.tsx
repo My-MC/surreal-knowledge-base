@@ -18,7 +18,8 @@ const STREAM_THROTTLE_MS = 100;
 const SHIKI_THEMES = { light: "github-light", dark: "github-dark" } as const;
 
 // Languages preloaded into the highlighter. Code fences asking for a language
-// outside this list would make shiki throw; extend deliberately.
+// outside this list fall back to "text" (see the rehype options below);
+// extend the list deliberately when real highlighting is wanted.
 const SHIKI_LANGS = [
   "text",
   "markdown",
@@ -48,13 +49,30 @@ type AnchorProps = ComponentProps<"a"> & { "data-wikilink"?: unknown };
  * without an href (the app resolves document links); regular links pass
  * through unless their protocol is unsafe (`javascript:`, `data:`, ...), in
  * which case the anchor renders without an href.
+ *
+ * Wikilink source nodes have a document title rather than a URL, so they
+ * receive an encoded fragment href to retain native link focus and Enter
+ * activation. Space re-dispatches a real click so the app's delegated click
+ * handler resolves the navigation exactly like a mouse click.
  */
 function SafeAnchor(props: AnchorProps) {
   const { className, href, ...rest } = props;
   const wikiTarget = props["data-wikilink"];
   const classes = className ? `${className} md-wikilink` : "md-wikilink";
   if (typeof wikiTarget === "string") {
-    return <a {...rest} className={classes} />;
+    return (
+      <a
+        {...rest}
+        href={`#${encodeURIComponent(wikiTarget)}`}
+        className={classes}
+        onKeyDown={(event) => {
+          if (event.key === " ") {
+            event.preventDefault();
+            event.currentTarget.click();
+          }
+        }}
+      />
+    );
   }
   if (href === undefined || SAFE_URL_PATTERN.test(href)) {
     return <a {...rest} href={href} className={className} />;
@@ -93,7 +111,12 @@ export function getMarkdownProcessor(): Promise<Processor> {
       .use(remarkWikiLink)
       .use(remarkGfm)
       .use(remarkRehype, { handlers: { wikiLink: wikiLinkHandler } })
-      .use(rehypeShikiFromHighlighter, highlighter, { themes: SHIKI_THEMES })
+      // fallbackLanguage: an unsupported fence language (e.g. mermaid) must
+      // not make processSync throw and take down the whole render.
+      .use(rehypeShikiFromHighlighter, highlighter, {
+        themes: SHIKI_THEMES,
+        fallbackLanguage: "text",
+      })
       .use(rehypeReact, {
         Fragment,
         jsx,

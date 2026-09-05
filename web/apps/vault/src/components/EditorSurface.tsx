@@ -34,6 +34,7 @@ export function EditorSurface({ doc }: EditorSurfaceProps) {
   const { status, schedule, retry } = useAutosave(doc.id);
 
   const editorShellRef = useRef<HTMLDivElement | null>(null);
+  const qaTriggerRef = useRef<HTMLButtonElement | null>(null);
   const [selection, setSelection] = useState("");
   const [qaQuestion, setQaQuestion] = useState<string | null>(null);
   const qaOpenRef = useRef(false);
@@ -146,6 +147,7 @@ export function EditorSurface({ doc }: EditorSurfaceProps) {
           {selection !== "" && qaQuestion === null && (
             <button
               type="button"
+              ref={qaTriggerRef}
               className={styles.qaFloating}
               data-testid="qa-floating-button"
               // preventDefault keeps the DOM selection alive through the
@@ -163,14 +165,18 @@ export function EditorSurface({ doc }: EditorSurfaceProps) {
           )}
         </div>
       ) : (
-        // biome-ignore lint/a11y/noStaticElementInteractions: click delegation on rendered markdown; the interactive targets are wikilink anchors, which packages/ui renders without href (not focusable, so a keyboard handler here would be dead code)
-        // biome-ignore lint/a11y/useKeyWithClickEvents: same delegation container, see noStaticElementInteractions above
+        // biome-ignore lint/a11y/noStaticElementInteractions: click delegation on rendered markdown; the interactive targets are native wikilink anchors with Space handling in packages/ui
+        // biome-ignore lint/a11y/useKeyWithClickEvents: same delegation container; wikilinks re-dispatch keyboard activation as real clicks, so a keydown handler here would double-fire
         <div className={styles.preview} onClick={onPreviewClick}>
           <MarkdownView content={content} />
         </div>
       )}
       {qaQuestion !== null && (
-        <QaOverlay question={qaQuestion} onClose={() => setQaQuestion(null)} />
+        <QaOverlay
+          question={qaQuestion}
+          onClose={() => setQaQuestion(null)}
+          triggerRef={qaTriggerRef}
+        />
       )}
     </div>
   );

@@ -6,6 +6,10 @@
   "exports": {
     ".": "./src/index.ts"
   },
+  "files": [
+    "src",
+    "THIRD_PARTY_LICENSES.md"
+  ],
   "scripts": {
     "test": "bun test",
     "typecheck": "tsc --noEmit"
@@ -13,6 +17,7 @@
   "dependencies": {
     "@react-sigma/core": "5.0.6",
     "@shikijs/rehype": "4.4.3",
+    "@skb/api-client": "workspace:*",
     "graphology": "0.26.0",
     "openapi-fetch": "0.17.0",
     "react": "19.2.8",

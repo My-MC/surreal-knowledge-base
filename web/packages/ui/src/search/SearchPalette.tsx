@@ -1,7 +1,9 @@
 import {
   type ChangeEvent,
   type KeyboardEvent as ReactKeyboardEvent,
+  useCallback,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
 } from "react";
@@ -56,20 +58,27 @@ export function SearchPalette({
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  // Re-sync when the parent drives the state.
-  useEffect(() => {
-    setIsOpen(open);
-  }, [open]);
+  const invalidateSearch = useCallback((): void => {
+    seqRef.current += 1;
+    if (timerRef.current !== null) {
+      clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
+  }, []);
 
-  // Fresh query state per open; drop a pending debounce on close.
+  // Re-sync when the parent drives the state.
+  useLayoutEffect(() => {
+    if (!open) invalidateSearch();
+    setIsOpen(open);
+  }, [open, invalidateSearch]);
+
+  // Fresh query state per open; on close, invalidate any in-flight search and
+  // drop a pending debounce so stale results can never land after close.
   useEffect(() => {
     if (isOpen) {
       setQuery("");
       setHits([]);
       setSelected(0);
-    } else if (timerRef.current !== null) {
-      clearTimeout(timerRef.current);
-      timerRef.current = null;
     }
   }, [isOpen]);
 
@@ -86,18 +95,20 @@ export function SearchPalette({
         event.preventDefault();
         if (event.repeat) return;
         const next = !isOpenRef.current;
+        if (!next) invalidateSearch();
         setIsOpen(next);
         if (!next) onCloseRef.current();
         return;
       }
       if (event.key === "Escape" && isOpenRef.current) {
+        invalidateSearch();
         setIsOpen(false);
         onCloseRef.current();
       }
     };
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
-  }, []);
+  }, [invalidateSearch]);
 
   useEffect(() => {
     return () => {
@@ -120,8 +131,10 @@ export function SearchPalette({
 
   const onInputChange = (event: ChangeEvent<HTMLInputElement>) => {
     const value = event.target.value;
+    // Invalidate any in-flight search before the state transition: its
+    // results belong to the previous input and must never reach setHits.
+    invalidateSearch();
     setQuery(value);
-    if (timerRef.current !== null) clearTimeout(timerRef.current);
     if (value === "") {
       setHits([]);
       return;
@@ -133,6 +146,7 @@ export function SearchPalette({
   };
 
   const selectHit = (hit: SearchHit): void => {
+    invalidateSearch();
     onSelectRef.current(hit);
     setIsOpen(false);
     onCloseRef.current();

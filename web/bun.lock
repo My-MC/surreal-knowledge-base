@@ -48,8 +48,13 @@
         "openapi-fetch": "0.17.0",
       },
       "devDependencies": {
+        "@types/react": "19.2.18",
         "openapi-typescript": "7.13.0",
+        "react": "19.2.8",
         "typescript": "7.0.2",
+      },
+      "peerDependencies": {
+        "react": "^19.0.0",
       },
     },
     "packages/ui": {
@@ -58,6 +63,7 @@
       "dependencies": {
         "@react-sigma/core": "5.0.6",
         "@shikijs/rehype": "4.4.3",
+        "@skb/api-client": "workspace:*",
         "graphology": "0.26.0",
         "openapi-fetch": "0.17.0",
         "react": "19.2.8",
