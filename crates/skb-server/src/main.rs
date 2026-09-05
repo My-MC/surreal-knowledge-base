@@ -59,11 +59,11 @@ async fn run(cli: Cli) -> Result<(), SkbError> {
 
     let host = state.server_cfg.host.clone();
     let port = state.server_cfg.port;
-    let addr = format!("{host}:{port}");
-    // Bind BEFORE printing so the announced port is already accepting.
-    let listener = tokio::net::TcpListener::bind(&addr)
+    // Bind via the (host, port) pair, not a pre-joined string: "addr:port"
+    // stringification breaks IPv6 literals (`::1:0` is not a socket address).
+    let listener = tokio::net::TcpListener::bind((host.as_str(), port))
         .await
-        .map_err(|e| SkbError::new(ErrorCode::Io, format!("bind {addr}: {e}")))?;
+        .map_err(|e| SkbError::new(ErrorCode::Io, format!("bind {host}:{port}: {e}")))?;
     let bound_port = listener
         .local_addr()
         .map_err(|e| SkbError::new(ErrorCode::Io, format!("local_addr: {e}")))?
