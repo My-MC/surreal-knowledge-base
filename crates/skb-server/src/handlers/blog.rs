@@ -19,7 +19,9 @@ use crate::auth::AuthUser;
 use crate::dto::ErrorResponse;
 use crate::error::ApiError;
 
-const DOC_APP_SQL: &str = "SELECT metadata FROM document WHERE id = type::record('document', $key)";
+const POST_AUTHOR_SQL: &str =
+    "SELECT author.email AS author_email FROM blog_post \
+     WHERE document = type::record('document', $key) LIMIT 1";
 const AUTHOR_ID_SQL: &str = "SELECT meta::id(id) AS user_key FROM user WHERE email = $email";
 const CREATE_POST_SQL: &str =
     "CREATE blog_post SET document = type::record('document', $doc_key), \
@@ -46,25 +48,28 @@ fn document_key(id: &str) -> &str {
     id.split_once(':').map(|(_, key)| key).unwrap_or(id)
 }
 
-/// Whether the document's flexible metadata marks it as a blog post
-/// (`metadata.app == "blog"`). A missing document yields `false`; the
-/// caller's subsequent core call owns the 404.
-pub async fn document_is_blog(state: &AppState, document_id: &str) -> Result<bool, ApiError> {
+/// Email of the author owning the blog_post row for a document, or `None`
+/// when the document has no registry row. The registry is the single source
+/// of truth for "is this a blog document" — the flexible `metadata.app`
+/// marker is advisory and can be dropped by a later PUT.
+pub async fn blog_post_author(
+    state: &AppState,
+    document_id: &str,
+) -> Result<Option<String>, ApiError> {
     let mut r = state
         .kb
         .db()
         .db
-        .query(DOC_APP_SQL)
+        .query(POST_AUTHOR_SQL)
         .bind(("key", document_key(document_id).to_string()))
         .await
-        .map_err(db_err("doc metadata"))?;
-    let rows: Vec<Value> = r.take(0).map_err(db_err("doc metadata take"))?;
+        .map_err(db_err("blog_post author"))?;
+    let rows: Vec<Value> = r.take(0).map_err(db_err("blog_post author take"))?;
     Ok(rows
         .first()
-        .and_then(|row| row.get("metadata"))
-        .and_then(|meta| meta.get("app"))
+        .and_then(|row| row.get("author_email"))
         .and_then(Value::as_str)
-        == Some("blog"))
+        .map(str::to_string))
 }
 
 /// Create the `blog_post` registry row for a freshly uploaded blog document

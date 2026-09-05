@@ -172,7 +172,9 @@ pub async fn get_document(
 ///
 /// `force` is never honored on PUT: `force=true` upserts in place (keeping
 /// the id), and the subsequent old-id delete would destroy the just-updated
-/// document.
+/// document. Documents with a `blog_post` registry row are author-owned:
+/// their owning author must hold the session, and a minted replacement id
+/// inherits the registry row.
 #[utoipa::path(
     put,
     path = "/api/documents/{id}",
@@ -181,6 +183,8 @@ pub async fn get_document(
     responses(
         (status = 200, description = "Current document id after the update", body = UpdateDocumentResponse),
         (status = 400, description = "Invalid upload request", body = ErrorResponse),
+        (status = 401, description = "Blog document without its author session", body = ErrorResponse),
+        (status = 403, description = "Blog document owned by a different author", body = ErrorResponse),
         (status = 404, description = "Document not found", body = ErrorResponse),
         (status = 415, description = "Unsupported source format", body = ErrorResponse),
         (status = 500, description = "Server fault", body = ErrorResponse),
@@ -188,6 +192,7 @@ pub async fn get_document(
 )]
 pub async fn update_document(
     State(state): State<AppState>,
+    auth: OptionalAuth,
     Path(id): Path<String>,
     Json(req): Json<UploadDocumentRequest>,
 ) -> Result<Json<UpdateDocumentResponse>, ApiError> {
@@ -200,14 +205,21 @@ pub async fn update_document(
             include_chunks: None,
         })
         .await?;
-    // Blog registry state must be read before the old document is deleted.
-    let was_blog = blog::document_is_blog(&state, &old.id).await?;
+    // Authorization rides on the blog_post registry (the single source of
+    // truth), read BEFORE the old document is deleted: replacing a blog
+    // document requires its owning author, and the same lookup decides
+    // whether a minted replacement id must inherit the registry row.
+    let post_author = blog::blog_post_author(&state, &old.id).await?;
+    let owner = match &post_author {
+        Some(email) => Some(require_blog_owner(auth, email)?),
+        None => None,
+    };
     let mut core_req = UploadRequest::from(req);
     core_req.force = None;
     let result = state.kb.upload(core_req).await?;
     let document_id = match result.document_id {
         Some(new_id) if new_id != id => {
-            if was_blog {
+            if post_author.is_some() {
                 blog::migrate_blog_post(&state, &old.id, &new_id).await?;
             }
             state
@@ -225,28 +237,51 @@ pub async fn update_document(
     Ok(Json(UpdateDocumentResponse { document_id }))
 }
 
-/// Delete a document and its chunks. Responds 204 with no body. The
-/// `blog_post` registry row (if any) is dropped first so the published-post
-/// listing never references a deleted document; the targeted delete is a
-/// no-op for documents without a post.
+/// Author-only gate for documents that carry a `blog_post` registry row:
+/// missing/invalid tokens and non-author roles get 401 (same generic shape
+/// as every other auth failure), a different author gets 403.
+fn require_blog_owner(auth: OptionalAuth, owner_email: &str) -> Result<crate::auth::AuthUser, ApiError> {
+    let user = auth.0?.require_author()?;
+    if user.email != owner_email {
+        return Err(ApiError::with_status(
+            SkbError::new(
+                ErrorCode::Validation,
+                "only the blog post's author may modify or delete it",
+            ),
+            StatusCode::FORBIDDEN,
+        ));
+    }
+    Ok(user)
+}
+
+/// Delete a document and its chunks. Responds 204 with no body. Documents
+/// with a `blog_post` registry row are author-owned (their owning author
+/// must hold the session); the registry row is dropped first so the
+/// published-post listing never references a deleted document.
 #[utoipa::path(
     delete,
     path = "/api/documents/{id}",
     params(("id" = String, Path, description = "Document record id (`document:<key>`)")),
     responses(
         (status = 204, description = "Document deleted"),
+        (status = 401, description = "Blog document without its author session", body = ErrorResponse),
+        (status = 403, description = "Blog document owned by a different author", body = ErrorResponse),
         (status = 404, description = "Document not found", body = ErrorResponse),
         (status = 500, description = "Server fault", body = ErrorResponse),
     )
 )]
 pub async fn delete_document(
     State(state): State<AppState>,
+    auth: OptionalAuth,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    // Unconditional: a PUT can migrate a post onto a replacement document
-    // whose metadata no longer carries app=blog, so the metadata marker is
-    // not a reliable existence test. A missing document still surfaces as
-    // the core-owned 404 below.
+    // The registry read happens BEFORE the delete: the blog_post row is the
+    // single source of truth for authorship, and the unconditional
+    // registry delete below also covers PUT-migrated successors whose
+    // metadata no longer carries app=blog.
+    if let Some(owner_email) = blog::blog_post_author(&state, &id).await? {
+        require_blog_owner(auth, &owner_email)?;
+    }
     blog::delete_blog_post(&state, &id).await?;
     state
         .kb
