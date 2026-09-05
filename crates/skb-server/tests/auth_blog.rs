@@ -304,6 +304,31 @@ async fn unset_jwt_secret_degrades_auth_paths_but_not_public_routes() {
     assert_eq!(posts.body, json!([]));
 }
 
+/// Given: two concurrent registrations with the same email.
+/// When:  both pass the pre-lookup and race the unique index.
+/// Then:  exactly one 201 and one 409 — the index violation maps to the
+///        documented 409 contract, never to a 500.
+#[tokio::test]
+async fn concurrent_duplicate_registration_yields_one_201_and_one_409() {
+    let _secret = EnvGuard::set(SECRET);
+    let _no_authors = EnvGuard::remove_key("SKB_SERVER_AUTHOR_EMAILS");
+    let (router, _db) = setup().await;
+
+    let (first, second) = tokio::join!(
+        register(&router, "race@example.com", "pw"),
+        register(&router, "race@example.com", "pw"),
+    );
+    let mut statuses = [first.status, second.status];
+    statuses.sort();
+    assert_eq!(
+        statuses,
+        [StatusCode::CREATED, StatusCode::CONFLICT],
+        "first: {} / second: {}",
+        first.body,
+        second.body
+    );
+}
+
 /// Given: SKB_SERVER_JWT_SECRET is set but shorter than 32 characters.
 /// When:  calling an authenticated path.
 /// Then:  503 E_CONFIG — weak secrets must not back HS256 sessions.

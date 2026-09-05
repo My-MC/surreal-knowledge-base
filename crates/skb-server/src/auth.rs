@@ -75,6 +75,26 @@ fn unauthorized(message: &'static str) -> ApiError {
     )
 }
 
+/// 409 `E_VALIDATION` — the email lost the unique-index race (or was
+/// pre-emptively found in the store).
+fn duplicate_email() -> ApiError {
+    ApiError::with_status(
+        SkbError::new(ErrorCode::Validation, "email already registered"),
+        StatusCode::CONFLICT,
+    )
+}
+
+/// The user-email unique index violation (CWE fix for concurrent
+/// registrations losing the race) maps to the documented 409, not 500. The
+/// violation can surface on the CREATE query itself or on result extraction.
+fn register_create_error(context: &'static str, e: impl std::fmt::Display) -> ApiError {
+    if e.to_string().contains("user_email_unique") {
+        duplicate_email()
+    } else {
+        ApiError::from(SkbError::new(ErrorCode::Db, format!("{context}: {e}")))
+    }
+}
+
 /// Comma-separated emails granted the `author` role at registration
 /// (`SKB_SERVER_AUTHOR_EMAILS`). The only path to an author role — public
 /// registration otherwise always mints `reader`.
@@ -243,10 +263,7 @@ pub async fn register(
         .take(0)
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("register lookup take: {e}")))?;
     if !taken.is_empty() {
-        return Err(ApiError::with_status(
-            SkbError::new(ErrorCode::Validation, "email already registered"),
-            StatusCode::CONFLICT,
-        ));
+        return Err(duplicate_email());
     }
 
     // Argon2id v19 defaults; the random salt is generated internally.
@@ -263,10 +280,15 @@ pub async fn register(
         .bind(("hash", hash))
         .bind(("role", role))
         .await
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("register create: {e}")))?;
+        .map_err(|e| {
+            // A concurrent registration can pass the pre-lookup and then lose
+            // the unique-index race inside CREATE; surface that as 409
+            // instead of the default 500.
+            register_create_error("register create", e)
+        })?;
     let _created: Vec<Value> = r
         .take(0)
-        .map_err(|e| SkbError::new(ErrorCode::Db, format!("register create take: {e}")))?;
+        .map_err(|e| register_create_error("register create take", e))?;
     Ok((
         StatusCode::CREATED,
         Json(AuthResponse {
