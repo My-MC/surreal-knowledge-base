@@ -97,7 +97,9 @@ fn register_create_error(context: &'static str, e: impl std::fmt::Display) -> Ap
 
 /// Comma-separated emails granted the `author` role at registration
 /// (`SKB_SERVER_AUTHOR_EMAILS`). The only path to an author role — public
-/// registration otherwise always mints `reader`.
+/// registration otherwise always mints `reader`. An entry of `@domain`
+/// grants every email at that domain (dynamic per-run addresses, e.g. the
+/// E2E harness); the `@` boundary keeps suffix collisions impossible.
 fn author_allowlist() -> Vec<String> {
     std::env::var("SKB_SERVER_AUTHOR_EMAILS")
         .map(|raw| {
@@ -108,6 +110,17 @@ fn author_allowlist() -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Exact-email or `@domain` allowlist matching. A domain entry needs a
+/// non-empty local part.
+fn allowlisted(allowed: &str, email: &str) -> bool {
+    match allowed.strip_prefix('@') {
+        Some(_) => email
+            .strip_suffix(allowed)
+            .is_some_and(|local| !local.is_empty()),
+        None => allowed == email,
+    }
 }
 
 fn jwt_secret() -> Result<String, ApiError> {
@@ -245,7 +258,10 @@ pub async fn register(
             "email and password must not be empty",
         )));
     }
-    let role = if author_allowlist().iter().any(|allowed| allowed == &email) {
+    let role = if author_allowlist()
+        .iter()
+        .any(|allowed| allowlisted(allowed, &email))
+    {
         "author"
     } else {
         "reader"

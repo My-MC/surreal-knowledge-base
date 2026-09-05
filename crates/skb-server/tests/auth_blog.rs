@@ -533,3 +533,26 @@ async fn put_migrates_blog_post_and_delete_removes_it() {
         listed.body
     );
 }
+
+/// Given: the allowlist grants an entire domain (`@example.com`).
+/// When:  an email at that domain registers (and one outside it).
+/// Then:  the in-domain email becomes an author; the other stays a reader.
+#[tokio::test]
+async fn author_allowlist_supports_domain_entries() {
+    let _secret = EnvGuard::set(SECRET);
+    let _authors = EnvGuard::set_key("SKB_SERVER_AUTHOR_EMAILS", "@example.com");
+    let (router, _db) = setup().await;
+
+    let insider = register(&router, "dynamic-42@example.com", "pw").await;
+    assert_eq!(
+        insider.status,
+        StatusCode::CREATED,
+        "insider: {}",
+        insider.body
+    );
+    assert_eq!(insider.body["role"], "author");
+
+    let outsider = register(&router, "stranger@elsewhere.org", "pw").await;
+    assert_eq!(outsider.status, StatusCode::CREATED);
+    assert_eq!(outsider.body["role"], "reader");
+}
