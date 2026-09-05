@@ -534,27 +534,37 @@ async fn put_migrates_blog_post_and_delete_removes_it() {
     );
 }
 
-/// Given: the allowlist grants an entire domain (`@example.com`).
-/// When:  an email at that domain registers (and one outside it).
-/// Then:  the in-domain email becomes an author; the other stays a reader.
+/// Given: the allowlist holds one exact email plus a domain-form entry.
+/// When:  the allowlisted email registers, and a sibling email at the same
+///        domain.
+/// Then:  only the exact email becomes an author — a domain-form entry grants
+///        nothing, so a client cannot self-claim an author role by choosing
+///        any address under an operator's domain (CWE-269).
 #[tokio::test]
-async fn author_allowlist_supports_domain_entries() {
+async fn author_allowlist_matches_exact_emails_only() {
     let _secret = EnvGuard::set(SECRET);
-    let _authors = EnvGuard::set_key("SKB_SERVER_AUTHOR_EMAILS", "@example.com");
+    let _authors = EnvGuard::set_key(
+        "SKB_SERVER_AUTHOR_EMAILS",
+        "author@example.com,@example.com",
+    );
     let (router, _db) = setup().await;
 
-    let insider = register(&router, "dynamic-42@example.com", "pw").await;
+    let listed = register(&router, "author@example.com", "pw").await;
     assert_eq!(
-        insider.status,
+        listed.status,
         StatusCode::CREATED,
-        "insider: {}",
-        insider.body
+        "listed: {}",
+        listed.body
     );
-    assert_eq!(insider.body["role"], "author");
+    assert_eq!(listed.body["role"], "author");
 
-    let outsider = register(&router, "stranger@elsewhere.org", "pw").await;
-    assert_eq!(outsider.status, StatusCode::CREATED);
-    assert_eq!(outsider.body["role"], "reader");
+    let claimer = register(&router, "attacker@example.com", "pw").await;
+    assert_eq!(claimer.status, StatusCode::CREATED);
+    assert_eq!(
+        claimer.body["role"], "reader",
+        "a domain-form entry must not grant author: {}",
+        claimer.body
+    );
 }
 
 /// Given: an author with a valid session cookie.
