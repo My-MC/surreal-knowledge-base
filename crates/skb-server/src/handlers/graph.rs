@@ -35,6 +35,18 @@ pub async fn expand_search(
     State(state): State<AppState>,
     Json(req): Json<ExpandRequest>,
 ) -> Result<Json<ExpandResponse>, ApiError> {
+    // max_expand feeds the traversal's hop loop; without this bound a single
+    // request could drive an unbounded walk. Reject early with the shared
+    // 400 contract instead of clamping silently.
+    if req.max_expand > skb_core::search::MAX_GRAPH_EXPAND {
+        return Err(ApiError::new(SkbError::new(
+            ErrorCode::Validation,
+            format!(
+                "max_expand must be at most {}",
+                skb_core::search::MAX_GRAPH_EXPAND
+            ),
+        )));
+    }
     let hits: Vec<skb_core::search::SearchHit> = req.hits.into_iter().map(Into::into).collect();
     let (expanded, entity_origins) =
         expand_search_hits(state.kb.db(), &hits, req.max_expand).await?;
