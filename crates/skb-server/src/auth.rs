@@ -299,7 +299,7 @@ pub async fn register(
 }
 
 /// Login with email + password; success sets the `skb_session` JWT cookie
-/// (HttpOnly, SameSite=Lax, Path=/) valid for 24 hours.
+/// (Secure, HttpOnly, SameSite=Lax, Path=/) valid for 24 hours.
 #[utoipa::path(
     post,
     path = "/api/auth/login",
@@ -348,7 +348,7 @@ pub async fn login(
         .map_err(|_| invalid())?;
 
     let token = issue_token(&email, &role, &secret)?;
-    let cookie = format!("{SESSION_COOKIE_PREFIX}{token}; HttpOnly; SameSite=Lax; Path=/");
+    let cookie = format!("{SESSION_COOKIE_PREFIX}{token}; Secure; HttpOnly; SameSite=Lax; Path=/");
     Ok((
         StatusCode::OK,
         [(header::SET_COOKIE, cookie)],

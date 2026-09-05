@@ -137,6 +137,7 @@ fn session_cookie(response: &TestResponse) -> String {
         raw.contains("SameSite=Lax"),
         "cookie must be SameSite=Lax: {raw}"
     );
+    assert!(raw.contains("Secure"), "cookie must be Secure: {raw}");
     raw.split(';').next().unwrap().to_string()
 }
 
