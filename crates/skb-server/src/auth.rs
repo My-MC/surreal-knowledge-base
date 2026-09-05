@@ -105,22 +105,33 @@ fn register_create_error(context: &'static str, e: impl std::fmt::Display) -> Ap
     }
 }
 
-/// Exact emails granted the `author` role at registration
-/// (`SKB_SERVER_AUTHOR_EMAILS`). The only path to an author role — public
-/// registration otherwise always mints `reader`. Entries match whole: no
-/// domain or suffix forms, because a client-supplied email claiming anything
-/// coarser than an exact operator-listed address is an unverified privilege
-/// self-grant (CWE-269).
-fn author_allowlist() -> Vec<String> {
-    std::env::var("SKB_SERVER_AUTHOR_EMAILS")
+/// Author invites (`SKB_SERVER_AUTHOR_INVITES`): comma-separated
+/// `email:token` pairs. Registration is public and always mints `reader`
+/// unless the request presents the token configured for an exact email —
+/// registration never verifies email ownership, so any coarser grant (client
+/// roles, domain or suffix forms, or a bare allowlist) would let an
+/// unverified caller self-grant `author` (CWE-269). Entries with an empty
+/// token are ignored: an operator cannot mint a tokenless invite by
+/// accident.
+fn author_invites() -> Vec<(String, String)> {
+    std::env::var("SKB_SERVER_AUTHOR_INVITES")
         .map(|raw| {
             raw.split(',')
                 .map(str::trim)
-                .filter(|entry| !entry.is_empty())
-                .map(str::to_string)
+                .filter_map(|entry| entry.split_once(':'))
+                .filter(|(email, token)| !email.is_empty() && !token.is_empty())
+                .map(|(email, token)| (email.to_string(), token.to_string()))
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Constant-time invite comparison: token bytes never reach a timing oracle
+/// on the HTTP path (a length mismatch short-circuits first — only the
+/// token's length leaks, which is not the secret).
+fn invite_matches(provided: &str, expected: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    provided.len() == expected.len() && bool::from(provided.as_bytes().ct_eq(expected.as_bytes()))
 }
 
 fn jwt_secret() -> Result<String, ApiError> {
@@ -257,9 +268,10 @@ impl FromRequestParts<AppState> for OptionalAuth {
 }
 
 /// Register a user (Argon2id hash; duplicate email → 409). The role is
-/// server-decided: emails on the `SKB_SERVER_AUTHOR_EMAILS` allowlist
-/// register as `author`, everyone else as `reader` — public registration
-/// must never mint privileges from unauthenticated client input.
+/// server-decided and public registration always mints `reader` unless the
+/// request presents the invite token listed for the email in
+/// `SKB_SERVER_AUTHOR_INVITES` — never privileges from unauthenticated
+/// client input (CWE-269).
 #[utoipa::path(
     post,
     path = "/api/auth/register",
@@ -282,10 +294,11 @@ pub async fn register(
             "email and password must not be empty",
         )));
     }
-    let role = if author_allowlist().iter().any(|allowed| allowed == &email) {
-        "author"
-    } else {
-        "reader"
+    let role = match author_invites().iter().find(|(listed, _)| listed == &email) {
+        Some((_, expected)) if invite_matches(req.invite.as_deref().unwrap_or(""), expected) => {
+            "author"
+        }
+        _ => "reader",
     };
 
     let mut r = state

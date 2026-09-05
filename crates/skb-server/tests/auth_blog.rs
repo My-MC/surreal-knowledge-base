@@ -124,8 +124,32 @@ async fn login(router: &axum::Router, email: &str, password: &str) -> TestRespon
     .await
 }
 
-async fn register_and_login(router: &axum::Router, email: &str, password: &str) -> TestResponse {
-    register(router, email, password).await;
+async fn register_with_invite(
+    router: &axum::Router,
+    email: &str,
+    password: &str,
+    invite: &str,
+) -> TestResponse {
+    send(
+        router.clone(),
+        "POST",
+        "/api/auth/register",
+        Some(json!({"email": email, "password": password, "invite": invite})),
+        &[],
+    )
+    .await
+}
+
+async fn register_and_login(
+    router: &axum::Router,
+    email: &str,
+    password: &str,
+    invite: Option<&str>,
+) -> TestResponse {
+    match invite {
+        Some(token) => register_with_invite(router, email, password, token).await,
+        None => register(router, email, password).await,
+    };
     login(router, email, password).await
 }
 
@@ -190,10 +214,19 @@ async fn list_posts(router: &axum::Router) -> TestResponse {
 #[tokio::test]
 async fn blog_full_flow_hides_until_publish_then_lists() {
     let _secret = EnvGuard::set(SECRET);
-    let _authors = EnvGuard::set_key("SKB_SERVER_AUTHOR_EMAILS", "author@example.com");
+    let _invites = EnvGuard::set_key(
+        "SKB_SERVER_AUTHOR_INVITES",
+        "author@example.com:invite-author-1",
+    );
     let (router, _db) = setup().await;
 
-    let reg = register(&router, "author@example.com", "pw-author").await;
+    let reg = register_with_invite(
+        &router,
+        "author@example.com",
+        "pw-author",
+        "invite-author-1",
+    )
+    .await;
     assert_eq!(reg.status, StatusCode::CREATED, "register: {}", reg.body);
     assert_eq!(reg.body["email"], "author@example.com");
     assert_eq!(reg.body["role"], "author");
@@ -236,7 +269,7 @@ async fn blog_full_flow_hides_until_publish_then_lists() {
 #[tokio::test]
 async fn reader_cookie_is_unauthorized_for_blog_upload() {
     let _secret = EnvGuard::set(SECRET);
-    let _no_authors = EnvGuard::remove_key("SKB_SERVER_AUTHOR_EMAILS");
+    let _no_authors = EnvGuard::remove_key("SKB_SERVER_AUTHOR_INVITES");
     let (router, _db) = setup().await;
 
     let reg = register(&router, "reader@example.com", "pw-reader").await;
@@ -261,7 +294,10 @@ async fn reader_cookie_is_unauthorized_for_blog_upload() {
 #[tokio::test]
 async fn missing_token_is_unauthorized_for_blog_upload_and_publish() {
     let _secret = EnvGuard::set(SECRET);
-    let _authors = EnvGuard::set_key("SKB_SERVER_AUTHOR_EMAILS", "author@example.com");
+    let _invites = EnvGuard::set_key(
+        "SKB_SERVER_AUTHOR_INVITES",
+        "author@example.com:invite-author-1",
+    );
     let (router, _db) = setup().await;
 
     let upload = upload_blog(&router, None, "anon content", "Anon Post").await;
@@ -272,7 +308,7 @@ async fn missing_token_is_unauthorized_for_blog_upload_and_publish() {
         upload.body
     );
 
-    register(&router, "author@example.com", "pw").await;
+    register_with_invite(&router, "author@example.com", "pw", "invite-author-1").await;
     let login = login(&router, "author@example.com", "pw").await;
     let cookie = session_cookie(&login);
     let upload = upload_blog(&router, Some(&cookie), "content", "T").await;
@@ -317,7 +353,7 @@ async fn unset_jwt_secret_degrades_auth_paths_but_not_public_routes() {
 #[tokio::test]
 async fn concurrent_duplicate_registration_yields_one_201_and_one_409() {
     let _secret = EnvGuard::set(SECRET);
-    let _no_authors = EnvGuard::remove_key("SKB_SERVER_AUTHOR_EMAILS");
+    let _no_authors = EnvGuard::remove_key("SKB_SERVER_AUTHOR_INVITES");
     let (router, _db) = setup().await;
 
     let (first, second) = tokio::join!(
@@ -343,15 +379,18 @@ async fn concurrent_duplicate_registration_yields_one_201_and_one_409() {
 #[tokio::test]
 async fn blog_documents_are_owner_only_for_put_and_delete() {
     let _secret = EnvGuard::set(SECRET);
-    let _authors = EnvGuard::set_key(
-        "SKB_SERVER_AUTHOR_EMAILS",
-        "owner@example.com,other@example.com",
+    let _invites = EnvGuard::set_key(
+        "SKB_SERVER_AUTHOR_INVITES",
+        "owner@example.com:tok-owner,other@example.com:tok-other",
     );
     let (router, _db) = setup().await;
 
-    let login = |email: &'static str| register_and_login(&router, email, "pw");
-    let owner_cookie = session_cookie(&login("owner@example.com").await);
-    let other_cookie = session_cookie(&login("other@example.com").await);
+    let owner_cookie = session_cookie(
+        &register_and_login(&router, "owner@example.com", "pw", Some("tok-owner")).await,
+    );
+    let other_cookie = session_cookie(
+        &register_and_login(&router, "other@example.com", "pw", Some("tok-other")).await,
+    );
 
     let upload = upload_blog(&router, Some(&owner_cookie), "owned content", "Owned").await;
     let document_id = upload.body["document_id"].as_str().unwrap().to_string();
@@ -372,7 +411,8 @@ async fn blog_documents_are_owner_only_for_put_and_delete() {
             anonymous.body
         );
 
-        let reader_cookie = session_cookie(&login("reader@example.com").await);
+        let reader_cookie =
+            session_cookie(&register_and_login(&router, "reader@example.com", "pw", None).await);
         let reader = send(
             router.clone(),
             method,
@@ -453,7 +493,7 @@ async fn weak_jwt_secret_is_rejected_like_an_unset_one() {
 #[tokio::test]
 async fn wrong_password_is_401_and_duplicate_email_is_409() {
     let _secret = EnvGuard::set(SECRET);
-    let _no_authors = EnvGuard::remove_key("SKB_SERVER_AUTHOR_EMAILS");
+    let _no_authors = EnvGuard::remove_key("SKB_SERVER_AUTHOR_INVITES");
     let (router, _db) = setup().await;
 
     let reg = register(&router, "dup@example.com", "pw").await;
@@ -484,10 +524,13 @@ async fn wrong_password_is_401_and_duplicate_email_is_409() {
 #[tokio::test]
 async fn put_migrates_blog_post_and_delete_removes_it() {
     let _secret = EnvGuard::set(SECRET);
-    let _authors = EnvGuard::set_key("SKB_SERVER_AUTHOR_EMAILS", "author@example.com");
+    let _invites = EnvGuard::set_key(
+        "SKB_SERVER_AUTHOR_INVITES",
+        "author@example.com:invite-author-1",
+    );
     let (router, _db) = setup().await;
 
-    register(&router, "author@example.com", "pw").await;
+    register_with_invite(&router, "author@example.com", "pw", "invite-author-1").await;
     let login = login(&router, "author@example.com", "pw").await;
     let cookie = session_cookie(&login);
 
@@ -534,36 +577,64 @@ async fn put_migrates_blog_post_and_delete_removes_it() {
     );
 }
 
-/// Given: the allowlist holds one exact email plus a domain-form entry.
-/// When:  the allowlisted email registers, and a sibling email at the same
-///        domain.
-/// Then:  only the exact email becomes an author — a domain-form entry grants
-///        nothing, so a client cannot self-claim an author role by choosing
-///        any address under an operator's domain (CWE-269).
+/// Given: the invite list holds `email:token` pairs (empty tokens ignored).
+/// When:  a listed email registers without a token, with a wrong token, and
+///        with the matching token; an unlisted email registers with a stolen
+///        token.
+/// Then:  only the matching invite mints an author — registration never
+///        verifies email ownership, so a bare or wrong claim must stay a
+///        reader (CWE-269).
 #[tokio::test]
-async fn author_allowlist_matches_exact_emails_only() {
+async fn author_role_requires_the_matching_invite_token() {
     let _secret = EnvGuard::set(SECRET);
-    let _authors = EnvGuard::set_key(
-        "SKB_SERVER_AUTHOR_EMAILS",
-        "author@example.com,@example.com",
+    let _invites = EnvGuard::set_key(
+        "SKB_SERVER_AUTHOR_INVITES",
+        "listed@example.com:invite-token-0123456789,wrong@listed.example:,,,also@listed.example:x",
     );
     let (router, _db) = setup().await;
 
-    let listed = register(&router, "author@example.com", "pw").await;
+    let bare = register(&router, "listed@example.com", "pw").await;
+    assert_eq!(bare.status, StatusCode::CREATED, "bare: {}", bare.body);
     assert_eq!(
-        listed.status,
-        StatusCode::CREATED,
-        "listed: {}",
-        listed.body
+        bare.body["role"], "reader",
+        "a bare email claim must stay a reader: {}",
+        bare.body
     );
-    assert_eq!(listed.body["role"], "author");
 
-    let claimer = register(&router, "attacker@example.com", "pw").await;
-    assert_eq!(claimer.status, StatusCode::CREATED);
+    let wrong = register_with_invite(
+        &router,
+        "wrong@listed.example",
+        "pw",
+        "invite-token-0123456789",
+    )
+    .await;
+    assert_eq!(wrong.status, StatusCode::CREATED);
     assert_eq!(
-        claimer.body["role"], "reader",
-        "a domain-form entry must not grant author: {}",
-        claimer.body
+        wrong.body["role"], "reader",
+        "the wrong token must stay a reader: {}",
+        wrong.body
+    );
+
+    let unlisted = register_with_invite(
+        &router,
+        "stranger@elsewhere.org",
+        "pw",
+        "invite-token-0123456789",
+    )
+    .await;
+    assert_eq!(unlisted.status, StatusCode::CREATED);
+    assert_eq!(
+        unlisted.body["role"], "reader",
+        "a token for another email must not carry over: {}",
+        unlisted.body
+    );
+
+    let invited = register_with_invite(&router, "also@listed.example", "pw", "x").await;
+    assert_eq!(invited.status, StatusCode::CREATED);
+    assert_eq!(
+        invited.body["role"], "author",
+        "the matching invite mints an author: {}",
+        invited.body
     );
 }
 
@@ -575,10 +646,10 @@ async fn author_allowlist_matches_exact_emails_only() {
 #[tokio::test]
 async fn logout_revokes_the_token_and_clears_the_cookie() {
     let _secret = EnvGuard::set(SECRET);
-    let _authors = EnvGuard::set_key("SKB_SERVER_AUTHOR_EMAILS", "logout@example.com");
+    let _invites = EnvGuard::set_key("SKB_SERVER_AUTHOR_INVITES", "logout@example.com:tok-logout");
     let (router, _db) = setup().await;
 
-    let registered = register(&router, "logout@example.com", "pw").await;
+    let registered = register_with_invite(&router, "logout@example.com", "pw", "tok-logout").await;
     assert_eq!(registered.body["role"], "author");
     let login_response = login(&router, "logout@example.com", "pw").await;
     let cookie = session_cookie(&login_response);

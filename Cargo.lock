@@ -5524,6 +5524,7 @@ dependencies = [
  "serde",
  "serde_json",
  "skb-core",
+ "subtle",
  "tokio",
  "tokio-stream",
  "toml",
@@ -5533,6 +5534,7 @@ dependencies = [
  "tracing-subscriber",
  "utoipa",
  "utoipa-swagger-ui",
+ "uuid",
  "validator",
  "wiremock",
 ]
