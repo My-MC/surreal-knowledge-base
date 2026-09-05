@@ -19,8 +19,7 @@ use crate::auth::AuthUser;
 use crate::dto::ErrorResponse;
 use crate::error::ApiError;
 
-const POST_OWNER_SQL: &str =
-    "SELECT author.email AS author_email, published FROM blog_post \
+const POST_OWNER_SQL: &str = "SELECT author.email AS author_email, published FROM blog_post \
      WHERE document = type::record('document', $key) LIMIT 1";
 const AUTHOR_ID_SQL: &str = "SELECT meta::id(id) AS user_key FROM user WHERE email = $email";
 const CREATE_POST_SQL: &str =

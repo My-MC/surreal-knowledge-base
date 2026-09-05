@@ -63,9 +63,7 @@ pub async fn create_document(
     };
     let result = state.kb.upload(req.into()).await?;
     if let (Some(user), Some(document_id)) = (author, result.document_id.clone()) {
-        if let Err(e) =
-            blog::create_blog_post(&state, &document_id, &user.email, false).await
-        {
+        if let Err(e) = blog::create_blog_post(&state, &document_id, &user.email, false).await {
             // Compensate: roll the just-ingested document back so the store
             // holds no registry-less blog content and a client retry starts
             // clean. If even the compensation fails, the original error
@@ -280,7 +278,10 @@ pub async fn update_document(
 /// Author-only gate for documents that carry a `blog_post` registry row:
 /// missing/invalid tokens and non-author roles get 401 (same generic shape
 /// as every other auth failure), a different author gets 403.
-fn require_blog_owner(auth: OptionalAuth, owner_email: &str) -> Result<crate::auth::AuthUser, ApiError> {
+fn require_blog_owner(
+    auth: OptionalAuth,
+    owner_email: &str,
+) -> Result<crate::auth::AuthUser, ApiError> {
     let user = auth.0?.require_author()?;
     if user.email != owner_email {
         return Err(ApiError::with_status(

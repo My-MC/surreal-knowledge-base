@@ -200,9 +200,7 @@ impl LlmStream {
             }
             match self.response.chunk().await {
                 Ok(Some(chunk)) => {
-                    if self.buffer.len() + chunk.len() > MAX_SSE_FRAME
-                        && !chunk.contains(&b'\n')
-                    {
+                    if self.buffer.len() + chunk.len() > MAX_SSE_FRAME && !chunk.contains(&b'\n') {
                         self.finished = true;
                         return Err(LlmError::Protocol(format!(
                             "SSE frame exceeds {MAX_SSE_FRAME} bytes without a newline"

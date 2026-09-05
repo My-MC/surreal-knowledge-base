@@ -405,7 +405,11 @@ async fn blog_documents_are_owner_only_for_put_and_delete() {
     }
 
     let listed = list_posts(&router).await;
-    assert_eq!(listed.body.as_array().unwrap().len(), 0, "still unpublished");
+    assert_eq!(
+        listed.body.as_array().unwrap().len(),
+        0,
+        "still unpublished"
+    );
 
     // The non-blog knowledge document keeps its public write surface.
     let plain = send(
