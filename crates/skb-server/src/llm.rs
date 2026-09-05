@@ -8,7 +8,7 @@
 //! radius: error bodies and single SSE frames are size-capped, idle chunk
 //! reads time out, and an API key is never sent over plain HTTP.
 
-use reqwest::Client;
+use reqwest::{redirect, Client};
 use serde_json::json;
 use std::fmt;
 use std::time::Duration;
@@ -104,6 +104,16 @@ impl LlmClient {
         let http = Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
             .read_timeout(READ_TIMEOUT)
+            .redirect(redirect::Policy::custom(|attempt| {
+                // A 307/308 replays the POST body — the prompt — at the new
+                // location, so never follow a scheme downgrade to plain
+                // HTTP; bound hops so a redirect loop cannot spin.
+                if attempt.previous().len() >= 5 || attempt.url().scheme() != "https" {
+                    attempt.stop()
+                } else {
+                    attempt.follow()
+                }
+            }))
             .build()
             .map_err(LlmError::Connection)?;
         Ok(Self {
@@ -187,6 +197,12 @@ impl LlmStream {
                 return Ok(None);
             }
             if let Some(pos) = self.buffer.iter().position(|&b| b == b'\n') {
+                if pos > MAX_SSE_FRAME {
+                    self.finished = true;
+                    return Err(LlmError::Protocol(format!(
+                        "SSE line exceeds {MAX_SSE_FRAME} bytes"
+                    )));
+                }
                 let line = String::from_utf8_lossy(&self.buffer[..pos]).into_owned();
                 self.buffer.drain(..=pos);
                 match Self::parse_line(line.trim_end_matches('\r'))? {
@@ -200,13 +216,21 @@ impl LlmStream {
             }
             match self.response.chunk().await {
                 Ok(Some(chunk)) => {
-                    if self.buffer.len() + chunk.len() > MAX_SSE_FRAME && !chunk.contains(&b'\n') {
+                    self.buffer.extend_from_slice(&chunk);
+                    // The trailing (newline-less) segment is the frame being
+                    // accumulated; a newline-terminated giant line is caught
+                    // by the per-line cap in the parse arm above.
+                    let last_newline = self.buffer.iter().rposition(|&b| b == b'\n');
+                    let trailing = match last_newline {
+                        Some(pos) => &self.buffer[pos + 1..],
+                        None => &self.buffer[..],
+                    };
+                    if trailing.len() > MAX_SSE_FRAME {
                         self.finished = true;
                         return Err(LlmError::Protocol(format!(
                             "SSE frame exceeds {MAX_SSE_FRAME} bytes without a newline"
                         )));
                     }
-                    self.buffer.extend_from_slice(&chunk);
                 }
                 Ok(None) => {
                     self.finished = true;

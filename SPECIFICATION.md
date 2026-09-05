@@ -886,7 +886,7 @@ LLM 系環境変数と JWT secret はリクエスト毎に読まれる（テス�
 | 401 | 認証失敗全般（トークン無し/無効/期限切れ、reader ロールによる author 操作、誤認証情報。コードは `E_VALIDATION`、ユーザー列挙防止のためメッセージは汎用） |
 | 403 | `blog_post` を持つ document の PUT/DELETE を別 author が試みた場合（コードは `E_VALIDATION`） |
 | 415 | 非対応ソース形式（`E_UNSUPPORTED_FORMAT`、既定マッピングと同一） |
-| 503 | `SKB_SERVER_JWT_SECRET` 未設定（`E_CONFIG`） |
+| 503 | `SKB_SERVER_JWT_SECRET` 未設定 **または 32 文字未満**（`E_CONFIG`） |
 
 ### 20.6 仕様差異（実装上の決定事項）
 

@@ -34,7 +34,7 @@ async fn run() -> Result<(), SkbError> {
     let mut config = Config::default();
     config.storage.path = db_path.into();
 
-    hold_at_barrier();
+    hold_at_barrier()?;
 
     let db = Db::open(&config).await?;
     let r = db
@@ -51,20 +51,25 @@ async fn run() -> Result<(), SkbError> {
 
 /// With the barrier env set: touch the ready file, then poll-wait for the go
 /// file so both children are parked in front of `Db::open` simultaneously.
-fn hold_at_barrier() {
+/// Failures surface through the normal `error:` + exit-code path.
+fn hold_at_barrier() -> Result<(), SkbError> {
     let (Some(ready), Some(go)) = (
         std::env::var("SKB_SPIKE_READY_FILE").ok(),
         std::env::var("SKB_SPIKE_GO_FILE").ok(),
     ) else {
-        return;
+        return Ok(());
     };
-    std::fs::write(&ready, "ready").expect("write spike ready file");
+    std::fs::write(&ready, "ready")
+        .map_err(|e| SkbError::new(ErrorCode::Io, format!("spike ready file: {e}")))?;
     let deadline = Instant::now() + GO_WAIT_TIMEOUT;
     while !std::path::Path::new(&go).exists() {
         if Instant::now() > deadline {
-            eprintln!("error: spike go file {go} never appeared");
-            std::process::exit(ErrorCode::Config.exit_code());
+            return Err(SkbError::new(
+                ErrorCode::Config,
+                format!("spike go file {go} never appeared"),
+            ));
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+    Ok(())
 }

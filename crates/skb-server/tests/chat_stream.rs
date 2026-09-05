@@ -246,7 +246,12 @@ async fn chat_stream_llm_unreachable_yields_terminal_in_band_error() {
 
 #[tokio::test]
 async fn chat_stream_rejects_oversized_sse_frames() {
-    let oversized = format!("data: x{}\n\n", "a".repeat(200_000));
+    // A VALID OpenAI delta whose single line exceeds the frame cap: the
+    // per-line limit must reject it, not malformed JSON.
+    let oversized = format!(
+        "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{}\"}}}}]}}\n\n",
+        "a".repeat(100_000)
+    );
     let _server = mount_llm(200, &oversized).await;
 
     let (state, db) = test_state().await;
@@ -299,17 +304,42 @@ async fn chat_stream_llm_error_body_is_size_capped() {
     let _ = std::fs::remove_dir_all(db);
 }
 
+/// Restores touched env keys on drop so the test leaves no `SKB_LLM_*`
+/// residue for later suites (the workspace runs with --test-threads=1, which
+/// is what keeps concurrent env access out of scope).
+struct EnvGuard(Vec<(&'static str, Option<String>)>);
+
+impl EnvGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let old = std::env::var(key).ok();
+        std::env::set_var(key, value);
+        Self(vec![(key, old)])
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (key, old) in self.0.drain(..) {
+            match old {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
 /// Given: SKB_LLM_API_KEY set and SKB_LLM_BASE_URL on plain http.
 /// When:  resolving the LLM client.
 /// Then:  E_LLM_CONFIG — bearer tokens and prompts never travel cleartext.
 #[tokio::test]
 async fn llm_api_key_rejects_http_base_url() {
-    std::env::set_var("SKB_LLM_API_KEY", "secret-token");
-    std::env::set_var("SKB_LLM_BASE_URL", "http://127.0.0.1:1/v1");
+    let _env = (
+        EnvGuard::set("SKB_LLM_API_KEY", "secret-token"),
+        EnvGuard::set("SKB_LLM_BASE_URL", "http://127.0.0.1:1/v1"),
+    );
     let err = match skb_server::llm::LlmClient::from_env() {
         Err(err) => err,
         Ok(_) => panic!("http + api key must fail"),
     };
-    std::env::remove_var("SKB_LLM_API_KEY");
     assert_eq!(err.code(), "E_LLM_CONFIG");
 }
