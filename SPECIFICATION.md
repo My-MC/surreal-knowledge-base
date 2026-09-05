@@ -718,11 +718,22 @@ surreal-knowledge-base/
 │   │   └── src/{config,db,ingest,embed,tokenize,search,graph,error}.rs
 │   ├── skb-cli/                  # CLI（clap）
 │   │   └── tests/contract.rs     # 現在のCLI契約テスト
-│   └── skb-mcp/                  # MCP サーバー（rmcp）
+│   ├── skb-mcp/                  # MCP サーバー（rmcp）
+│   └── skb-server/               # HTTP APIサーバー（axum、§20）
+│       ├── src/{api,auth,config,error,llm}.rs
+│       ├── src/dto/              # OpenAPI用サーバー所有DTO
+│       ├── src/handlers/         # documents / search / graph / chat / auth / blog
+│       ├── schema/002_server.surql  # サーバー所有DDL（user / blog_post、起動時冪等適用）
+│       ├── examples/mock_llm.rs  # モックOpenAI互換LLMサーバー（E2E用）
+│       ├── tests/                # 統合 / API E2E / TLSガード
+│       └── SPIKE.md              # マルチプロセスDBロックスパイク（§20.1）
 ├── npm/
 │   ├── package.json              # メタパッケージ
 │   ├── bin/skb-mcp.js            # ラッパ
 │   └── packages/                 # プラットフォーム別パッケージ
+├── web/                          # フロントエンド（本プランで追加）
+│   ├── apps/{vault,studio,blog}/ # 3 SPA（Vite + React）
+│   └── packages/{api-client,ui}/ # OpenAPI型生成クライアント + 共通UI
 ├── skills/
 │   └── surreal-knowledge-base/
 │       └── SKILL.md
@@ -757,3 +768,154 @@ MCP/CLIのゴールデン契約テストとnpm E2E用の専用ディレクトリ
 | 3 | SurrealDB FTS の日本語品質 | keyword/hybrid 精度 | `class` + lowercase を採用。ngram は BM25 の単語・複合語精度を低下させるため不使用 |
 | 4 | bge-m3 初回 DL のサイズ（約 2GB 級） | 初回 UX | `skb doctor` で進捗表示付き事前 DL を案内。量子化版 ONNX の採用も検討 |
 | 5 | PDF 抽出クレートの選定 | v1 スコープ | M1 で `pdf-extract` を検証し不十分なら代替選定 |
+
+---
+
+## 20. HTTP APIサーバー仕様（`skb-server`）
+
+本章はフロントエンド実装仕様書に基づく HTTP API サーバー `skb-server` の実装仕様を定める。ルート定義と OpenAPI ドキュメントの生成は `crates/skb-server/src/api.rs` が正であり、`GET /api/openapi.json`（Swagger UI は `/swagger-ui`）で機械可読な契約を提供する。フロントエンド（`web/`）はこの OpenAPI JSON から型を生成して呼び出す。
+
+### 20.1 プロセスモデルとDB所有権（スパイク結果）
+
+SurrealDB は組込みモード（SurrealKV）で動作するため、DB ファイルの所有者は 1 プロセスに限定される。マルチプロセススパイク（`crates/skb-server/SPIKE.md`、証跡 `target/evidence/01/`）の結果:
+
+- SurrealKv は `<db-path>/LOCK` によるクロスプロセス排他ロックを持つ。同一 `storage.path` への同時オープンは必ず 1 プロセスのみが成功し、敗者はオープン時点で即座に `E_DB`（"LOCK is already locked by another process"、終了コード 3）で失敗する。ブロックもリトライも破損も発生しない。
+- このため **サーバープロセスが単一の DB 所有者** である。`skb-server` は起動時に `KnowledgeBase::open` を 1 回だけ呼び、プロセス生存中は保持し続ける。全 HTTP ハンドラはこの 1 インスタンスを共有し、サーバーはパスを再オープンしない。
+- **サーバー起動中は `skb` CLI / `skb-mcp` が同一 `storage.path` を開いてはならない**。オープンは即座に `E_DB` で失敗する。安全な読み取り専用の同時アクセスモードは存在しない。サーバー停止後は CLI/MCP がスタンドアロンで開いてよい。
+- リクエスト処理中に DB オープンエラーが発生した場合（外部プロセスがロックを奪った等）は `E_DB` 系 → HTTP 500 に写像される（サーバー側のストレージ障害でありクライアントエラーではない）。リトライループは持たず、オペレーターが所有権の競合を解消する。
+- 既知のクセ（スパイク case 3/4、現状受け入れ）: パス要素が通常ファイルで占有されている場合は起動時に `E_DB`。親ディレクトリが存在しない場合は `create_dir_all` により **黙って自動作成される** ため、`skb.toml` の `storage.path` の打ち間違いは起動時に検出されず、誤った場所に新しいストアが生成される。
+
+### 20.2 エンドポイント一覧
+
+認証は `Cookie: skb_session=<JWT>`（優先）または `Authorization: Bearer <JWT>`。「公開」は認証不要を意味する。
+
+| メソッド | パス | 認証 | 成功ステータス | 概要 |
+|---|---|---|---|---|
+| GET | `/api/health` | 公開 | 200 | Liveness プローブ（DB に触れない） |
+| GET | `/api/openapi.json` | 公開 | 200 | OpenAPI ドキュメント（utoipa 生成） |
+| GET | `/swagger-ui` | 公開 | 200 | Swagger UI |
+| POST | `/api/documents` | 公開（注1） | 201 | 取り込み。`metadata.app == "blog"` の場合は author JWT 必須 |
+| GET | `/api/documents` | 公開 | 200 | 一覧。`limit` / `offset` / `order` / `after` カーソル |
+| GET | `/api/documents/{id}` | 公開 | 200 | 詳細。`?include_chunks=true` でチャンク付き |
+| PUT | `/api/documents/{id}` | 公開（注3） | 200 | 内容差し替え（複合操作、本文参照）。レスポンス `{"document_id"}` |
+| DELETE | `/api/documents/{id}` | 公開（注3） | 204 | 削除（レスポンスボディなし） |
+| GET | `/api/documents/{id}/backlinks` | 公開 | 200 | 逆方向 mentions ウォークによるバックリンク（`{documents: [{id, title}]}`） |
+| POST | `/api/search` | 公開 | 200 | 検索（既定 hybrid、透過パススルー）。`{hits, mode, elapsed_ms}` |
+| POST | `/api/search/expand` | 公開 | 200 | 検索ヒットのグラフ拡張。`{hits, entity_origins}`（§20.6-4 の既知制限あり） |
+| POST | `/api/graph/query` | 公開 | 200 | グラフ照会。`depth` 1〜5（範囲外は 400）。`{nodes, edges}` |
+| POST | `/api/chat/stream` | 公開 | 200 | SSE チャット（§20.3） |
+| POST | `/api/auth/register` | 公開（注4） | 201 | ユーザー登録（Argon2id）。email 重複は 409（同時登録の競合も 409） |
+| POST | `/api/auth/login` | 公開 | 200 | ログイン。`Set-Cookie: skb_session=<JWT>` |
+| POST | `/api/auth/logout` | 認証済み | 204 | ログアウト。トークンの jti を `revoked_session` に記録（以後そのトークンは401）し、`Set-Cookie: skb_session=; Max-Age=0` で Cookie を失効させる |
+| GET | `/api/blog/posts` | 公開 | 200 | 公開済み（`published = true`）投稿のみを新着順で返す |
+| POST | `/api/blog/posts/{document_id}/publish` | author | 200 | 公開フラグの設定。author ロール必須 |
+
+注1: `metadata.app == "blog"` を含む `POST /api/documents` は author JWT を要求する（トークン無し・無効・reader ロールは 401、`SKB_SERVER_JWT_SECRET` 未設定・32文字未満は 503）。それ以外のアップロードは認証不要のままである。blog アップロード成功時は `blog_post` レジストリ行（`published = false`、author は JWT の email から解決）が自動作成される。
+
+注3: `blog_post` レジストリ行を持つ document の PUT / DELETE は **その投稿の author 本人のみ** が実行できる（トークン無し・無効・reader ロールは 401、別 author は 403）。レジストリ行の存在が blog 判定の唯一の根拠であり、`metadata.app` は目安に過ぎない（後続 PUT で欠落し得る）。`blog_post` を持たない document（通常の KB 編集、Vault の autosave 含む）は公開のままである。
+
+注4: 登録時のロールはクライアントが選べず、公開登録は**常に `reader`** を発行する。`author` は招待トークン方式のみ: `SKB_SERVER_AUTHOR_INVITES`（カンマ区切りの `email:token` ペア）に登録した email について、リクエストが `invite` フィールドで**一致するトークン**を提示した場合に限り `author` として登録される（トークン比較は定数時間）。email の所有確認がない公開登録では、allowlist 形式（クライアントが email を先に登録すれば効果を持つ）や `@domain` 形式の部分一致は権限の自己付与になるため許可しない（CWE-269）。トークンは運用者が配布する招待情報であり、空トークンのエントリは無効として扱う。動的なアドレスが必要な E2E ハーネスは、サーバー起動前に実行固有の `email:token` ペアを env へ渡す。
+
+注2: `/api/blog/*` はフロントエンド実装仕様書の §API設計表に無い **追加エンドポイント** であり、同書 §Blog の公開範囲管理（`published` フラグ + reader/author ロール）を実現するために設けた。サーバー所有スキーマは `crates/skb-server/schema/002_server.surql`（`user` / `blog_post` テーブル、起動時に冪等適用）。
+
+**PUT の複合動作**: コアに更新 API が無いため、旧ドキュメント取得（404）→ `force` を剥離した 1 回の upload → 応答分岐として実装する。内容が変わった場合（新 id 発行）は `blog_post` 行（レジストリ存在ベースで判定、注3）を新 id へ移行した上で旧ドキュメントを削除し、新 id を返す。同一内容（sha256 一致で `skipped`）の場合は旧ドキュメントを保持し旧 id を返す（ここで削除すると唯一のコピーが失われる）。`force` は PUT では常に無視される。クライアントはレスポンスの `document_id` へ保存済み参照を張り替えること。
+
+**複合操作の補償（compensation）**: コアにレジストリとドキュメントを跨ぐトランザクションは無いため、各複合操作は失敗時に補償して再試行可能な状態へ戻す。(1) blog upload 後のレジストリ作成失敗 → 取り込んだ document を削除してエラー。(2) PUT 中のレジストリ移行失敗 → 後継 document を削除してエラー（旧 document は無傷）。(3) DELETE でレジストリ削減後の document 削除失敗 → 既知の author / published フラグでレジストリ行を復元してエラー。唯一の不可逆ステップ（移行成功後の旧 document 削除）は、レジストリが既に新 id を指すため論理状態は正しく、警告ログとともに成功応答を返す。
+
+**DELETE の blog_post 後片付け**: ドキュメント削除時は `blog_post` 行を無条件に先に削除する。PUT 移行後の後継ドキュメントが `metadata.app=blog` を持たない場合があり、メタデータマーカーは存在判定として信頼できないためである（インデックスバック付きの DELETE で、投稿を持たないドキュメントに対しては no-op）。公開投稿一覧が削除済みドキュメントを参照し続けることを防ぐ。削除対象が `blog_post` を持つ場合は注3 の author 認可を先に要求する。
+
+### 20.3 SSEイベント契約（`POST /api/chat/stream`）
+
+リクエストボディは `{"message": string}`。レスポンスは `text/event-stream` で、イベント順序は次のとおり。
+
+| イベント | データ | 回数 |
+|---|---|---|
+| `citation` | `{"hits": [SearchHit]}`。検索ヒット全件（`document_id` / `title` / `score` / `matched_entities` / `highlights` を含む） | 1 |
+| `token` | `{"text": "..."}` | 0 以上 |
+| `done` | `{}` | 1（正常終了時） |
+| `error` | `{"code": "E_...", "message": "..."}` | 0 または 1（終端） |
+
+- パイプライン: `kb.search`（top_k 6、`graph_expand` は `SKB_CHAT_EXPAND_DEPTH`）→ citation → ヒットチャンクからプロンプト構築（文字ベースのトークン予算、§20.4）→ LLM ストリーミング転送（`choices[0].delta.content`）→ done。
+- **クライアント切断で即座に中止する**: 検索・LLM 接続・フラグメント待機の全ての長時間待機は切断チャネル（`tx.closed()`）と競合し、切断時はパイプラインのタスクと上流 LLM 接続を解放する。
+- 失敗時は `event: error` を送ってストリームを正常終了する。**HTTP ステータスは常に 200**（SSE エラーは in-band であり、ストリームエラーとして送らない）。エラーコードはコアの `E_*` に加え `E_LLM_CONNECTION` / `E_LLM_STATUS` / `E_LLM_PROTOCOL` / `E_LLM_CONFIG`。
+- keep-alive は axum の `KeepAlive::default()`（既定 15 秒間隔のコメント行）。
+- `EventSource` は GET 専用のため使用できない。フロントエンドは `fetch` + `ReadableStream` でパースする専用 hook を `packages/api-client` に置く（フロントエンド実装仕様書 §API設計と同一の方針）。
+
+### 20.4 設定
+
+`skb.toml` の `[server]` テーブル（コア設定ローダーは未知キーを無視するため既存セクションと共存できる）:
+
+```toml
+[server]
+host = "127.0.0.1"
+port = 8080
+```
+
+リッスンアドレスの優先順位: CLI `--port` / `--host` > 環境変数 > `skb.toml [server]`。
+
+| 環境変数 | 既定 | 意味 |
+|---|---|---|
+| `SKB_SERVER_HOST` / `SKB_SERVER_PORT` | toml 値（既定 127.0.0.1:8080） | リッスンアドレス。`SKB_SERVER_PORT` が数値でない場合は起動失敗（`E_CONFIG`） |
+| `SKB_LLM_BASE_URL` | `http://localhost:11434/v1` | OpenAI 互換 LLM のベース URL（`{base}/chat/completions` に POST）。上流からの応答には防御上限がある: エラー本文 8 KiB、SSE 1 フレーム 64 KiB（超過は `E_LLM_PROTOCOL`）、フラグメント間 60 秒の read timeout |
+| `SKB_LLM_MODEL` | `llama3.1` | チャットモデル |
+| `SKB_LLM_API_KEY` | 未設定 | Bearer トークン（空文字は未設定扱い）。設定時は **`https://` の `SKB_LLM_BASE_URL` のみ許可**（HTTP URL はチャット要求が `E_LLM_CONFIG` で終端する。API キーとプロンプトの平文漏えい防止） |
+| `SKB_CHAT_EXPAND_DEPTH` | 2 | チャット検索の `graph_expand` 深さ。上限 5（コア `MAX_GRAPH_EXPAND`、超過は切り詰め）、パース不能値は既定 |
+| `SKB_CHAT_TOKEN_BUDGET` | 4000 | プロンプト全体の文字予算（固定指示文 + 質問文 + 引用断片の合計）。超過する質問文は文字境界で切り詰められ、引用断片は残り予算を共有する。文字ベースの近似（約 4 文字/トークン）。実トークナイザは意図的に導入しない |
+| `SKB_SERVER_JWT_SECRET` | 未設定 | JWT 署名鍵（HS256、有効期限 24 時間）。**未設定でも起動は継続** し warning を出力する。JWT 検証を要するパス（login、publish、`app=blog` の POST /api/documents の author 必須分岐、blog document の PUT/DELETE）は 503 `E_CONFIG` を返す。register と公開 GET は影響を受けない。**32 文字未満の弱い secret も未設定と同等に 503** する（総当たり可能な鍵で HS256 トークンを偽造できないようにするため） |
+| `SKB_SERVER_AUTHOR_INVITES` | 未設定 | 登録時に `author` を付与する `email:token` ペアのカンマ区切りリスト。リクエストの `invite` フィールドが一致するトークンの場合のみ `author`（**公開登録の既定は `reader`**、注4）。未設定なら招待は存在しない |
+
+LLM 系環境変数と JWT secret はリクエスト毎に読まれる（テストや E2E がプロセス再起動なしで向き先を変えられる）。
+
+`--port 0` で起動するとエフェメラルポートをバインドした後、stdout に機械可読な 1 行 `SKB_SERVER_PORT=<n>` を出力する（バインド後出力のため、この行を受信した時点でポートは受付中である）。E2E ハーネスはこの行をパースする。モック LLM サーバー（`examples/mock_llm.rs`）も同一プロトコルで `MOCK_LLM_PORT=<n>` を出力する。ログは `tracing` により **stderr のみ**（既定フィルタ `skb_server=info,warn`、`RUST_LOG` で上書き）。終了は ctrl-c / SIGTERM でグレースフルに行う。
+
+### 20.5 エラー → HTTP マッピング
+
+ボディは常に `{"code": "E_...", "message": "..."}` である（§14.1 の CLI JSON 出力はキーが `error` である点が異なる。コード体系自体は共通）。
+
+| コード | 既定ステータス |
+|---|---|
+| `E_VALIDATION` | 400 |
+| `E_DOCUMENT_NOT_FOUND` | 404 |
+| `E_UNSUPPORTED_FORMAT` | 415 |
+| `E_DB` / `E_IO` / `E_CONFIG` / `E_EMBEDDING` / `E_TOKENIZE` / `E_MODEL_MISMATCH` | 500 |
+
+ハンドラによる明示的な上書き:
+
+| ステータス | 条件 |
+|---|---|
+| 409 | register で email 重複（コードは `E_VALIDATION`） |
+| 401 | 認証失敗全般（トークン無し/無効/期限切れ、reader ロールによる author 操作、誤認証情報。コードは `E_VALIDATION`、ユーザー列挙防止のためメッセージは汎用） |
+| 403 | `blog_post` を持つ document の PUT/DELETE を別 author が試みた場合（コードは `E_VALIDATION`） |
+| 415 | 非対応ソース形式（`E_UNSUPPORTED_FORMAT`、既定マッピングと同一） |
+| 503 | `SKB_SERVER_JWT_SECRET` 未設定 **または 32 文字未満**（`E_CONFIG`） |
+
+### 20.6 仕様差異（実装上の決定事項）
+
+フロントエンド実装仕様書に対する、実装で確定させた差異とその理由:
+
+1. **`SearchHit.score` は RRF 融合済みの単一スコア** である。個別の BM25 / ベクトルスコアは skb-core が非公開のため HTTP API でも提供しない。§Studio 参照パネルと §Vault Cmd+K の「BM25/ベクトルスコアを表示」は、この融合スコアの表示に置き換える。
+2. **Studio 再帰取得の MVP 代替**: 回答生成中の citation 検出による再帰展開の代わりに、検索時の事前一括 `graph_expand`（`POST /api/search` の `graph_expand`、チャットは `SKB_CHAT_EXPAND_DEPTH`）で関連コンテキストを取得する。
+3. **`query_surql` の server 内部利用**: `KnowledgeBase::query_surql` は「CLI 専用の escape hatch」と自己文書化されているが、サーバーは固定 SQL（`schema/002_server.surql` の DDL 適用）に限ってこれを使う。ユーザー入力を含むクエリ（backlinks / auth / blog）は生の db ハンドルでパラメータバインドし、文字列補間は行わない。
+4. **`/api/search/expand` の拡張レグは現在無効（inert）**: skb-core の `expand_search_hits` が WHERE 句内の順方向グラフ走査（`FROM chunk WHERE ->mentions->entity.name IN ...`）を使っており、surrealdb 3.x ではこれが黙って 0 件に一致する（既存コアバグ、修正は上流待ち）。`entity_origins` は別の有効なステートメントで埋まるため応答自体は正常だが、拡張ヒットは空で返る。エンドポイントは透過パススルーとして正しく、フロントエンドはこのエンドポイントに依存しない。
+5. **`after` キーセットカーソルのサーバー側エミュレーション**: コアの行値比較 SQL（`(created_at, meta::id(id)) < (...)`）は surrealdb 3.x でパースできないため、サーバーは順序付き走査（上限 10,000 件）+ スライスでカーソルを再現する。カーソルがどのドキュメントにも一致しない場合は 400 を返す（黙って誤ったページを返さない）。コア修正後はこのシムを削除する。
+6. **検索ヒットの `document_id` は `document:<key>` の完全レコード形に正規化** する（サーバー DTO 境界で変換）。コアは素のキーを返すが、ドキュメント系エンドポイントは前置き付きの形しか受け付けない（素キーは 400）。これにより検索応答の id が全エンドポイントでそのまま使える。
+7. **HTTP 経由では `path` アップロードを受け付けない**: `POST`/`PUT /api/documents` の DTO は `url` / `content` / `content_base64` のみ。サーバー側ファイル読み込みを外部入力から解放するとパス走査（`/etc/passwd` 等）になるため（CLI / MCP は引き続き `path` を保持する）。
+8. **POST /api/search/expand の `max_expand` は API 境界で検証** する（コア `MAX_GRAPH_EXPAND` 超過は 400 `E_VALIDATION`。トラバーサル開始前に拒否する）。
+
+### 20.7 MVPデスコープ
+
+フロントエンド実装仕様書に記載がありながら、MVP では実装を見送った 2 項目:
+
+1. **SPA 静的ホスト（ServeDir / SPA-fallback）**: MVP の動作確認は dev server で行う。本番配信時の静的ホスト実装は後続とする。
+2. **§Blog 冒頭のグラフ可視化（ネットワーク図）**: MVP は関連記事データの取得（`POST /api/graph/query`、vector 検索）までを実装する。グラフ UI の描画は後続とする。
+
+### 20.8 テスト方針
+
+| レベル | 内容 | 実行 |
+|---|---|---|
+| 単体 | DTO 変換、エラー写像、設定の優先順位、SSE 行パース等 | `cargo test -p skb-server` |
+| 統合 | in-process ルーターによる全エンドポイント。組込み DB を伴うため **直列実行必須** | `cargo test --workspace -- --test-threads=1` |
+| API E2E | 実バイナリ spawn（`--port 0` + `SKB_SERVER_PORT=` 行パース）+ 生 HTTP。モック LLM（`examples/mock_llm.rs`）を含む | 同上（スイート内） |
+| UI E2E | Playwright + mock_llm（`web/`、本プラン後半で追加） | `bunx playwright test` |
+
+TLS ガード（`cargo tree -i openssl-sys` / `-i native-tls` の非ゼロ終了 = パッケージ不在）は `tests/tls_guard.rs` としてスイート内で常時実行される。検証証跡は `target/evidence/` 配下にタスク番号別に保存する。
