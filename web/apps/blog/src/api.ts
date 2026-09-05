@@ -166,10 +166,14 @@ export async function loginQuery(email: string, password: string) {
   return data;
 }
 
-export async function registerQuery(email: string, password: string) {
-  const { data, error, response } = await api.POST("/api/auth/register", {
-    body: { email, password },
-  });
+/**
+ * Register. Always mints a reader unless the server's invite list covers the
+ * email and `invite` presents the matching token (SKB_SERVER_AUTHOR_INVITES)
+ * — a 409 for a duplicate email and a 400 for validation render inline.
+ */
+export async function registerQuery(email: string, password: string, invite?: string) {
+  const body = invite === undefined ? { email, password } : { email, password, invite };
+  const { data, error, response } = await api.POST("/api/auth/register", { body });
   if (error !== undefined || data === undefined) {
     throw toApiError(error, response.status);
   }

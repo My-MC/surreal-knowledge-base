@@ -77,6 +77,10 @@ function fillCredentials(email: string, password: string) {
   fireEvent.change(screen.getByTestId("auth-password"), { target: { value: password } });
 }
 
+function fillInvite(invite: string) {
+  fireEvent.change(screen.getByTestId("auth-invite"), { target: { value: invite } });
+}
+
 describe("AuthForm", () => {
   beforeEach(() => {
     fakeClient.GET.mockReset();
@@ -168,5 +172,31 @@ describe("AuthForm", () => {
     expect(calls).toEqual(["/api/auth/register"]);
     expect(screen.getByTestId("auth-error").textContent).toBe("email already registered");
     expect(useAuthStore.getState().email).toBeNull();
+  });
+
+  test("a non-blank 招待トークン rides along in the register body", async () => {
+    fakeClient.POST.mockImplementation(async (path: string) => {
+      if (path === "/api/auth/register") {
+        return ok({ email: "invited@example.com", role: "author" }, 201);
+      }
+      if (path === "/api/auth/login") {
+        return ok({ email: "invited@example.com", role: "author" });
+      }
+      throw new Error(`unexpected POST ${path}`);
+    });
+    await renderAuth("register");
+    fillCredentials("invited@example.com", "secret");
+    fillInvite("  invite-token-0123456789  ");
+    fireEvent.click(screen.getByTestId("auth-submit"));
+    await flush();
+
+    expect(fakeClient.POST).toHaveBeenCalledWith("/api/auth/register", {
+      body: {
+        email: "invited@example.com",
+        password: "secret",
+        invite: "invite-token-0123456789",
+      },
+    });
+    expect(useAuthStore.getState().role).toBe("author");
   });
 });

@@ -16,9 +16,11 @@ const LABELS: Record<AuthFormProps["mode"], { title: string; submit: string }> =
 /**
  * /login and /register. Register auto-logins: the register response sets no
  * cookie, so the login call runs right after a 201 and the user lands on "/"
- * already signed in. The server decides the role (SKB_SERVER_AUTHOR_EMAILS
- * allowlist); errors (409 duplicate email, 400 validation, 401 bad
- * credentials) render inline from the server message.
+ * already signed in. The server decides the role — registration is
+ * reader-only unless the optional 招待トークン matches the operator's
+ * SKB_SERVER_AUTHOR_INVITES entry for the email; errors (409 duplicate
+ * email, 400 validation, 401 bad credentials) render inline from the server
+ * message.
  */
 export function AuthForm({ mode }: AuthFormProps) {
   const label = LABELS[mode];
@@ -26,6 +28,7 @@ export function AuthForm({ mode }: AuthFormProps) {
   const setAuth = useAuthStore((state) => state.setAuth);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [invite, setInvite] = useState("");
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -35,7 +38,8 @@ export function AuthForm({ mode }: AuthFormProps) {
     setError(null);
     try {
       if (mode === "register") {
-        await registerQuery(email, password);
+        const trimmedInvite = invite.trim();
+        await registerQuery(email, password, trimmedInvite === "" ? undefined : trimmedInvite);
       }
       const auth = await loginQuery(email, password);
       setAuth(auth.email, auth.role);
@@ -69,6 +73,17 @@ export function AuthForm({ mode }: AuthFormProps) {
           onChange={(event) => setPassword(event.target.value)}
           required
         />
+        {mode === "register" && (
+          <input
+            type="text"
+            placeholder="招待トークン（author 招待を受けた場合のみ）"
+            aria-label="招待トークン"
+            data-testid="auth-invite"
+            value={invite}
+            onChange={(event) => setInvite(event.target.value)}
+            autoComplete="off"
+          />
+        )}
         <button type="submit" data-testid="auth-submit" disabled={pending}>
           {label.submit}
         </button>

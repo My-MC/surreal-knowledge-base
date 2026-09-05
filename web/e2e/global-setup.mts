@@ -16,13 +16,15 @@ const STUDIO_APP_DIR = path.join(repoRoot, "web", "apps", "studio");
 const BLOG_APP_DIR = path.join(repoRoot, "web", "apps", "blog");
 const AUTH_FIXTURE_PATH = path.join(repoRoot, "target", "e2e-auth.json");
 
-// Run-unique allowlist emails, composed before the server spawns. The server
-// grants `author` at registration only to exact SKB_SERVER_AUTHOR_EMAILS
-// entries (CWE-269: no @domain forms), so the specs must use these exact
-// addresses; the fixture file is the handoff.
+// Run-unique invite identities, composed before the server spawns. Public
+// registration is reader-only (CWE-269): the server mints `author` only when
+// the register request presents the token paired with the exact email in
+// SKB_SERVER_AUTHOR_INVITES. The fixture file is the handoff to the specs.
 const E2E_RUN_ID = Date.now();
 const E2E_SEEDER_EMAIL = `seeder${E2E_RUN_ID}@example.com`;
 const E2E_BLOGGER_EMAIL = `blogger${E2E_RUN_ID}@example.com`;
+const E2E_SEEDER_INVITE = `seed-invite-${E2E_RUN_ID}`;
+const E2E_BLOGGER_INVITE = `blog-invite-${E2E_RUN_ID}`;
 
 const SERVER_START_TIMEOUT_MS = 120_000;
 const CHILD_START_TIMEOUT_MS = 30_000;
@@ -142,7 +144,12 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
   mkdirSync(path.dirname(AUTH_FIXTURE_PATH), { recursive: true });
   writeFileSync(
     AUTH_FIXTURE_PATH,
-    JSON.stringify({ seederEmail: E2E_SEEDER_EMAIL, bloggerEmail: E2E_BLOGGER_EMAIL }),
+    JSON.stringify({
+      seederEmail: E2E_SEEDER_EMAIL,
+      bloggerEmail: E2E_BLOGGER_EMAIL,
+      seederInvite: E2E_SEEDER_INVITE,
+      bloggerInvite: E2E_BLOGGER_INVITE,
+    }),
   );
 
   spawnDetached("mock_llm", MOCK_LLM_BIN, ["--port", String(MOCK_LLM_PORT)]);
@@ -165,8 +172,8 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
       // Auth endpoints 503 E_CONFIG without it (todo 7 semantics). The
       // 32+ char floor rejects weak secrets (503), so keep it long.
       SKB_SERVER_JWT_SECRET: "skb-e2e-secret-0123456789abcdef-0123456789abcdef",
-      // Exact-match author allowlist (note 4): the run's two identities.
-      SKB_SERVER_AUTHOR_EMAILS: `${E2E_SEEDER_EMAIL},${E2E_BLOGGER_EMAIL}`,
+      // Invite tokens for this run's two author identities (note 4).
+      SKB_SERVER_AUTHOR_INVITES: `${E2E_SEEDER_EMAIL}:${E2E_SEEDER_INVITE},${E2E_BLOGGER_EMAIL}:${E2E_BLOGGER_INVITE}`,
       SKB_LLM_BASE_URL: `http://127.0.0.1:${MOCK_LLM_PORT}/v1`,
     },
   });

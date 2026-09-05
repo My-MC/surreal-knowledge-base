@@ -22,27 +22,32 @@ const evidenceDir = path.join(repoRoot, "target", "evidence", "19");
 
 /**
  * The run's author identities: global-setup composed them before spawning
- * skb-server so the allowlist (exact emails only, note 4) covers them.
+ * skb-server so the invite list (SKB_SERVER_AUTHOR_INVITES, note 4) covers
+ * them. Registration without the token stays a reader.
  */
-function readAuthFixture(): { seederEmail: string; bloggerEmail: string } {
+function readAuthFixture(): {
+  seederEmail: string;
+  bloggerEmail: string;
+  seederInvite: string;
+  bloggerInvite: string;
+} {
   const raw: unknown = JSON.parse(
     readFileSync(path.join(repoRoot, "target", "e2e-auth.json"), "utf8"),
   );
-  if (
-    typeof raw !== "object" ||
-    raw === null ||
-    !("seederEmail" in raw) ||
-    !("bloggerEmail" in raw)
-  ) {
-    throw new Error(
-      "target/e2e-auth.json missing or malformed — was the playwright globalSetup run?",
-    );
+  if (typeof raw !== "object" || raw === null) {
+    throw new Error("target/e2e-auth.json missing — was the playwright globalSetup run?");
   }
-  const { seederEmail, bloggerEmail } = raw as {
+  for (const key of ["seederEmail", "bloggerEmail", "seederInvite", "bloggerInvite"]) {
+    if (!(key in raw)) {
+      throw new Error(`target/e2e-auth.json is missing "${key}" — stale fixture?`);
+    }
+  }
+  return raw as {
     seederEmail: string;
     bloggerEmail: string;
+    seederInvite: string;
+    bloggerInvite: string;
   };
-  return { seederEmail, bloggerEmail };
 }
 
 const authFixture = readAuthFixture();
@@ -63,7 +68,7 @@ test("blog: register, login, post, publish, and related posts", async ({ page, r
 
   // -- Step 1: seed one published post via the API (self-contained) ----------
   const registered = await request.post(`${BLOG_URL}api/auth/register`, {
-    data: { email: seedEmail, password },
+    data: { email: seedEmail, password, invite: authFixture.seederInvite },
   });
   expect(registered.status()).toBe(201);
   const loggedIn = await request.post(`${BLOG_URL}api/auth/login`, {
@@ -97,6 +102,7 @@ test("blog: register, login, post, publish, and related posts", async ({ page, r
   await page.goto(`${BLOG_URL}register`);
   await page.getByTestId("auth-email").fill(bloggerEmail);
   await page.getByTestId("auth-password").fill(password);
+  await page.getByTestId("auth-invite").fill(authFixture.bloggerInvite);
   await page.getByTestId("auth-submit").click();
   await page.waitForURL((url) => url.pathname === "/");
   await expect(page.getByTestId("header-email")).toHaveText(bloggerEmail);
