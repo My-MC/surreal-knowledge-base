@@ -23,6 +23,11 @@ const DEFAULT_EXPAND_DEPTH: usize = 2;
 const DEFAULT_TOKEN_BUDGET: usize = 4000;
 const CHAT_TOP_K: usize = 6;
 
+/// Fixed prompt scaffolding (module level so [`token_budget`] can enforce
+/// the budget floor it implies).
+const INSTRUCTION: &str = "You are a knowledge-base assistant. Answer the question using the document excerpts below when they are relevant.\n\n";
+const QUESTION_LABEL: &str = "Question: ";
+
 /// SSE event stream: items are always `Ok` — failures travel as `error`
 /// events, never as stream errors. `KeepAliveStream` is the wrapper added by
 /// `.keep_alive(KeepAlive::default())`.
@@ -124,23 +129,26 @@ fn expand_depth() -> usize {
 }
 
 /// `SKB_CHAT_TOKEN_BUDGET` (default 4000); unparseable values fall back to
-/// the default.
+/// the default. Values below the fixed-string floor are lifted to it — the
+/// scaffolding alone occupies that much, so a smaller configuration would
+/// otherwise make [`build_prompt`]'s output exceed the configured cap.
 fn token_budget() -> usize {
     std::env::var("SKB_CHAT_TOKEN_BUDGET")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
+        .map(|v| v.max(INSTRUCTION.len() + QUESTION_LABEL.len()))
         .unwrap_or(DEFAULT_TOKEN_BUDGET)
 }
 
 /// Build the LLM prompt under a TOTAL char budget that covers the fixed
-/// instruction, the question, and the excerpts. Chars approximate tokens
-/// (~4 chars/token for English) — documented MVP approximation; a real
-/// tokenizer is deliberately not pulled in here. The question keeps its
-/// priority: the excerpts share whatever budget remains after the (possibly
-/// truncated) question.
+/// instruction, the question, and the excerpts — including each excerpt's
+/// blank-line separator, so the output never exceeds `budget` (precondition:
+/// `budget` ≥ the fixed-string floor, which [`token_budget`] enforces).
+/// Chars approximate tokens (~4 chars/token for English) — documented MVP
+/// approximation; a real tokenizer is deliberately not pulled in here. The
+/// question keeps its priority: the excerpts share whatever budget remains
+/// after the (possibly truncated) question.
 fn build_prompt(message: &str, hits: &[SearchHit], budget: usize) -> String {
-    const INSTRUCTION: &str = "You are a knowledge-base assistant. Answer the question using the document excerpts below when they are relevant.\n\n";
-    const QUESTION_LABEL: &str = "Question: ";
     let reserved = INSTRUCTION.len() + QUESTION_LABEL.len();
     let message_budget = budget.saturating_sub(reserved);
     let message = truncate_at_char_boundary(message, message_budget);
@@ -153,12 +161,14 @@ fn build_prompt(message: &str, hits: &[SearchHit], budget: usize) -> String {
     for (i, hit) in hits.iter().enumerate() {
         let title = hit.title.as_deref().unwrap_or("(untitled)");
         let header = format!("Excerpt {} — {title} ({}):\n", i + 1, hit.document_id);
-        if used + header.len() >= excerpt_budget {
+        // The blank-line separator after this excerpt must fit too: content
+        // capped at the raw remainder alone would push the total 2 bytes over.
+        if used + header.len() + 2 > excerpt_budget {
             break;
         }
-        let remaining = excerpt_budget - used - header.len();
+        let remaining = excerpt_budget - used - header.len() - 2;
         let content = truncate_at_char_boundary(&hit.content, remaining);
-        used += header.len() + content.len() + 2; // + blank-line separator
+        used += header.len() + content.len() + 2;
         excerpts.push_str(&header);
         excerpts.push_str(content);
         excerpts.push_str("\n\n");
@@ -196,4 +206,99 @@ async fn send_error(
         .event("error")
         .data(json!({ "code": code, "message": message }).to_string());
     let _ = tx.send(Ok(event)).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Restores the previous `SKB_CHAT_TOKEN_BUDGET` value on drop (the
+    /// tests/auth_blog.rs EnvGuard pattern; the workspace runs with
+    /// --test-threads=1).
+    struct EnvGuard(Option<String>);
+
+    impl EnvGuard {
+        fn set(value: &str) -> Self {
+            let old = std::env::var("SKB_CHAT_TOKEN_BUDGET").ok();
+            std::env::set_var("SKB_CHAT_TOKEN_BUDGET", value);
+            Self(old)
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => std::env::set_var("SKB_CHAT_TOKEN_BUDGET", value),
+                None => std::env::remove_var("SKB_CHAT_TOKEN_BUDGET"),
+            }
+        }
+    }
+
+    fn hit(document_id: &str, title: &str, content: &str) -> SearchHit {
+        SearchHit {
+            document_id: document_id.to_string(),
+            chunk_idx: 0,
+            content: content.to_string(),
+            score: 1.0,
+            title: Some(title.to_string()),
+            source: None,
+            highlights: None,
+            matched_entities: None,
+        }
+    }
+
+    /// Given: SKB_CHAT_TOKEN_BUDGET below the fixed-string floor.
+    /// When:  resolving the token budget.
+    /// Then:  the floor wins — the scaffolding alone occupies it, so a
+    ///        smaller configuration could not be honored anyway.
+    #[test]
+    fn tiny_budget_is_lifted_to_the_fixed_string_floor() {
+        let _env = EnvGuard::set("10");
+        assert_eq!(token_budget(), INSTRUCTION.len() + QUESTION_LABEL.len());
+    }
+
+    /// Given: several excerpts whose content far exceeds any budget.
+    /// When:  building prompts across budget sizes (floor, small surplus,
+    ///        typical).
+    /// Then:  every prompt is within its total budget — fixed strings,
+    ///        message, headers, excerpt content, and separators included.
+    #[test]
+    fn prompt_never_exceeds_the_total_budget() {
+        let hits: Vec<SearchHit> = (0..6)
+            .map(|i| {
+                hit(
+                    &format!("document:d{i}"),
+                    &format!("Title {i}"),
+                    &"x".repeat(500),
+                )
+            })
+            .collect();
+        let floor = INSTRUCTION.len() + QUESTION_LABEL.len();
+        for budget in [floor, floor + 40, 800, DEFAULT_TOKEN_BUDGET] {
+            let prompt = build_prompt("total budget question", &hits, budget);
+            assert!(
+                prompt.len() <= budget,
+                "budget {budget}: prompt is {} bytes",
+                prompt.len()
+            );
+        }
+    }
+
+    /// Given: one excerpt whose content exactly fills the space left after
+    ///        its header.
+    /// When:  building the prompt.
+    /// Then:  the blank-line separator is part of the cap — the total stays
+    ///        at the budget instead of running 2 bytes over.
+    #[test]
+    fn excerpt_filling_the_remaining_budget_leaves_room_for_the_separator() {
+        let budget = INSTRUCTION.len() + QUESTION_LABEL.len() + 100;
+        let header_len = "Excerpt 1 — t (document:t1):\n".len();
+        let content = "a".repeat(100 - header_len);
+        let prompt = build_prompt("", &[hit("document:t1", "t", &content)], budget);
+        assert!(
+            prompt.len() <= budget,
+            "exact-fill case: prompt is {} bytes over budget {budget}",
+            prompt.len()
+        );
+    }
 }
