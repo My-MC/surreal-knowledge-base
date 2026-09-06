@@ -29,7 +29,7 @@ export function ChatComposer({ streaming, onSend, onStop }: ChatComposerProps) {
       />
       {streaming ? (
         <button type="button" className={styles.stop} data-testid="chat-stop" onClick={onStop}>
-          止る
+          停止
         </button>
       ) : (
         <button

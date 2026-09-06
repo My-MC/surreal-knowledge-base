@@ -14,6 +14,7 @@ import { existsSync, rmSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { killAll, spawnDetached, waitForHttp, waitForPortLine } from "./proc";
+import { readSseEvents } from "./sseLib";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 const SERVER_BIN = path.join(repoRoot, "target", "debug", "skb-server");
@@ -25,62 +26,8 @@ const CHILD_START_TIMEOUT_MS = 30_000;
 const STREAM_TIMEOUT_MS = 30_000;
 const OVERALL_TIMEOUT_MS = 180_000;
 
-interface SseEvent {
-  event: string;
-  data: string;
-}
-
 function fail(message: string): never {
   throw new Error(message);
-}
-
-/** Reads an SSE body to completion, returning events in arrival order. */
-async function readSseEvents(response: Response, timeoutMs: number): Promise<SseEvent[]> {
-  const body = response.body;
-  if (body === null) fail("chat stream response has no body");
-  const reader = body.getReader();
-  const decoder = new TextDecoder();
-  const events: SseEvent[] = [];
-  let buffer = "";
-  let eventName: string | null = null;
-  let dataLines: string[] = [];
-  const deadline = Date.now() + timeoutMs;
-
-  const dispatch = () => {
-    if (eventName === null && dataLines.length === 0) return;
-    events.push({ event: eventName ?? "message", data: dataLines.join("\n") });
-    eventName = null;
-    dataLines = [];
-  };
-  const handleLine = (line: string) => {
-    if (line === "") {
-      dispatch();
-      return;
-    }
-    if (line.startsWith(":")) return;
-    const colon = line.indexOf(":");
-    const field = colon === -1 ? line : line.slice(0, colon);
-    let value = colon === -1 ? "" : line.slice(colon + 1);
-    if (value.startsWith(" ")) value = value.slice(1);
-    if (field === "event") eventName = value;
-    else if (field === "data") dataLines.push(value);
-  };
-
-  for (;;) {
-    if (Date.now() > deadline) fail(`SSE stream did not finish within ${timeoutMs}ms`);
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    let nl = buffer.indexOf("\n");
-    while (nl !== -1) {
-      handleLine(buffer.slice(0, nl).replace(/\r$/, ""));
-      buffer = buffer.slice(nl + 1);
-      nl = buffer.indexOf("\n");
-    }
-    if (events.some((e) => e.event === "done" || e.event === "error")) break;
-  }
-  dispatch();
-  return events;
 }
 
 async function main(): Promise<void> {
