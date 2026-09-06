@@ -85,7 +85,11 @@ async function waitForHttp(
     } finally {
       clearTimeout(timeout);
     }
-    await new Promise((resolve) => setTimeout(resolve, 250));
+    // Keep the poll wait inside the remaining deadline: a fixed 250ms sleep
+    // after a late failure would push the readiness error past timeoutMs.
+    await new Promise((resolve) =>
+      setTimeout(resolve, Math.min(250, Math.max(0, deadline - Date.now()))),
+    );
   }
 }
 

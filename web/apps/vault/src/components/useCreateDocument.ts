@@ -6,11 +6,12 @@ import { ApiError, api, toApiError } from "../api";
  * POST /api/documents then navigate to the new document. Shared by the tree
  * header button and the "/" empty state.
  *
- * The initial content carries a creation timestamp because the server dedups
- * uploads by sha256: a fixed "# Untitled" would make the second and later
- * creations answer `skipped` with no document_id. A skipped (null-id)
- * response is never a successful creation, so it throws instead of
- * navigating.
+ * The initial content carries a creation timestamp plus a per-request random
+ * id because the server dedups uploads by sha256: a fixed "# Untitled" would
+ * make the second and later creations answer `skipped` with no document_id,
+ * and even distinct timestamps can collide within one millisecond when two
+ * views create concurrently. A skipped (null-id) response is never a
+ * successful creation, so it throws instead of navigating.
  */
 export function useCreateDocument() {
   const queryClient = useQueryClient();
@@ -19,7 +20,9 @@ export function useCreateDocument() {
   const mutation = useMutation({
     mutationFn: async () => {
       const { data, error, response } = await api.POST("/api/documents", {
-        body: { content: `# Untitled\n\n${new Date().toISOString()}` },
+        body: {
+          content: `# Untitled\n\n${new Date().toISOString()}\n\n${crypto.randomUUID()}`,
+        },
       });
       if (error !== undefined || data === undefined) {
         throw toApiError(error, response.status);

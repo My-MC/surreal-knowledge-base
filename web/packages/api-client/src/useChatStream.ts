@@ -66,7 +66,9 @@ export function useChatStream(baseUrl: string): ChatStreamController {
               if (isCurrent()) setTokens((prev) => prev + text);
             },
             onDone: () => {
-              if (isCurrent()) setStatus("done");
+              if (isCurrent()) {
+                setStatus((previous) => (previous === "error" ? previous : "done"));
+              }
             },
             onError: (code, errorMessage) => {
               if (!isCurrent()) return;

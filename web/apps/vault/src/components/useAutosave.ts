@@ -62,27 +62,35 @@ export function useAutosave(docId: string) {
   const inFlightRef = useRef(false);
   const lastRequestRef = useRef<SaveRequest | null>(null);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const rotatedRef = useRef(false);
+  const rotatedRef = useRef<string | null>(null);
 
   useLayoutEffect(() => {
     if (docIdRef.current === docId) return;
     docIdRef.current = docId;
-    if (rotatedRef.current) {
-      rotatedRef.current = false;
+    // Rotation continuity holds only when this transition landed on the
+    // rotation target. A navigation elsewhere (e.g. racing the rotation's
+    // invalidateQueries await) must invalidate the session: bump the
+    // generation and drop every pending edit so nothing from the old
+    // document is ever PUT into the new one.
+    if (rotatedRef.current !== null && rotatedRef.current === docId) {
+      rotatedRef.current = null;
       return;
     }
+    rotatedRef.current = null;
     generationRef.current += 1;
     if (timerRef.current !== null) {
       clearTimeout(timerRef.current);
       timerRef.current = null;
     }
     pendingRef.current = null;
+    queuedRef.current = null;
     setStatus({ kind: "idle" });
   }, [docId]);
 
   useLayoutEffect(() => {
     return () => {
       generationRef.current += 1;
+      queuedRef.current = null;
       if (timerRef.current !== null) {
         clearTimeout(timerRef.current);
       }
@@ -109,7 +117,7 @@ export function useAutosave(docId: string) {
     onSuccess: async (result, request) => {
       if (!isCurrent(request)) return;
       if (result.document_id !== request.docId) {
-        rotatedRef.current = true;
+        rotatedRef.current = result.document_id;
         const oldDoc = queryClient.getQueryData<DocumentDetail>(
           documentQuery(request.docId).queryKey,
         );
