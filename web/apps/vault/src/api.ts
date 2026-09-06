@@ -42,24 +42,14 @@ export function toApiError(error: unknown, status: number): ApiError {
 }
 
 /**
- * Document summaries for the tree and the "/" latest-document redirect.
- *
- * The generated schema types the list query params under `parameters.path`
- * (utoipa emits them without an explicit `in`, openapi-typescript maps that to
- * path params), so the type-correct call passes them explicitly as nulls. At
- * runtime openapi-fetch only substitutes path params into `{placeholder}`
- * segments — "/api/documents" has none — so the request is a plain
- * GET /api/documents and the server defaults apply.
+ * Document summaries for the tree and the "/" latest-document redirect. No
+ * query params: the server defaults (newest first) apply.
  */
 export const documentsQuery = () =>
   queryOptions({
     queryKey: ["documents"],
     queryFn: async () => {
-      const { data, error, response } = await api.GET("/api/documents", {
-        params: {
-          path: { limit: null, offset: null, order: null, after: null },
-        },
-      });
+      const { data, error, response } = await api.GET("/api/documents");
       if (error !== undefined || data === undefined) {
         throw toApiError(error, response.status);
       }
@@ -72,7 +62,7 @@ export const documentQuery = (id: string) =>
     queryKey: ["documents", id],
     queryFn: async () => {
       const { data, error, response } = await api.GET("/api/documents/{id}", {
-        params: { path: { id, include_chunks: null } },
+        params: { path: { id } },
       });
       if (error !== undefined || data === undefined) {
         throw toApiError(error, response.status);

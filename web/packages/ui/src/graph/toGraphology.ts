@@ -1,25 +1,14 @@
+import type { components } from "@skb/api-client";
 import Graph from "graphology";
 
-/** Node of the `POST /api/graph/query` result graph (server DTO, dto/graph.rs). */
-export interface GraphNodeDto {
-  id: string;
-  name: string;
-  kind: string;
-  depth: number;
-}
+/** Node of the `POST /api/graph/query` result graph (generated OpenAPI schema). */
+export type GraphNodeDto = components["schemas"]["GraphNode"];
 
-/** Edge of the `POST /api/graph/query` result graph (server DTO, dto/graph.rs). */
-export interface GraphEdgeDto {
-  from: string;
-  to: string;
-  relation: string;
-}
+/** Edge of the `POST /api/graph/query` result graph (generated OpenAPI schema). */
+export type GraphEdgeDto = components["schemas"]["GraphEdge"];
 
-/** Body of the `POST /api/graph/query` response (server DTO, dto/graph.rs). */
-export interface GraphQueryResultDto {
-  nodes: GraphNodeDto[];
-  edges: GraphEdgeDto[];
-}
+/** Body of the `POST /api/graph/query` response (generated OpenAPI schema). */
+export type GraphQueryResultDto = components["schemas"]["GraphQueryResult"];
 
 export interface GraphNodeAttrs {
   label: string;

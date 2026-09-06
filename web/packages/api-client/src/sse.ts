@@ -84,7 +84,7 @@ function dispatchEvent(name: string, data: string, handlers: SseHandlers): void 
   switch (name) {
     case "citation": {
       const hits = asRecord(parseJson(data))?.hits;
-      if (Array.isArray(hits)) handlers.onCitation(hits);
+      if (Array.isArray(hits) && hits.every(isSearchHit)) handlers.onCitation(hits);
       else handlers.onError(PROTOCOL_ERROR, "malformed citation payload");
       break;
     }
@@ -121,4 +121,15 @@ function parseJson(data: string): unknown {
 function asRecord(value: unknown): Record<string, unknown> | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
   return value as Record<string, unknown>;
+}
+
+function isSearchHit(value: unknown): value is SearchHit {
+  const hit = asRecord(value);
+  return (
+    hit !== null &&
+    typeof hit.document_id === "string" &&
+    typeof hit.chunk_idx === "number" &&
+    typeof hit.content === "string" &&
+    typeof hit.score === "number"
+  );
 }

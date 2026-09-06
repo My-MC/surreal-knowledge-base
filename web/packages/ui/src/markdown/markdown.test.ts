@@ -1,4 +1,5 @@
-import { describe, expect, jest, test } from "bun:test";
+import { afterEach, describe, expect, jest, test } from "bun:test";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { getMarkdownProcessor, MarkdownView } from "./MarkdownView";
@@ -44,6 +45,8 @@ const GFM_DOC = [
 ].join("\n");
 
 describe("MarkdownView", () => {
+  afterEach(cleanup);
+
   // Declaration order matters: this test runs before any test awaits
   // getMarkdownProcessor(), so the module-level pipeline is still unresolved.
   test("renders a lightweight fallback before the processor resolves", () => {
@@ -71,6 +74,28 @@ describe("MarkdownView", () => {
     expect(anchors[0]?.props.children).toBe("Foo");
   });
 
+  test("renders wikilinks as native links with Space activation", async () => {
+    await getMarkdownProcessor();
+    let activated = "";
+    render(
+      createElement(
+        "div",
+        {
+          onClick: (event: MouseEvent) => {
+            if (event.target instanceof HTMLElement) {
+              activated = event.target.dataset.wikilink ?? "";
+            }
+          },
+        },
+        createElement(MarkdownView, { content: "[[Foo]]" }),
+      ),
+    );
+    const link = screen.getByRole("link", { name: "Foo" });
+    expect(link.getAttribute("href")).toBe("#Foo");
+    fireEvent.keyDown(link, { key: " " });
+    expect(activated).toBe("Foo");
+  });
+
   test("leaves [[...]] inside code fences untouched", async () => {
     const processor = await getMarkdownProcessor();
     const file = processor.processSync("```\n[[NotALink]]\n```");
@@ -91,6 +116,15 @@ describe("MarkdownView", () => {
       return typeof style === "object" && style !== null;
     });
     expect(themedSpans.length).toBeGreaterThan(0);
+  });
+
+  test("falls back to text highlighting for unsupported fence languages", async () => {
+    await getMarkdownProcessor();
+    const html = renderToStaticMarkup(
+      createElement(MarkdownView, { content: "```mermaid\ngraph TD; A-->B;\n```" }),
+    );
+    expect(html).toContain("<pre");
+    expect(html).toContain("graph TD; A--&gt;B;");
   });
 
   test("drops raw <script> tags from the tree", async () => {

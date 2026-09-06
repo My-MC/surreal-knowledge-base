@@ -140,6 +140,16 @@ describe("consumeSseStream", () => {
     expect(c.events).toEqual(["error"]);
   });
 
+  it("rejects citation payloads whose hits contain null or malformed entries", async () => {
+    const nullHit = `event: citation\ndata: {"hits":[${HIT},null]}\n\n`;
+    const missingFields = 'event: citation\ndata: {"hits":[{"document_id":"document:x"}]}\n\n';
+    const c = collect();
+    await consumeSseStream(sseResponse(enc.encode(nullHit), enc.encode(missingFields)), c.handlers);
+    expect(c.events).toEqual(["error", "error"]);
+    expect(c.errors.map((e) => e.code)).toEqual(["E_SSE_PROTOCOL", "E_SSE_PROTOCOL"]);
+    expect(c.citations).toEqual([]);
+  });
+
   it("routes malformed payloads on known events to onError", async () => {
     const c = collect();
     await consumeSseStream(sseResponse(enc.encode("event: token\ndata: not-json\n\n")), c.handlers);

@@ -709,16 +709,16 @@ export interface operations {
   };
   list_documents: {
     parameters: {
-      query?: never;
-      header?: never;
-      path: {
-        limit: number | null;
-        offset: number | null;
+      query?: {
+        limit?: number;
+        offset?: number;
         /** @description `created_desc` | `created_asc` | `title_asc` | `title_desc`. */
-        order: string | null;
+        order?: string;
         /** @description Keyset cursor `<created_at>,<id>` as returned by the previous page. */
-        after: string | null;
+        after?: string;
       };
+      header?: never;
+      path?: never;
       cookie?: never;
     };
     requestBody?: never;
@@ -823,13 +823,14 @@ export interface operations {
   };
   get_document: {
     parameters: {
-      query?: never;
+      query?: {
+        /** @description Include the document's chunks in the response. */
+        include_chunks?: boolean;
+      };
       header?: never;
       path: {
         /** @description Document record id (`document:<key>`) */
         id: string;
-        /** @description Include the document's chunks in the response. */
-        include_chunks: boolean | null;
       };
       cookie?: never;
     };

@@ -66,21 +66,32 @@ async function waitForHttp(
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    try {
-      const response = await fetch(url);
-      if (expectedStatus === null || response.status === expectedStatus) {
-        return;
-      }
-    } catch {
-      // not accepting connections yet
-    }
-    if (Date.now() > deadline) {
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) {
       const logs = children
         .map((child) => `--- ${labels.get(child) ?? "child"} ---\n${tailOf(child)}`)
         .join("\n");
       throw new Error(`${label} not ready at ${url} within ${timeoutMs}ms\n${logs}`);
     }
-    await new Promise((resolve) => setTimeout(resolve, 250));
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), remainingMs);
+    try {
+      // Bound each probe by the remaining deadline so a hung connection
+      // cannot stretch the readiness window past timeoutMs.
+      const response = await fetch(url, { signal: controller.signal });
+      if (expectedStatus === null || response.status === expectedStatus) {
+        return;
+      }
+    } catch {
+      // not accepting connections yet, or the probe hit the deadline
+    } finally {
+      clearTimeout(timeout);
+    }
+    // Keep the poll wait inside the remaining deadline: a fixed 250ms sleep
+    // after a late failure would push the readiness error past timeoutMs.
+    await new Promise((resolve) =>
+      setTimeout(resolve, Math.min(250, Math.max(0, deadline - Date.now()))),
+    );
   }
 }
 
