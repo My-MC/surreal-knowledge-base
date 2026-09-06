@@ -141,6 +141,10 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
     }
   }
   rmSync(DB_PATH, { recursive: true, force: true });
+  // The fixture carries author invite tokens (CWE-522): recreate instead of
+  // overwrite — writeFileSync's mode only applies at creation, so a stale
+  // file's looser permissions would leak through — and create it owner-only.
+  rmSync(AUTH_FIXTURE_PATH, { force: true });
   mkdirSync(path.dirname(AUTH_FIXTURE_PATH), { recursive: true });
   writeFileSync(
     AUTH_FIXTURE_PATH,
@@ -150,6 +154,7 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
       seederInvite: E2E_SEEDER_INVITE,
       bloggerInvite: E2E_BLOGGER_INVITE,
     }),
+    { mode: 0o600 },
   );
 
   spawnDetached("mock_llm", MOCK_LLM_BIN, ["--port", String(MOCK_LLM_PORT)]);
