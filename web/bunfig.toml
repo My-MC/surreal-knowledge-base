@@ -1,0 +1,5 @@
+[test]
+preload = ["./test/happydom.ts"]
+# Playwright specs are driven by `bunx playwright test`, not `bun test`
+# (playwright's test() throws under bun's runner).
+pathIgnorePatterns = ["e2e/**"]

@@ -1,0 +1,29 @@
+{
+  "name": "@skb/api-client",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src",
+    "THIRD_PARTY_LICENSES.md"
+  ],
+  "scripts": {
+    "gen": "bash scripts/gen-api.sh",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "openapi-fetch": "0.17.0"
+  },
+  "peerDependencies": {
+    "react": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "19.2.18",
+    "openapi-typescript": "7.13.0",
+    "react": "19.2.8",
+    "typescript": "7.0.2"
+  }
+}

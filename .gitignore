@@ -16,3 +16,5 @@ spike/
 # npm platform binaries (injected by CI, never committed)
 npm/packages/*/bin/
 npm/node_modules/
+# web build output (web/node_modules is covered by **/node_modules/ above)
+web/dist/
