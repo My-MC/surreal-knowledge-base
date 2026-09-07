@@ -17,17 +17,26 @@ use crate::dto::graph::{
 use crate::dto::ErrorResponse;
 use crate::error::ApiError;
 
+/// Server-side cap on the hit count accepted by `POST /api/search/expand`:
+/// `expand_search_hits` walks every input hit against the graph (per-hop
+/// frontier caps exist in core, but the input count itself is unbounded), so
+/// the API must reject oversized batches instead of straining DB and memory.
+pub const MAX_EXPAND_HITS: usize = 100;
+
 /// Expand search hits along the knowledge graph (spec §6): each hit's chunk
 /// mentions entities, `related_to` edges extend the frontier for
 /// `max_expand - 1` further hops, and chunks mentioning any frontier entity
-/// come back with a hop-decayed score. Bounded by core (frontier caps, hop
-/// decay); no server-side validation is added.
+/// come back with a hop-decayed score. The server validates both axes at the
+/// API boundary before any traversal: `max_expand` above core's
+/// `MAX_GRAPH_EXPAND` and more than `MAX_EXPAND_HITS` hits are 400
+/// `E_VALIDATION`.
 #[utoipa::path(
     post,
     path = "/api/search/expand",
     request_body = ExpandRequest,
     responses(
         (status = 200, description = "Expanded hits plus per-hit origin entities", body = ExpandResponse),
+        (status = 400, description = "max_expand above MAX_GRAPH_EXPAND or more than MAX_EXPAND_HITS hits", body = ErrorResponse),
         (status = 500, description = "Server fault", body = ErrorResponse),
     )
 )]
@@ -45,6 +54,15 @@ pub async fn expand_search(
                 "max_expand must be at most {}",
                 skb_core::search::MAX_GRAPH_EXPAND
             ),
+        )));
+    }
+    // Same boundary discipline for the input hit count: the walker issues
+    // per-hit bulk queries, so a huge `hits` array inflates DB work and
+    // memory regardless of the per-hop frontier cap.
+    if req.hits.len() > MAX_EXPAND_HITS {
+        return Err(ApiError::new(SkbError::new(
+            ErrorCode::Validation,
+            format!("hits must contain at most {MAX_EXPAND_HITS} entries"),
         )));
     }
     let hits: Vec<skb_core::search::SearchHit> = req.hits.into_iter().map(Into::into).collect();
@@ -78,6 +96,14 @@ pub async fn graph_query(
     Ok(Json(result.into()))
 }
 
+/// Maximum distinct entity names fed to the backlinks document walk: a
+/// document's chunks can mention many entities, and without a cap the
+/// `mentions` fan-in of a common name would be read in full before dedup.
+pub const MAX_BACKLINK_ENTITIES: usize = 64;
+/// Maximum documents returned by `GET /api/documents/{id}/backlinks`
+/// (response entries counted after dedup; paging is a future contract).
+pub const MAX_BACKLINK_DOCUMENTS: usize = 100;
+
 /// SERVER-OWNED FIXED SQL (spec chapter arrives with plan todo 8). Parameter
 /// binding ONLY — user input is never interpolated. Reverse-mentions walk:
 /// document → its chunks → `mentions` edges (in = chunk, out = entity) →
@@ -87,9 +113,11 @@ pub async fn graph_query(
 /// surrealdb 3.x, while `out.name IN $names` over the edge rows works.
 const BACKLINK_ENTITIES_SQL: &str =
     "SELECT ->mentions->entity.name AS names FROM chunk WHERE meta::id(document) = $key";
-const BACKLINK_DOCUMENTS_SQL: &str =
+/// Row cap built from the server constant above (compile-time value, never
+/// user input) so the DB-side read is bounded per edge row.
+const BACKLINK_DOCUMENTS_SQL_TEMPLATE: &str =
     "SELECT meta::id(in.document) AS document_id, in.document.title AS title \
-     FROM mentions WHERE out.name IN $names";
+     FROM mentions WHERE out.name IN $names LIMIT {limit}";
 
 /// Documents whose chunks mention any entity this document's chunks mention
 /// (reverse `mentions` walk). A document with no extracted entities has no
@@ -151,17 +179,27 @@ pub async fn document_backlinks(
             _ => {}
         }
     }
+    // Dedup + cap before the names list crosses into the document walk: a
+    // document mentioning hundreds of entities must not multiply the walk.
+    let mut seen_names: HashSet<String> = HashSet::new();
+    let names: Vec<String> = names
+        .into_iter()
+        .filter(|name| seen_names.insert(name.clone()))
+        .take(MAX_BACKLINK_ENTITIES)
+        .collect();
     if names.is_empty() {
         return Ok(Json(BacklinksResponse {
             documents: Vec::new(),
         }));
     }
 
+    let sql =
+        BACKLINK_DOCUMENTS_SQL_TEMPLATE.replace("{limit}", &MAX_BACKLINK_DOCUMENTS.to_string());
     let mut r = state
         .kb
         .db()
         .db
-        .query(BACKLINK_DOCUMENTS_SQL)
+        .query(&sql)
         .bind(("names", names))
         .await
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("backlinks documents: {e}")))?;
@@ -170,7 +208,7 @@ pub async fn document_backlinks(
         .map_err(|e| SkbError::new(ErrorCode::Db, format!("backlinks documents take: {e}")))?;
 
     let mut seen: HashSet<String> = HashSet::new();
-    let mut documents = Vec::new();
+    let mut documents: Vec<BacklinkDocument> = Vec::new();
     for row in &rows {
         let Some(doc_key) = row.get("document_id").and_then(Value::as_str) else {
             continue;
@@ -188,5 +226,8 @@ pub async fn document_backlinks(
                 .to_string(),
         });
     }
+    // The SQL LIMIT counts edge rows; the dedup step above can expand beyond
+    // the response contract, so clamp the deduped list at the same bound.
+    documents.truncate(MAX_BACKLINK_DOCUMENTS);
     Ok(Json(BacklinksResponse { documents }))
 }

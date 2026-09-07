@@ -6,11 +6,13 @@
 //! failures surface as typed [`LlmError`]s so the chat handler can emit them
 //! as in-band SSE error events. The client caps hostile-upstream blast
 //! radius: error bodies and single SSE frames are size-capped, idle chunk
-//! reads time out, and an API key is never sent over plain HTTP.
+//! reads time out, and plain HTTP is rejected for everything but loopback
+//! peers (API key or not).
 
 use reqwest::{redirect, Client};
 use serde_json::json;
 use std::fmt;
+use std::net::IpAddr;
 use std::time::Duration;
 
 /// Environment variable selecting the OpenAI-compatible base URL.
@@ -57,6 +59,23 @@ impl LlmError {
     }
 }
 
+/// Whether a parsed base URL points at this machine only (loopback): a
+/// literal loopback IP or the `localhost` domain name.
+fn is_loopback_url(url: &reqwest::Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    // host_str carries IPv6 in bracketed form ("[::1]").
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
 impl fmt::Display for LlmError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -93,12 +112,16 @@ impl LlmClient {
         let base_url = std::env::var(ENV_BASE_URL).unwrap_or_else(|_| DEFAULT_BASE_URL.into());
         let model = std::env::var(ENV_MODEL).unwrap_or_else(|_| DEFAULT_MODEL.into());
         let api_key = std::env::var(ENV_API_KEY).ok().filter(|k| !k.is_empty());
-        if api_key.is_some() && !base_url.trim_start().starts_with("https://") {
-            // A bearer token over plain HTTP leaks the credential and every
-            // prompt to whoever can sniff the wire — including a local
-            // process that grabbed the port before the LLM came up.
+        // Plain HTTP is only acceptable to loopback peers: everything outside
+        // the machine sends the prompt (and any bearer token) cleartext over
+        // the wire, regardless of whether an API key is configured.
+        let url = reqwest::Url::parse(base_url.trim())
+            .map_err(|e| LlmError::Config(format!("SKB_LLM_BASE_URL is not a valid URL: {e}")))?;
+        if url.scheme() != "https" && !is_loopback_url(&url) {
             return Err(LlmError::Config(
-                "SKB_LLM_API_KEY requires an https:// SKB_LLM_BASE_URL".to_string(),
+                "SKB_LLM_BASE_URL must use https:// or a loopback http:// address (e.g. \
+                 http://127.0.0.1, http://localhost)"
+                    .to_string(),
             ));
         }
         let http = Client::builder()

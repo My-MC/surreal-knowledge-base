@@ -729,3 +729,192 @@ async fn logout_revokes_the_token_and_clears_the_cookie() {
         after.body
     );
 }
+
+/// Given: two concurrent PUTs against the same blog document with distinct
+///        replacement content.
+/// When:  both migrations target the same `blog_post` row.
+/// Then:  exactly one PUT wins and its returned document_id equals the
+///        registry's `blog_post.document` (no orphan replacement), while the
+///        loser either conflicts (409; its replacement compensated away) or
+///        misses the deleted original (404), and only the winning document
+///        remains.
+#[tokio::test]
+async fn concurrent_blog_puts_leave_the_registry_pointing_at_a_live_document() {
+    let _secret = EnvGuard::set(SECRET);
+    let _invites = EnvGuard::set_key(
+        "SKB_SERVER_AUTHOR_INVITES",
+        "author@example.com:tok-race-put",
+    );
+    let (state, _db) = test_state().await;
+    let kb = state.kb.clone();
+    let router = test_router(state);
+
+    let author_cookie = session_cookie(
+        &register_and_login(&router, "author@example.com", "pw", Some("tok-race-put")).await,
+    );
+    let upload = upload_blog(&router, Some(&author_cookie), "concurrent base", "Race Put").await;
+    let old_id = upload.body["document_id"].as_str().unwrap().to_string();
+
+    let old_url = format!("/api/documents/{old_id}");
+    let first_cookie = ("cookie", author_cookie.clone());
+    let first_headers = [first_cookie];
+    let second_cookie = ("cookie", author_cookie.clone());
+    let second_headers = [second_cookie];
+    let (first, second) = tokio::join!(
+        send(
+            router.clone(),
+            "PUT",
+            &old_url,
+            Some(json!({"content": "concurrent a", "title": "Race Put"})),
+            &first_headers,
+        ),
+        send(
+            router.clone(),
+            "PUT",
+            &old_url,
+            Some(json!({"content": "concurrent b", "title": "Race Put"})),
+            &second_headers,
+        ),
+    );
+
+    let winner = if first.status == StatusCode::OK {
+        &first
+    } else {
+        &second
+    };
+    let loser = if first.status == StatusCode::OK {
+        &second
+    } else {
+        &first
+    };
+    assert_eq!(
+        winner.status,
+        StatusCode::OK,
+        "first PUT: {} / second PUT: {}",
+        first.body,
+        second.body
+    );
+    assert!(
+        loser.status == StatusCode::CONFLICT || loser.status == StatusCode::NOT_FOUND,
+        "loser must be 409 (compensated) or 404 (original gone): first: {} / second: {}",
+        first.body,
+        second.body
+    );
+
+    let winner_id = winner.body["document_id"].as_str().unwrap().to_string();
+    assert_ne!(winner_id, old_id, "changed content must mint a new id");
+
+    // Registry row points exactly at the id the winning PUT returned.
+    let mut r = kb
+        .db()
+        .db
+        .query("SELECT meta::id(document) AS document_id FROM blog_post")
+        .await
+        .expect("registry query");
+    let rows: Vec<serde_json::Value> = r.take(0).expect("registry rows");
+    assert_eq!(rows.len(), 1, "registry rows: {rows:?}");
+    assert_eq!(
+        rows[0]["document_id"].as_str(),
+        Some(winner_id.trim_start_matches("document:")),
+        "registry must match the returned id"
+    );
+
+    // The winner is live and it is the only remaining document: the old
+    // original was deleted and the loser's replacement was compensated away.
+    let get = send(
+        router.clone(),
+        "GET",
+        &format!("/api/documents/{winner_id}"),
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(get.status, StatusCode::OK, "winner GET: {}", get.body);
+
+    let mut r = kb
+        .db()
+        .db
+        .query("SELECT VALUE meta::id(id) FROM document")
+        .await
+        .expect("document count query");
+    let docs: Vec<serde_json::Value> = r.take(0).expect("document rows");
+    assert_eq!(docs.len(), 1, "documents after race: {docs:?}");
+}
+
+/// Given: a blog document's registry row is removed by another writer
+///        (directly, in place of a racing DELETE) after the replacement
+///        document was minted by a PUT.
+/// When:  `migrate_blog_post` runs its UPDATE and matches zero rows.
+/// Then:  it fails with HTTP 409 instead of reporting success — the caller
+///        (`update_document`) compensates by deleting the replacement and
+///        surfaces this to the client, so the returned id can never diverge
+///        from `blog_post.document`.
+#[tokio::test]
+async fn migrate_blog_post_maps_a_zero_row_update_to_409() {
+    let _secret = EnvGuard::set(SECRET);
+    let _invites = EnvGuard::set_key(
+        "SKB_SERVER_AUTHOR_INVITES",
+        "author@example.com:tok-stale-registry",
+    );
+    let (state, _db) = test_state().await;
+    let kb = state.kb.clone();
+    let router = test_router(state);
+
+    let author_cookie = session_cookie(
+        &register_and_login(
+            &router,
+            "author@example.com",
+            "pw",
+            Some("tok-stale-registry"),
+        )
+        .await,
+    );
+    let upload = upload_blog(
+        &router,
+        Some(&author_cookie),
+        "stale base",
+        "Stale Registry",
+    )
+    .await;
+    let old_id = upload.body["document_id"].as_str().unwrap().to_string();
+
+    // The replacement document a PUT would have minted (plain upload: no
+    // `blog_post` marker, so the registry is untouched by it).
+    let replacement = send(
+        router.clone(),
+        "POST",
+        "/api/documents",
+        Some(json!({"content": "plain replacement body", "title": "Replacement"})),
+        &[],
+    )
+    .await;
+    assert_eq!(replacement.status, StatusCode::CREATED);
+    let replacement_id = replacement.body["document_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Simulate the concurrent writer that moved/removed the row the PUT
+    // authorized against: drop it through the direct DB handle.
+    let mut r = kb
+        .db()
+        .db
+        .query("DELETE FROM blog_post")
+        .await
+        .expect("registry delete");
+    let _: Vec<serde_json::Value> = r.take(0).expect("registry delete rows");
+
+    // A second AppState sharing the same store: the router consumed the
+    // original before the regression could drive the migration helper.
+    let probe = skb_server::AppState {
+        kb,
+        server_cfg: skb_server::ServerConfig::default(),
+    };
+    let result =
+        skb_server::handlers::blog::migrate_blog_post(&probe, &old_id, &replacement_id).await;
+    let err = result.expect_err(
+        "a migration matching no rows must not succeed: registry already moved or removed",
+    );
+    let response = axum::response::IntoResponse::into_response(err);
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+}
