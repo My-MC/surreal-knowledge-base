@@ -8,6 +8,7 @@
 //! direct surrealdb dependency).
 
 use axum::extract::{Path, State};
+use axum::http::StatusCode;
 use axum::Json;
 use serde::Serialize;
 use serde_json::Value;
@@ -130,6 +131,13 @@ pub async fn create_blog_post(
 
 /// Re-point the blog_post row at the replacement document after a PUT minted
 /// a new id (author and published state are preserved by the UPDATE).
+///
+/// An UPDATE matching zero rows means a concurrent PUT / DELETE already moved
+/// or removed the registry row while this handler ran: treating that as
+/// success would let `update_document` return a replacement id while
+/// `blog_post.document` still points elsewhere, orphaning the replacement.
+/// The empty result surfaces as HTTP 409 and the caller compensates by
+/// deleting the replacement document.
 pub async fn migrate_blog_post(
     state: &AppState,
     old_document_id: &str,
@@ -144,7 +152,18 @@ pub async fn migrate_blog_post(
         .bind(("new_key", document_key(new_document_id).to_string()))
         .await
         .map_err(db_err("blog_post migrate"))?;
-    let _updated: Vec<Value> = r.take(0).map_err(db_err("blog_post migrate take"))?;
+    let updated: Vec<Value> = r.take(0).map_err(db_err("blog_post migrate take"))?;
+    if updated.is_empty() {
+        return Err(ApiError::with_status(
+            SkbError::new(
+                ErrorCode::Validation,
+                format!(
+                    "blog_post registry for {old_document_id} was concurrently migrated or deleted; retry the PUT against the registry's current document"
+                ),
+            ),
+            StatusCode::CONFLICT,
+        ));
+    }
     Ok(())
 }
 

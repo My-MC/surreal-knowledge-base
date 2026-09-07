@@ -88,7 +88,10 @@ impl From<CoreGraphQueryResult> for GraphQueryResult {
 }
 
 /// Body of `POST /api/search/expand`: search hits plus the expansion hop
-/// depth consumed by core's `expand_search_hits`.
+/// depth consumed by core's `expand_search_hits`. Both axes are validated
+/// server-side at the API boundary before traversal: `max_expand` above
+/// core's `MAX_GRAPH_EXPAND` and more than `MAX_EXPAND_HITS` hits are 400
+/// `E_VALIDATION`.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct ExpandRequest {
     pub hits: Vec<SearchHit>,

@@ -328,18 +328,64 @@ impl Drop for EnvGuard {
     }
 }
 
-/// Given: SKB_LLM_API_KEY set and SKB_LLM_BASE_URL on plain http.
+/// Given: SKB_LLM_BASE_URL on plain remote HTTP without any API key.
+/// When:  resolving the LLM client.
+/// Then:  E_LLM_CONFIG — prompts travel cleartext over remote HTTP even
+///        when no bearer token is involved.
+#[tokio::test]
+async fn llm_rejects_remote_http_without_api_key() {
+    let _env = EnvGuard::set("SKB_LLM_BASE_URL", "http://203.0.113.10:11434/v1");
+    let err = match skb_server::llm::LlmClient::from_env() {
+        Err(err) => err,
+        Ok(_) => panic!("remote http without api key must fail"),
+    };
+    assert_eq!(err.code(), "E_LLM_CONFIG");
+}
+
+/// Given: SKB_LLM_API_KEY set and SKB_LLM_BASE_URL on plain remote HTTP.
 /// When:  resolving the LLM client.
 /// Then:  E_LLM_CONFIG — bearer tokens and prompts never travel cleartext.
 #[tokio::test]
-async fn llm_api_key_rejects_http_base_url() {
+async fn llm_rejects_remote_http_with_api_key() {
     let _env = (
         EnvGuard::set("SKB_LLM_API_KEY", "secret-token"),
-        EnvGuard::set("SKB_LLM_BASE_URL", "http://127.0.0.1:1/v1"),
+        EnvGuard::set("SKB_LLM_BASE_URL", "http://203.0.113.10:11434/v1"),
     );
     let err = match skb_server::llm::LlmClient::from_env() {
         Err(err) => err,
-        Ok(_) => panic!("http + api key must fail"),
+        Ok(_) => panic!("remote http + api key must fail"),
     };
     assert_eq!(err.code(), "E_LLM_CONFIG");
+}
+
+/// Given: SKB_LLM_BASE_URL on loopback HTTP (no API key).
+/// When:  resolving the LLM client.
+/// Then:  allowed — loopback traffic never leaves the machine.
+#[tokio::test]
+async fn llm_allows_loopback_http_without_api_key() {
+    // Both accepted loopback spellings: the localhost domain and a literal
+    // loopback IP (the default base URL's form).
+    let _env = EnvGuard::set("SKB_LLM_API_KEY", "secret-token");
+    let _url = EnvGuard::set("SKB_LLM_BASE_URL", "http://localhost:11434/v1");
+    assert!(
+        skb_server::llm::LlmClient::from_env().is_ok(),
+        "loopback http (localhost) + api key must be allowed"
+    );
+    let _url = EnvGuard::set("SKB_LLM_BASE_URL", "http://127.0.0.1:1/v1");
+    assert!(
+        skb_server::llm::LlmClient::from_env().is_ok(),
+        "loopback http (127.0.0.1) + api key must be allowed"
+    );
+}
+
+/// Given: SKB_LLM_BASE_URL on HTTPS without any API key.
+/// When:  resolving the LLM client.
+/// Then:  accepted — HTTPS is always allowed, key or not.
+#[tokio::test]
+async fn llm_allows_https_without_api_key() {
+    let _env = EnvGuard::set("SKB_LLM_BASE_URL", "https://llm.example.invalid/v1");
+    assert!(
+        skb_server::llm::LlmClient::from_env().is_ok(),
+        "https must resolve without an api key"
+    );
 }

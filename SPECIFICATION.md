@@ -779,7 +779,7 @@ MCP/CLIのゴールデン契約テストとnpm E2E用の専用ディレクトリ
 
 SurrealDB は組込みモード（SurrealKV）で動作するため、DB ファイルの所有者は 1 プロセスに限定される。マルチプロセススパイク（`crates/skb-server/SPIKE.md`、証跡 `target/evidence/01/`）の結果:
 
-- SurrealKv は `<db-path>/LOCK` によるクロスプロセス排他ロックを持つ。同一 `storage.path` への同時オープンは必ず 1 プロセスのみが成功し、敗者はオープン時点で即座に `E_DB`（"LOCK is already locked by another process"、終了コード 3）で失敗する。ブロックもリトライも破損も発生しない。
+- SurrealKv は `<db-path>/LOCK` によるクロスプロセス排他ロックを持つ。マルチプロセススパイクでは、同一 `storage.path` への同時オープンで 1 プロセスのみが成功し、敗者はオープン時点で即座に `E_DB`（"LOCK is already locked by another process"、終了コード 3）で失敗することが観測された。ブロックもリトライも破損も発生しない。この挙動は `crates/skb-server/tests/spike_multi_process.rs` の **観測スパイク** が記録する分類（ONE_PROCESS_FAILED / BOTH_SUCCEEDED_CONCURRENTLY のいずれも取り得る）であり、CI テストとしては表明されない。オープンがブロック・ハングした場合のみテストが失敗する。
 - このため **サーバープロセスが単一の DB 所有者** である。`skb-server` は起動時に `KnowledgeBase::open` を 1 回だけ呼び、プロセス生存中は保持し続ける。全 HTTP ハンドラはこの 1 インスタンスを共有し、サーバーはパスを再オープンしない。
 - **サーバー起動中は `skb` CLI / `skb-mcp` が同一 `storage.path` を開いてはならない**。オープンは即座に `E_DB` で失敗する。安全な読み取り専用の同時アクセスモードは存在しない。サーバー停止後は CLI/MCP がスタンドアロンで開いてよい。
 - リクエスト処理中に DB オープンエラーが発生した場合（外部プロセスがロックを奪った等）は `E_DB` 系 → HTTP 500 に写像される（サーバー側のストレージ障害でありクライアントエラーではない）。リトライループは持たず、オペレーターが所有権の競合を解消する。
@@ -858,7 +858,7 @@ port = 8080
 | `SKB_SERVER_HOST` / `SKB_SERVER_PORT` | toml 値（既定 127.0.0.1:8080） | リッスンアドレス。`SKB_SERVER_PORT` が数値でない場合は起動失敗（`E_CONFIG`） |
 | `SKB_LLM_BASE_URL` | `http://localhost:11434/v1` | OpenAI 互換 LLM のベース URL（`{base}/chat/completions` に POST）。上流からの応答には防御上限がある: エラー本文 8 KiB、SSE 1 フレーム 64 KiB（超過は `E_LLM_PROTOCOL`）、フラグメント間 60 秒の read timeout |
 | `SKB_LLM_MODEL` | `llama3.1` | チャットモデル |
-| `SKB_LLM_API_KEY` | 未設定 | Bearer トークン（空文字は未設定扱い）。設定時は **`https://` の `SKB_LLM_BASE_URL` のみ許可**（HTTP URL はチャット要求が `E_LLM_CONFIG` で終端する。API キーとプロンプトの平文漏えい防止） |
+| `SKB_LLM_API_KEY` | 未設定 | Bearer トークン（空文字は未設定扱い）。**`http://` は loopback 宛てのみ許可**（`localhost` / loopback IP）し、それ以外の遠隔 HTTP は **API キーの有無に関係なく `E_LLM_CONFIG` で拒否**する（プロンプトとトークンの平文漏えい防止）。HTTPS は常に許可 |
 | `SKB_CHAT_EXPAND_DEPTH` | 2 | チャット検索の `graph_expand` 深さ。上限 5（コア `MAX_GRAPH_EXPAND`、超過は切り詰め）、パース不能値は既定 |
 | `SKB_CHAT_TOKEN_BUDGET` | 4000 | プロンプト全体の文字予算（固定指示文 + 質問文 + 引用断片の合計）。超過する質問文は文字境界で切り詰められ、引用断片は残り予算を共有する。文字ベースの近似（約 4 文字/トークン）。実トークナイザは意図的に導入しない |
 | `SKB_SERVER_JWT_SECRET` | 未設定 | JWT 署名鍵（HS256、有効期限 24 時間）。**未設定でも起動は継続** し warning を出力する。JWT 検証を要するパス（login、publish、`app=blog` の POST /api/documents の author 必須分岐、blog document の PUT/DELETE）は 503 `E_CONFIG` を返す。register と公開 GET は影響を受けない。**32 文字未満の弱い secret も未設定と同等に 503** する（総当たり可能な鍵で HS256 トークンを偽造できないようにするため） |
@@ -900,7 +900,8 @@ LLM 系環境変数と JWT secret はリクエスト毎に読まれる（テス�
 5. **`after` キーセットカーソルのサーバー側エミュレーション**: コアの行値比較 SQL（`(created_at, meta::id(id)) < (...)`）は surrealdb 3.x でパースできないため、サーバーは順序付き走査（上限 10,000 件）+ スライスでカーソルを再現する。カーソルがどのドキュメントにも一致しない場合は 400 を返す（黙って誤ったページを返さない）。コア修正後はこのシムを削除する。
 6. **検索ヒットの `document_id` は `document:<key>` の完全レコード形に正規化** する（サーバー DTO 境界で変換）。コアは素のキーを返すが、ドキュメント系エンドポイントは前置き付きの形しか受け付けない（素キーは 400）。これにより検索応答の id が全エンドポイントでそのまま使える。
 7. **HTTP 経由では `path` アップロードを受け付けない**: `POST`/`PUT /api/documents` の DTO は `url` / `content` / `content_base64` のみ。サーバー側ファイル読み込みを外部入力から解放するとパス走査（`/etc/passwd` 等）になるため（CLI / MCP は引き続き `path` を保持する）。
-8. **POST /api/search/expand の `max_expand` は API 境界で検証** する（コア `MAX_GRAPH_EXPAND` 超過は 400 `E_VALIDATION`。トラバーサル開始前に拒否する）。
+8. **POST /api/search/expand はリクエスト両軸を API 境界で検証** する。`max_expand`（コア `MAX_GRAPH_EXPAND` 超過）と `hits` 件数（`MAX_EXPAND_HITS` = 100 超過）はどちらもトラバーサル開始前に 400 `E_VALIDATION` で拒否する。
+9. **`GET /api/documents/{id}/backlinks` はサーバー側で上限を設ける**: ドキュメントから抽出したエンティティ名は重複排除の上 `MAX_BACKLINK_ENTITIES` = 64 件、返答 `documents` は `MAX_BACKLINK_DOCUMENTS` = 100 件に切り詰める（バックエンド SQL にも同一上限の `LIMIT` を固定定数として組み込む）。積極的なページング契約は後続で検討する。
 
 ### 20.7 MVPデスコープ
 

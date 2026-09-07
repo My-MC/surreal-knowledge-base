@@ -1,0 +1,16 @@
+.doc {
+  max-width: 46rem;
+  margin: 0 auto;
+  padding: var(--space-4) var(--space-2);
+}
+
+.title {
+  margin: 0 0 var(--space-3);
+  font-size: 1.35rem;
+  line-height: 1.4;
+}
+
+.state {
+  padding: var(--space-4) var(--space-2);
+  color: var(--color-text-muted, #666);
+}
