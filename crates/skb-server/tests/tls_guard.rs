@@ -2,9 +2,12 @@
 //! and `native-tls` must be ABSENT from the dependency graph
 //! (CONTRIBUTING.md "TLS"). `cargo tree -i <pkg>` exits non-zero when the
 //! package ID specification matches nothing, so non-zero exit = pass.
-//! `--all-features` includes feature-gated deps (e.g. `ort`) in the graph.
-//! Runs offline against Cargo.lock; `cargo tree` performs no builds and
-//! takes no target-dir lock, so it is safe inside `cargo test`.
+//! `--all-features` includes feature-gated deps (e.g. `ort`) in the graph;
+//! resolving them may fetch their crates on first run (documented cost).
+//! `cargo tree` performs no builds and takes no target-dir lock, so it is
+//! safe inside `cargo test`. A resolution or network failure is NOT treated
+//! as "package absent": only the "did not match any packages" stderr passes
+//! (`--locked` keeps the graph pinned).
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -15,9 +18,9 @@ fn workspace_root() -> PathBuf {
 
 fn inverted_tree_must_fail(package: &str) {
     let output = Command::new("cargo")
-        // --offline + --locked: a dependency-resolution or network failure
-        // must NOT read as "package absent" and silently pass the guard.
-        .args(["tree", "--offline", "--locked", "--all-features", "-i", package])
+        // --locked: a dependency-resolution or network failure is caught by
+        // the reason assertion below, never silently read as "absent".
+        .args(["tree", "--locked", "--all-features", "-i", package])
         .current_dir(workspace_root())
         .output()
         .unwrap_or_else(|e| panic!("failed to run cargo tree -i {package}: {e}"));
