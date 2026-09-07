@@ -1,0 +1,69 @@
+.list {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.empty {
+  margin: auto;
+  opacity: 0.7;
+  font-size: var(--font-size-sm);
+  text-align: center;
+}
+
+.rowUser {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.rowAssistant {
+  display: flex;
+  justify-content: flex-start;
+}
+
+.bubbleUser,
+.bubbleAssistant {
+  max-width: min(640px, 85%);
+  border-radius: var(--radius-md);
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--font-size-sm);
+}
+
+.bubbleUser {
+  background: var(--color-primary);
+  color: var(--color-surface);
+}
+
+.bubbleAssistant {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+}
+
+.userText {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.hint {
+  margin: 0;
+  opacity: 0.7;
+}
+
+.stopped {
+  margin: var(--space-1) 0 0;
+  font-size: var(--font-size-xs);
+  opacity: 0.7;
+}
+
+.error {
+  margin: var(--space-2) 0 0;
+  padding: var(--space-2);
+  border: 1px solid var(--color-error);
+  border-radius: var(--radius-sm);
+  color: var(--color-error);
+  overflow-wrap: anywhere;
+}

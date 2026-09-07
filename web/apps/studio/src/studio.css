@@ -1,0 +1,86 @@
+/*
+ * Studio app shell — chat column (left/center) + citation panel (right).
+ * All colors and spacing reference @skb/ui tokens.css.
+ */
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-family-sans);
+  background: var(--color-background);
+  color: var(--color-text);
+}
+
+.studio-shell {
+  display: flex;
+  height: 100vh;
+}
+
+.studio-layout {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  max-width: 860px;
+  margin: 0 auto;
+}
+
+/*
+ * Citation rail: fixed right column so the chat width stays stable when
+ * hits arrive. Narrow viewports stack it under the chat instead of hiding
+ * it — the なぜ引用されたか context stays reachable while composing.
+ */
+.studio-panel {
+  width: 320px;
+  flex-shrink: 0;
+  overflow-y: auto;
+  padding: var(--space-3) var(--space-4);
+  border-left: 1px solid var(--color-border);
+  background: var(--color-surface);
+}
+
+@media (max-width: 900px) {
+  .studio-shell {
+    flex-direction: column;
+  }
+
+  .studio-layout {
+    max-width: none;
+  }
+
+  .studio-panel {
+    width: auto;
+    max-height: 40vh;
+    border-left: none;
+    border-top: 1px solid var(--color-border);
+  }
+}
+
+.studio-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--color-border);
+  background: var(--color-surface);
+}
+
+.studio-title {
+  margin: 0;
+  font-size: var(--font-size-lg);
+  font-weight: 600;
+}
+
+.studio-clear {
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface);
+  color: var(--color-text);
+  font-size: var(--font-size-xs);
+  font-family: inherit;
+  cursor: pointer;
+}
