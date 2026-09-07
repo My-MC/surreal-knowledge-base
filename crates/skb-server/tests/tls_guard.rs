@@ -2,6 +2,7 @@
 //! and `native-tls` must be ABSENT from the dependency graph
 //! (CONTRIBUTING.md "TLS"). `cargo tree -i <pkg>` exits non-zero when the
 //! package ID specification matches nothing, so non-zero exit = pass.
+//! `--all-features` includes feature-gated deps (e.g. `ort`) in the graph.
 //! Runs offline against Cargo.lock; `cargo tree` performs no builds and
 //! takes no target-dir lock, so it is safe inside `cargo test`.
 
@@ -16,7 +17,7 @@ fn inverted_tree_must_fail(package: &str) {
     let output = Command::new("cargo")
         // --offline + --locked: a dependency-resolution or network failure
         // must NOT read as "package absent" and silently pass the guard.
-        .args(["tree", "--offline", "--locked", "-i", package])
+        .args(["tree", "--offline", "--locked", "--all-features", "-i", package])
         .current_dir(workspace_root())
         .output()
         .unwrap_or_else(|e| panic!("failed to run cargo tree -i {package}: {e}"));
