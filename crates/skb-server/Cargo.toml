@@ -1,0 +1,56 @@
+[package]
+name = "skb-server"
+version = "0.1.0"
+edition = "2021"
+rust-version.workspace = true
+description = "Surreal Knowledge Base - HTTP API server"
+
+[[bin]]
+name = "skb-server"
+path = "src/main.rs"
+
+[features]
+default = []
+ort = ["skb-core/ort"]
+
+[dependencies]
+skb-core = { path = "../skb-core" }
+# Web stack pins are exact per the implementation plan; tokio/clap follow the
+# workspace-wide major-line requirement ("1" / "4") shared with skb-cli and
+# skb-core — a literal `=1`/`=4` would pin 1.0.0/4.0.0 and break the workspace.
+axum = "=0.8.9"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
+# reqwest 0.13 renamed the 0.12 `rustls-tls` feature to `rustls`; with
+# `default-features = false` this stays rustls-only (TLS guard: no native-tls).
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "json"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tower-http = { version = "=0.7.0", features = ["cors", "trace", "timeout", "fs", "compression-gzip"] }
+utoipa = "=5.5.0"
+utoipa-swagger-ui = { version = "=9.0.2", features = ["axum"] }
+validator = { version = "=0.21.0", features = ["derive"] }
+# Auth (plan todo 7): Argon2id password hashing (password-hash is a default
+# feature) and JWT HS256. jsonwebtoken 11 has no default crypto backend —
+# `rust_crypto` selects the pure-Rust hmac/sha2 provider, keeping the TLS
+# guard green (no ring/aws-lc-rs/openssl in the graph).
+argon2 = "0.6"
+jsonwebtoken = { version = "11", features = ["rust_crypto"] }
+# Logout revocation ids: v4 jti per issued session token (os-random, no
+# native-TLS involvement — the TLS guard stays green).
+uuid = { version = "1", features = ["v4"] }
+# Constant-time comparison of author invite tokens (no timing oracle on the
+# HTTP handler path).
+subtle = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = { workspace = true }
+toml = "1.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+# In-process router tests (oneshot) and the port-0 spawn protocol test.
+tokio = { version = "1", features = ["io-util", "process"] }
+# Mock OpenAI LLM upstream for the chat SSE tests.
+wiremock = "0.6"
