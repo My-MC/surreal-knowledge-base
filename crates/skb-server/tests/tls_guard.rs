@@ -14,16 +14,22 @@ fn workspace_root() -> PathBuf {
 
 fn inverted_tree_must_fail(package: &str) {
     let output = Command::new("cargo")
-        .args(["tree", "-i", package])
+        // --offline + --locked: a dependency-resolution or network failure
+        // must NOT read as "package absent" and silently pass the guard.
+        .args(["tree", "--offline", "--locked", "-i", package])
         .current_dir(workspace_root())
         .output()
         .unwrap_or_else(|e| panic!("failed to run cargo tree -i {package}: {e}"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         !output.status.success(),
         "cargo tree -i {package} must exit non-zero (package absent), but it \
-         succeeded — TLS guard violated:\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+         succeeded — TLS guard violated:\nstdout: {}\nstderr: {stderr}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        stderr.contains("did not match any packages"),
+        "cargo tree -i {package} failed for another reason than package absence:\nstderr: {stderr}"
     );
 }
 
