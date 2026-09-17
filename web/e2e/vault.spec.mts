@@ -37,7 +37,7 @@ test("vault: backlinks, graph view, cmd+k search, and selection qa", async ({ pa
   // -- Step 1: fresh vault -> 新規作成 -> /doc/{id} with editor -------------
   await page.goto("/");
   // Scoped to main: the tree header carries a second 新規作成 button.
-  const createButton = page.locator(".vault-main").getByRole("button", { name: "新規作成" });
+  const createButton = page.locator(".vault-sidebar").getByRole("button", { name: "新規作成" });
   await expect(createButton).toBeVisible();
   await createButton.click();
   await page.waitForURL(/\/doc\//);
@@ -67,8 +67,7 @@ test("vault: backlinks, graph view, cmd+k search, and selection qa", async ({ pa
   const seeded = await request.post("/api/documents", {
     data: {
       title: "Bar",
-      content:
-        "# Bar\n\nBar についての文書です。Bar は重要なトピックで、Bar への参照が複数あります。",
+      content: "# Bar\n\nBar についての文書です。Bar は重要なトピックで、[[Bar]] を参照します。",
     },
   });
   expect(seeded.ok()).toBeTruthy();

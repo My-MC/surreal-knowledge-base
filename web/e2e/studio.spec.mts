@@ -1,4 +1,4 @@
-import { mkdirSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { expect, type Page, test } from "@playwright/test";
 import { repoRoot } from "./helpers.mts";
@@ -25,6 +25,17 @@ const evidenceDir = path.join(repoRoot, "target", "evidence", "17");
 
 type DocumentResponse = { document_id: string };
 type DocumentSummary = { id: string };
+
+type E2eAuthFixture = {
+  readonly seederEmail: string;
+  readonly bloggerEmail: string;
+};
+
+function readE2eAuthFixture(): E2eAuthFixture {
+  return JSON.parse(
+    readFileSync(path.join(repoRoot, "target", "e2e-auth.json"), "utf8"),
+  ) as E2eAuthFixture;
+}
 
 /** Rendered markdown length of the LAST assistant bubble (0 while the hint shows). */
 async function lastAssistantMarkdownLength(page: Page): Promise<number> {
@@ -101,14 +112,23 @@ test("studio: citation panel empty state for a citation-less response", async ({
   // deterministic citation-less response is an empty chunk table: wipe every
   // document via the API, then send a message — search returns 0 hits and
   // the citation event carries an empty list.
-  const listed = await request.get(`${STUDIO_URL}api/documents?limit=10000`);
-  expect(listed.ok()).toBeTruthy();
-  const documents = (await listed.json()) as DocumentSummary[];
-  for (const document of documents) {
-    const deleted = await request.delete(
-      `${STUDIO_URL}api/documents/${encodeURIComponent(document.id)}`,
-    );
-    expect(deleted.ok()).toBeTruthy();
+  const fixture = readE2eAuthFixture();
+  for (const email of [fixture.seederEmail, fixture.bloggerEmail]) {
+    const loggedIn = await request.post(`${STUDIO_URL}api/auth/login`, {
+      data: { email, password: "blog-e2e-passw0rd" },
+    });
+    expect(loggedIn.ok()).toBeTruthy();
+    const listed = await request.get(`${STUDIO_URL}api/documents?limit=10000`);
+    expect(listed.ok()).toBeTruthy();
+    const documents = (await listed.json()) as DocumentSummary[];
+    for (const document of documents) {
+      const deleted = await request.delete(
+        `${STUDIO_URL}api/documents/${encodeURIComponent(document.id)}`,
+      );
+      if (!deleted.ok()) {
+        expect(deleted.status()).toBe(403);
+      }
+    }
   }
 
   // -- Step 2: send a message that matches nothing ---------------------------
