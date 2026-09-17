@@ -21,7 +21,7 @@ path = "./skb-data"
 Then invoke the CLI through Cargo:
 
 ```bash
-cargo run -p skb -- upload --path README.md --title "Project README"
+cargo run -p skb -- upload README.md --title "Project README"
 cargo run -p skb -- search "hybrid search" --mode hybrid --top-k 10
 cargo run -p skb -- list --limit 20
 cargo run -p skb -- doctor
@@ -42,8 +42,8 @@ vector, and keyword search; document CRUD; graph management; configuration;
 diagnostics; and reindexing. Use `--format json` for machine-readable output.
 
 ```bash
-skb upload --path notes.md --tags "project,notes"
-skb graph query --from "SurrealDB"
+skb upload notes.md --tags "project,notes"
+skb graph query "SurrealDB"
 skb reindex --dry-run
 skb config show
 ```

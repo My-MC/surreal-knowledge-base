@@ -24,7 +24,7 @@ port = 8080
 Then run:
 
 ```bash
-cargo run -p skb-server -- --port 8080
+cargo run -p skb-server --bin skb-server -- --port 8080
 ```
 
 The generated API contract is at `http://127.0.0.1:8080/api/openapi.json` and

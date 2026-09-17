@@ -88,7 +88,7 @@ port = 8080
 
 ```bash
 # 文書をアップロード
-skb upload --path README.md --title "README"
+skb upload README.md --title "README"
 
 # URL からアップロード
 skb upload --url https://example.com/doc.md --tags "docs,example"
@@ -117,12 +117,10 @@ skb doctor
 
 ### MCP サーバー
 
-stdio トランスポートで起動：
+開発時はリポジトリルートから stdio サーバーを起動します：
 
 ```bash
-npx surreal-knowledge-base
-# または:
-bunx surreal-knowledge-base
+cargo run -p skb-mcp --bin skb-mcp
 ```
 
 #### クライアント設定（opencode / Claude Desktop）
@@ -132,7 +130,7 @@ bunx surreal-knowledge-base
   "mcp": {
     "surreal-knowledge-base": {
       "type": "local",
-      "command": ["npx", "-y", "surreal-knowledge-base"],
+      "command": ["cargo", "run", "-p", "skb-mcp", "--bin", "skb-mcp"],
       "enabled": true
     }
   }
@@ -146,7 +144,7 @@ bunx surreal-knowledge-base
 
 ```bash
 # 上記の mock 設定なら ort feature なしで起動できます。
-cargo run -p skb-server -- --port 8080
+cargo run -p skb-server --bin skb-server -- --port 8080
 
 # または実埋め込みを使う release ビルドを起動します。
 ./target/release/skb-server --port 8080
@@ -186,7 +184,7 @@ bun --filter @skb/blog dev    # 公開知識ブログと著者向け投稿フロ
 
 | コマンド | 説明 |
 |---|---|
-| `skb upload --path <FILE>` | ファイルをアップロード（`--recursive`、`--metadata JSON`、`--force`） |
+| `skb upload <FILE>` | ファイルをアップロード（`--recursive`、`--metadata JSON`、`--force`） |
 | `skb upload --url <URL>` | URL からアップロード |
 | `skb upload --stdin` | 標準入力からアップロード |
 | `skb search <QUERY>` | 検索（`--mode hybrid\|vector\|keyword --top-k N --filter KEY=VALUE`） |
@@ -194,12 +192,12 @@ bun --filter @skb/blog dev    # 公開知識ブログと著者向け投稿フロ
 | `skb get <ID>` | 文書詳細（`--chunks`） |
 | `skb delete <ID>` | 文書削除（`--yes`） |
 | `skb stats` | 統計情報 |
-| `skb graph query --from <ENTITY>` | 知識グラフ検索 |
+| `skb graph query <ENTITY>` | 知識グラフ検索 |
 | `skb graph entity <NAME> --kind <KIND>` | エンティティ追加・更新 |
 | `skb graph link <FROM> <TO>` | エンティティ間リンク |
 | `skb reindex` | 全文書を再インデックス（`--dry-run` 対応） |
 | `skb config init\|show\|set` | 設定管理 |
-| `npx surreal-knowledge-base` | MCP サーバー起動 |
+| `cargo run -p skb-mcp --bin skb-mcp` | 開発用 MCP サーバー起動 |
 | `skb doctor` | 診断実行 |
 
 全コマンドで `--format json` を指定すると構造化出力になります。
@@ -300,6 +298,7 @@ bun run sse-smoke
 
 # ブラウザ E2E テスト（先に skb-server と mock_llm をビルド）
 cargo build --manifest-path ../Cargo.toml -p skb-server --bin skb-server --examples
+bunx playwright install chromium
 bunx playwright test
 ```
 

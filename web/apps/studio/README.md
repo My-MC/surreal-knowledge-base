@@ -12,7 +12,7 @@ Studio is a Vite application inside the `web/` Bun workspace. Start
 
 ```bash
 # Repository root: start the API server
-cargo run -p skb-server -- --port 8080
+cargo run -p skb-server --bin skb-server -- --port 8080
 
 # In another terminal
 cd web
@@ -47,6 +47,7 @@ bun --filter @skb/studio build
 
 # End-to-end chat verification
 cargo build --manifest-path ../Cargo.toml -p skb-server --bin skb-server --examples
+bunx playwright install chromium
 bunx playwright test e2e/studio.spec.mts
 ```
 

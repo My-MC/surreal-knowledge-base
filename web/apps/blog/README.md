@@ -15,7 +15,7 @@ Set server authentication configuration before testing author flows:
 ```bash
 export SKB_SERVER_JWT_SECRET='replace-with-a-strong-32-character-secret'
 export SKB_SERVER_AUTHOR_INVITES='writer@example.com:invite-token'
-cargo run -p skb-server -- --port 8080
+cargo run -p skb-server --bin skb-server -- --port 8080
 ```
 
 Then run Blog from the web workspace:
@@ -48,6 +48,7 @@ bun --filter @skb/blog typecheck
 bun --filter @skb/blog build
 
 cargo build --manifest-path ../Cargo.toml -p skb-server --bin skb-server --examples
+bunx playwright install chromium
 bunx playwright test e2e/blog.spec.mts
 ```
 

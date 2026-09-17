@@ -88,7 +88,7 @@ port = 8080
 
 ```bash
 # Upload a document
-skb upload --path README.md --title "README"
+skb upload README.md --title "README"
 
 # Upload from URL
 skb upload --url https://example.com/doc.md --tags "docs,example"
@@ -117,12 +117,10 @@ skb doctor
 
 ### MCP Server
 
-Start the server through the npm package (stdio transport):
+For development, start the stdio server from the repository root:
 
 ```bash
-npx surreal-knowledge-base
-# or:
-bunx surreal-knowledge-base
+cargo run -p skb-mcp --bin skb-mcp
 ```
 
 #### Client configuration (opencode / Claude Desktop)
@@ -132,7 +130,7 @@ bunx surreal-knowledge-base
   "mcp": {
     "surreal-knowledge-base": {
       "type": "local",
-      "command": ["npx", "-y", "surreal-knowledge-base"],
+      "command": ["cargo", "run", "-p", "skb-mcp", "--bin", "skb-mcp"],
       "enabled": true
     }
   }
@@ -146,7 +144,7 @@ or MCP server against the same `[storage].path` while it is running.
 
 ```bash
 # The mock configuration above lets this run without the ort feature.
-cargo run -p skb-server -- --port 8080
+cargo run -p skb-server --bin skb-server -- --port 8080
 
 # Or run the real-embedding release build.
 ./target/release/skb-server --port 8080
@@ -186,7 +184,7 @@ bun --filter @skb/blog dev    # Public knowledge blog and authoring flow
 
 | Command | Description |
 |---|---|
-| `skb upload --path <FILE>` | Upload a file (`--recursive`, `--metadata JSON`, `--force`) |
+| `skb upload <FILE>` | Upload a file (`--recursive`, `--metadata JSON`, `--force`) |
 | `skb upload --url <URL>` | Upload from URL |
 | `skb upload --stdin` | Upload from stdin |
 | `skb search <QUERY>` | Search documents (`--mode hybrid\|vector\|keyword --top-k N --filter KEY=VALUE`) |
@@ -194,12 +192,12 @@ bun --filter @skb/blog dev    # Public knowledge blog and authoring flow
 | `skb get <ID>` | Get document details (`--chunks`) |
 | `skb delete <ID>` | Delete a document (`--yes`) |
 | `skb stats` | Show statistics |
-| `skb graph query --from <ENTITY>` | Query knowledge graph |
+| `skb graph query <ENTITY>` | Query knowledge graph |
 | `skb graph entity <NAME> --kind <KIND>` | Add/update an entity |
 | `skb graph link <FROM> <TO>` | Link two entities |
 | `skb reindex` | Reindex all documents (`--dry-run` supported) |
 | `skb config init\|show\|set` | Manage configuration |
-| `npx surreal-knowledge-base` | Start the MCP server |
+| `cargo run -p skb-mcp --bin skb-mcp` | Start the development MCP server |
 | `skb doctor` | Run diagnostics |
 
 All commands support `--format json` for structured output.
@@ -300,6 +298,7 @@ bun run sse-smoke
 
 # Run browser end-to-end tests (build skb-server and mock_llm first)
 cargo build --manifest-path ../Cargo.toml -p skb-server --bin skb-server --examples
+bunx playwright install chromium
 bunx playwright test
 ```
 

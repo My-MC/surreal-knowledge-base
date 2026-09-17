@@ -13,7 +13,7 @@ running `skb-server`; its development proxy sends `/api` requests to
 From the repository root, start the server with mock embeddings:
 
 ```bash
-cargo run -p skb-server -- --port 8080
+cargo run -p skb-server --bin skb-server -- --port 8080
 ```
 
 In another terminal, install the web workspace and start Vault:
@@ -50,6 +50,7 @@ and its mock LLM before running it:
 
 ```bash
 cargo build --manifest-path ../Cargo.toml -p skb-server --bin skb-server --examples
+bunx playwright install chromium
 bunx playwright test e2e/vault.spec.mts
 ```
 

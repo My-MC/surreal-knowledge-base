@@ -22,11 +22,8 @@ path = "./skb-data"
 cargo run -p skb-mcp
 ```
 
-For a packaged client installation, use the npm launcher:
-
-```bash
-npx -y surreal-knowledge-base
-```
+The npm package is not published yet. Use the Cargo command above for local
+development; after publication, the package will provide the `skb-mcp` launcher.
 
 The transport is stdio. Keep stdout reserved for MCP protocol messages; use
 stderr for diagnostics.
@@ -46,7 +43,7 @@ Example client configuration:
   "mcp": {
     "surreal-knowledge-base": {
       "type": "local",
-      "command": ["npx", "-y", "surreal-knowledge-base"],
+      "command": ["cargo", "run", "-p", "skb-mcp", "--bin", "skb-mcp"],
       "enabled": true
     }
   }
