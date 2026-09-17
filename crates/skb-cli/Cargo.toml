@@ -31,4 +31,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # upstream README) so MSRV stays at the direct-deps floor (1.88).
 # Exact pin (=) mirrors the ureq policy in skb-core/Cargo.toml and blocks
 # silent jumps to 4.x when a transitive resolver picks a newer minor.
-serial_test = "=3.2.0"
+serial_test = "=4.0.1"
