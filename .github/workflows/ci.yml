@@ -708,7 +708,7 @@ jobs:
     name: CI gate (required)
     runs-on: ubuntu-24.04
     if: always()
-    needs: [test, build, smoke, e2e-linux-arm64, e2e-macos, e2e-windows]
+    needs: [test, build, smoke, e2e-linux-arm64, e2e-macos, e2e-windows, web-e2e]
     timeout-minutes: 5
     permissions:
       contents: read
