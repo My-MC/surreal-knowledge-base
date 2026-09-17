@@ -24,7 +24,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal
 # `default-features = false` this stays rustls-only (TLS guard: no native-tls).
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "json"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
-tower-http = { version = "=0.7.0", features = ["cors", "trace", "timeout", "fs", "compression-gzip"] }
+tower-http = { version = "=0.7.1", features = ["cors", "trace", "timeout", "fs", "compression-gzip"] }
 utoipa = "=5.5.0"
 utoipa-swagger-ui = { version = "=9.0.2", features = ["axum"] }
 validator = { version = "=0.21.0", features = ["derive"] }
