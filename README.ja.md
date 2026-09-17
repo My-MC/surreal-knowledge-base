@@ -4,7 +4,7 @@
 
 埋め込み [SurrealDB](https://surrealdb.com/)（SurrealKV）と
 [BAAI/bge-m3](https://huggingface.co/BAAI/bge-m3) によるハイブリッド検索（ベクトル +
-BM25）と知識グラフを備えたローカルファースト知識ベース。MCP サーバーと CLI として提供します。
+BM25）と知識グラフを備えたローカルファースト知識ベース。MCP サーバー、CLI、HTTP API、3つの Web アプリケーションとして提供します。
 
 > English version: [README.md](README.md)
 
@@ -19,6 +19,8 @@ BM25）と知識グラフを備えたローカルファースト知識ベース�
 - **再インデックス** — 埋め込みモデルやチャンク設定の変更を既存データに適用
 - **MCP サーバー** — 10 ツール（Claude Desktop / opencode / 任意の MCP クライアント対応）
 - **CLI** — `skb` コマンドで全機能を提供（MCP と同等の機能パリティ）
+- **HTTP API** — OpenAPI を備えた文書・検索・グラフ・SSE チャット・認証・ブログ API
+- **Web アプリケーション** — 編集用 Vault、引用付き RAG チャット用 Studio、知識公開用 Blog
 - **実埋め込み** — BAAI/bge-m3 ONNX Runtime 推論（オプション、`ort` feature）
 
 ## 構成
@@ -27,8 +29,10 @@ BM25）と知識グラフを備えたローカルファースト知識ベース�
 crates/
 ├── skb-core/    コアライブラリ（DB、埋め込み、トークン化、検索、グラフ、取り込み）
 ├── skb-cli/     CLI バイナリ（skb）
-└── skb-mcp/     MCP サーバーバイナリ（skb-mcp）
+├── skb-mcp/     MCP サーバーバイナリ（skb-mcp）
+└── skb-server/  HTTP API サーバー（skb-server）
 npm/             npm メタパッケージ + プラットフォーム別パッケージ
+web/             Vault、Studio、Blog、共有 API クライアント、UI を含む Bun workspace
 schema/          SurrealDB マイグレーション（001_init.surql）
 skills/          opencode エージェント Skill
 ```
@@ -37,7 +41,8 @@ skills/          opencode エージェント Skill
 
 - [Rust](https://rustup.rs/) 1.88+
 - 実埋め込み（`--features ort`）の場合：初回ビルド時に ONNX Runtime を自動ダウンロード（約 15 分、`~/.cache/ort.pyke.io` にキャッシュ）
-- MCP/CLI の初回実行時（mock 埋め込みでも）：tokenizer.json を Hugging Face から自動ダウンロード（約 17 MB、`~/.cache/huggingface` にキャッシュ）
+- CLI/MCP/HTTP サーバーの初回実行時（mock 埋め込みでも）：tokenizer.json を Hugging Face から自動ダウンロード（約 17 MB、`~/.cache/huggingface` にキャッシュ）
+- Web アプリケーション: [Bun](https://bun.sh/) 1.4+
 
 ## クイックスタート
 
@@ -49,6 +54,9 @@ cargo build
 
 # 実 BAAI/bge-m3 埋め込み（本番用）
 cargo build --release -p skb-mcp --features ort
+
+# 実 BAAI/bge-m3 埋め込みを使う HTTP API（本番用）
+cargo build --release -p skb-server --features ort
 ```
 
 ### 設定
@@ -63,6 +71,10 @@ dimension = 8
 
 [storage]
 path = "./skb-data"
+
+[server]
+host = "127.0.0.1"
+port = 8080
 
 # 実埋め込み（BAAI/bge-m3）
 # [embedding]
@@ -126,6 +138,49 @@ bunx surreal-knowledge-base
   }
 }
 ```
+
+### HTTP API サーバー
+
+`skb-server` は実行中に組み込み DB を所有します。稼働中は同じ `[storage].path`
+に対して CLI や MCP サーバーを起動しないでください。
+
+```bash
+# 上記の mock 設定なら ort feature なしで起動できます。
+cargo run -p skb-server -- --port 8080
+
+# または実埋め込みを使う release ビルドを起動します。
+./target/release/skb-server --port 8080
+```
+
+API は `http://127.0.0.1:8080` で利用できます。生成された契約は
+[`/api/openapi.json`](http://127.0.0.1:8080/api/openapi.json)、操作画面は
+[`/swagger-ui`](http://127.0.0.1:8080/swagger-ui) で確認できます。チャット API は
+OpenAI 互換 LLM から回答をストリーミングします。サーバーと LLM の設定は
+[SPECIFICATION.md](SPECIFICATION.md) を参照してください。
+
+### Web アプリケーション
+
+最初に `skb-server` を起動し、続いて Bun workspace の依存をインストールします。
+
+```bash
+cd web
+bun install
+```
+
+`web/` からアプリケーションを起動します。各 Vite 開発サーバーは `/api` を
+`SKB_SERVER_PORT`（既定は `8080`）へプロキシします。
+
+```bash
+bun --filter @skb/vault dev   # Markdown ナレッジベースエディタ
+bun --filter @skb/studio dev  # 引用付き RAG チャット
+bun --filter @skb/blog dev    # 公開知識ブログと著者向け投稿フロー
+```
+
+| アプリケーション | 用途 |
+|---|---|
+| Vault | Markdown 文書の閲覧、編集、自動保存、検索、グラフ連携。 |
+| Studio | ナレッジベースへの質問と、引用を伴うストリーミング回答の確認。 |
+| Blog | 公開済み文書の閲覧。招待された著者はサインイン、投稿、公開が可能。 |
 
 ## CLI コマンド一覧
 
@@ -227,6 +282,25 @@ cargo bench
 
 # ベンチマーク（実 BAAI/bge-m3、ort feature 必要）
 cargo bench --features ort
+```
+
+### Web 開発
+
+```bash
+cd web
+
+# workspace のフォーマットとリント
+bun run biome
+
+# 全アプリケーションと共有パッケージの型検査
+bun --filter '*' typecheck
+
+# SSE スモークテスト（モック LLM と HTTP サーバーを自身で起動）
+bun run sse-smoke
+
+# ブラウザ E2E テスト（先に skb-server と mock_llm をビルド）
+cargo build --manifest-path ../Cargo.toml -p skb-server --bin skb-server --examples
+bunx playwright test
 ```
 
 ## ドキュメント
