@@ -2,6 +2,7 @@ import { defineConfig } from "@playwright/test";
 
 export default defineConfig({
   testDir: "./e2e",
+  testMatch: "**/*.spec.{ts,mts}",
   globalSetup: "./e2e/global-setup.mts",
   // Serial + no retries: the suite owns one wiped DB and one server; a flaky
   // pass must not hide itself behind a retry.
