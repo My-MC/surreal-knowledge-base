@@ -55,7 +55,7 @@ with `SKB_LLM_BASE_URL`, `SKB_LLM_MODEL`, and, when needed,
   and author-only publication.
 
 The exact routes, auth rules, error mappings, and environment variables are
-defined in the [HTTP API specification](../../SPECIFICATION.md#20-http-apiserverskb-server).
+defined in the [HTTP API specification](../../SPECIFICATION.md#20-http-apiサーバー仕様skb-server).
 
 ## Development
 

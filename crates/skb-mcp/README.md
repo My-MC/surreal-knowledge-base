@@ -36,15 +36,36 @@ reindex. It also provides document and statistics resources plus reusable
 prompts. Tool schemas are generated from the same request and response types
 used by `skb-core` and the CLI.
 
-Example client configuration:
+OpenCode configuration (replace `/absolute/path/to/surreal-knowledge-base`):
 
 ```jsonc
 {
   "mcp": {
     "surreal-knowledge-base": {
       "type": "local",
-      "command": ["cargo", "run", "-p", "skb-mcp", "--bin", "skb-mcp"],
+      "command": [
+        "cargo", "run",
+        "--manifest-path", "/absolute/path/to/surreal-knowledge-base/Cargo.toml",
+        "-p", "skb-mcp", "--bin", "skb-mcp"
+      ],
       "enabled": true
+    }
+  }
+}
+```
+
+Claude Desktop uses a string command and separate arguments:
+
+```jsonc
+{
+  "mcpServers": {
+    "surreal-knowledge-base": {
+      "command": "/absolute/path/to/cargo",
+      "args": [
+        "run",
+        "--manifest-path", "/absolute/path/to/surreal-knowledge-base/Cargo.toml",
+        "-p", "skb-mcp", "--bin", "skb-mcp"
+      ]
     }
   }
 }

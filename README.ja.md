@@ -123,15 +123,38 @@ skb doctor
 cargo run -p skb-mcp --bin skb-mcp
 ```
 
-#### クライアント設定（opencode / Claude Desktop）
+#### OpenCode の設定
+
+`/absolute/path/to/surreal-knowledge-base` はリポジトリの絶対パスに置き換えてください。
 
 ```jsonc
 {
   "mcp": {
     "surreal-knowledge-base": {
       "type": "local",
-      "command": ["cargo", "run", "-p", "skb-mcp", "--bin", "skb-mcp"],
+      "command": [
+        "cargo", "run",
+        "--manifest-path", "/absolute/path/to/surreal-knowledge-base/Cargo.toml",
+        "-p", "skb-mcp", "--bin", "skb-mcp"
+      ],
       "enabled": true
+    }
+  }
+}
+```
+
+#### Claude Desktop の設定
+
+```jsonc
+{
+  "mcpServers": {
+    "surreal-knowledge-base": {
+      "command": "/absolute/path/to/cargo",
+      "args": [
+        "run",
+        "--manifest-path", "/absolute/path/to/surreal-knowledge-base/Cargo.toml",
+        "-p", "skb-mcp", "--bin", "skb-mcp"
+      ]
     }
   }
 }

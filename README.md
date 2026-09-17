@@ -123,15 +123,39 @@ For development, start the stdio server from the repository root:
 cargo run -p skb-mcp --bin skb-mcp
 ```
 
-#### Client configuration (opencode / Claude Desktop)
+#### OpenCode configuration
+
+Replace `/absolute/path/to/surreal-knowledge-base` with this repository's
+absolute path:
 
 ```jsonc
 {
   "mcp": {
     "surreal-knowledge-base": {
       "type": "local",
-      "command": ["cargo", "run", "-p", "skb-mcp", "--bin", "skb-mcp"],
+      "command": [
+        "cargo", "run",
+        "--manifest-path", "/absolute/path/to/surreal-knowledge-base/Cargo.toml",
+        "-p", "skb-mcp", "--bin", "skb-mcp"
+      ],
       "enabled": true
+    }
+  }
+}
+```
+
+#### Claude Desktop configuration
+
+```jsonc
+{
+  "mcpServers": {
+    "surreal-knowledge-base": {
+      "command": "/absolute/path/to/cargo",
+      "args": [
+        "run",
+        "--manifest-path", "/absolute/path/to/surreal-knowledge-base/Cargo.toml",
+        "-p", "skb-mcp", "--bin", "skb-mcp"
+      ]
     }
   }
 }
