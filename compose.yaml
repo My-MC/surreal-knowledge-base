@@ -9,7 +9,7 @@ services:
       SKB_STORAGE_PATH: /var/lib/skb/db
       SKB_EMBEDDING_ONNX_PATH: mock
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     volumes:
       - skb-data:/var/lib/skb
     healthcheck:
@@ -27,7 +27,7 @@ services:
       api:
         condition: service_healthy
     ports:
-      - "3000:8080"
+      - "127.0.0.1:3000:8080"
 
   studio:
     build:
@@ -37,7 +37,7 @@ services:
       api:
         condition: service_healthy
     ports:
-      - "3001:8080"
+      - "127.0.0.1:3001:8080"
 
   blog:
     build:
@@ -47,7 +47,7 @@ services:
       api:
         condition: service_healthy
     ports:
-      - "3002:8080"
+      - "127.0.0.1:3002:8080"
 
 volumes:
   skb-data:
