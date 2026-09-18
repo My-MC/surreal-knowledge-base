@@ -4,7 +4,7 @@
 
 Local-first knowledge base with hybrid search (vector + BM25) and knowledge graph, powered
 by embedded [SurrealDB](https://surrealdb.com/) and [BAAI/bge-m3](https://huggingface.co/BAAI/bge-m3)
-embeddings — exposed as an MCP server and CLI.
+embeddings. It is available through an MCP server, CLI, HTTP API, and three web applications.
 
 > 日本語版: [README.ja.md](README.ja.md)
 
@@ -19,6 +19,8 @@ embeddings — exposed as an MCP server and CLI.
 - **Reindex** — switch embedding models or chunk settings on existing data
 - **MCP server** — 10 tools for Claude Desktop / opencode / any MCP client
 - **CLI** — full feature parity with `skb` command
+- **HTTP API** — OpenAPI-documented API with document, search, graph, SSE chat, auth, and blog endpoints
+- **Web applications** — Vault for editing, Studio for cited RAG chat, and Blog for publishing knowledge
 - **Real embeddings** — BAAI/bge-m3 ONNX Runtime inference (optional, `ort` feature)
 
 ## Architecture
@@ -27,8 +29,10 @@ embeddings — exposed as an MCP server and CLI.
 crates/
 ├── skb-core/    Core library (DB, embedding, tokenization, search, graph, ingestion)
 ├── skb-cli/     CLI binary (skb)
-└── skb-mcp/     MCP server binary (skb-mcp)
+├── skb-mcp/     MCP server binary (skb-mcp)
+└── skb-server/  HTTP API server (skb-server)
 npm/             Meta-package + platform-specific npm packages
+web/             Bun workspace with Vault, Studio, Blog, shared API client, and UI
 schema/          SurrealDB migration (001_init.surql)
 skills/          opencode agent skill
 ```
@@ -37,7 +41,8 @@ skills/          opencode agent skill
 
 - [Rust](https://rustup.rs/) 1.88+
 - For real embeddings (`--features ort`): ONNX Runtime is downloaded automatically on first build (~15 minutes, cached at `~/.cache/ort.pyke.io`)
-- First MCP/CLI run (even with mock embeddings): tokenizer.json is auto-downloaded from Hugging Face (~17 MB, cached at `~/.cache/huggingface`)
+- First CLI/MCP/HTTP-server run (even with mock embeddings): tokenizer.json is auto-downloaded from Hugging Face (~17 MB, cached at `~/.cache/huggingface`)
+- For web applications: [Bun](https://bun.sh/) 1.4+
 
 ## Quick Start
 
@@ -49,6 +54,9 @@ cargo build
 
 # Production build with real BAAI/bge-m3 embeddings
 cargo build --release -p skb-mcp --features ort
+
+# Production HTTP API build with real BAAI/bge-m3 embeddings
+cargo build --release -p skb-server --features ort
 ```
 
 ### Configuration
@@ -64,6 +72,10 @@ dimension = 8
 [storage]
 path = "./skb-data"
 
+[server]
+host = "127.0.0.1"
+port = 8080
+
 # Real embeddings with BAAI/bge-m3
 # [embedding]
 # model = "BAAI/bge-m3"
@@ -76,7 +88,7 @@ path = "./skb-data"
 
 ```bash
 # Upload a document
-skb upload --path README.md --title "README"
+skb upload README.md --title "README"
 
 # Upload from URL
 skb upload --url https://example.com/doc.md --tags "docs,example"
@@ -105,33 +117,98 @@ skb doctor
 
 ### MCP Server
 
-Start the server through the npm package (stdio transport):
+For development, start the stdio server from the repository root:
 
 ```bash
-npx surreal-knowledge-base
-# or:
-bunx surreal-knowledge-base
+cargo run -p skb-mcp --bin skb-mcp
 ```
 
-#### Client configuration (opencode / Claude Desktop)
+#### OpenCode configuration
+
+Replace `/absolute/path/to/surreal-knowledge-base` with this repository's
+absolute path:
 
 ```jsonc
 {
   "mcp": {
     "surreal-knowledge-base": {
       "type": "local",
-      "command": ["npx", "-y", "surreal-knowledge-base"],
+      "command": [
+        "cargo", "run",
+        "--manifest-path", "/absolute/path/to/surreal-knowledge-base/Cargo.toml",
+        "-p", "skb-mcp", "--bin", "skb-mcp"
+      ],
       "enabled": true
     }
   }
 }
 ```
 
+#### Claude Desktop configuration
+
+```jsonc
+{
+  "mcpServers": {
+    "surreal-knowledge-base": {
+      "command": "/absolute/path/to/cargo",
+      "args": [
+        "run",
+        "--manifest-path", "/absolute/path/to/surreal-knowledge-base/Cargo.toml",
+        "-p", "skb-mcp", "--bin", "skb-mcp"
+      ]
+    }
+  }
+}
+```
+
+### HTTP API server
+
+`skb-server` owns the embedded database for its lifetime. Do not start the CLI
+or MCP server against the same `[storage].path` while it is running.
+
+```bash
+# The mock configuration above lets this run without the ort feature.
+cargo run -p skb-server --bin skb-server -- --port 8080
+
+# Or run the real-embedding release build.
+./target/release/skb-server --port 8080
+```
+
+The API is available at `http://127.0.0.1:8080`. Inspect its generated contract
+at [`/api/openapi.json`](http://127.0.0.1:8080/api/openapi.json) or use
+[`/swagger-ui`](http://127.0.0.1:8080/swagger-ui). The chat endpoint streams
+answers from an OpenAI-compatible LLM; server and LLM configuration are
+documented in [SPECIFICATION.md](SPECIFICATION.md).
+
+### Web applications
+
+Start `skb-server` first, then install the Bun workspace dependencies:
+
+```bash
+cd web
+bun install
+```
+
+Run an application from `web/` (each Vite development server proxies `/api` to
+`SKB_SERVER_PORT`, which defaults to `8080`):
+
+```bash
+bun --filter @skb/vault dev   # Markdown knowledge-base editor
+bun --filter @skb/studio dev  # RAG chat with source citations
+bun --filter @skb/blog dev    # Public knowledge blog and authoring flow
+```
+
+| Application | Purpose |
+|---|---|
+| Vault | Browse, edit, autosave, search, and graph-link Markdown documents. |
+| Studio | Ask questions over the knowledge base and inspect streaming answers with citations. |
+| Blog | Read published documents; invited authors can sign in, create, and publish posts. |
+
 ## CLI Commands
 
 | Command | Description |
 |---|---|
-| `skb upload --path <FILE>` | Upload a file (`--recursive`, `--metadata JSON`, `--force`) |
+| `skb upload <FILE>` | Upload a file (`--recursive`, `--metadata JSON`, `--force`) |
 | `skb upload --url <URL>` | Upload from URL |
 | `skb upload --stdin` | Upload from stdin |
 | `skb search <QUERY>` | Search documents (`--mode hybrid\|vector\|keyword --top-k N --filter KEY=VALUE`) |
@@ -139,12 +216,12 @@ bunx surreal-knowledge-base
 | `skb get <ID>` | Get document details (`--chunks`) |
 | `skb delete <ID>` | Delete a document (`--yes`) |
 | `skb stats` | Show statistics |
-| `skb graph query --from <ENTITY>` | Query knowledge graph |
+| `skb graph query <ENTITY>` | Query knowledge graph |
 | `skb graph entity <NAME> --kind <KIND>` | Add/update an entity |
 | `skb graph link <FROM> <TO>` | Link two entities |
 | `skb reindex` | Reindex all documents (`--dry-run` supported) |
 | `skb config init\|show\|set` | Manage configuration |
-| `npx surreal-knowledge-base` | Start the MCP server |
+| `cargo run -p skb-mcp --bin skb-mcp` | Start the development MCP server |
 | `skb doctor` | Run diagnostics |
 
 All commands support `--format json` for structured output.
@@ -227,6 +304,26 @@ cargo bench
 
 # Benchmarks (real BAAI/bge-m3, requires ort feature)
 cargo bench --features ort
+```
+
+### Web development
+
+```bash
+cd web
+
+# Format and lint the workspace
+bun run biome
+
+# Type-check every application and shared package
+bun --filter '*' typecheck
+
+# Run the SSE smoke test (starts its own mock LLM and HTTP server)
+bun run sse-smoke
+
+# Run browser end-to-end tests (build skb-server and mock_llm first)
+cargo build --manifest-path ../Cargo.toml -p skb-server --bin skb-server --examples
+bunx playwright install chromium
+bunx playwright test
 ```
 
 ## Documentation
