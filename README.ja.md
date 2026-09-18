@@ -203,6 +203,27 @@ bun --filter @skb/blog dev    # 公開知識ブログと著者向け投稿フロ
 | Studio | ナレッジベースへの質問と、引用を伴うストリーミング回答の確認。 |
 | Blog | 公開済み文書の閲覧。招待された著者はサインイン、投稿、公開が可能。 |
 
+### Docker Compose デプロイ
+
+Docker Compose では、ホスト側に Rust や Bun をセットアップせず HTTP API と静的
+Web フロントエンドを実行できます。API は引き続き組み込み SurrealKV を所有し、
+`skb-data` named volume によりコンテナの再作成後もデータを保持します。
+
+```bash
+docker compose up --build
+```
+
+Vault は `http://127.0.0.1:3000`、Studio は
+`http://127.0.0.1:3000/studio/`、Blog は `http://127.0.0.1:3000/blog/`、
+API は `http://127.0.0.1:8080` で利用できます。フロントエンドは同一オリジンの
+`/api` リクエストを API コンテナへリバースプロキシします。
+
+既定の Compose イメージは mock embedder
+(`SKB_EMBEDDING_ONNX_PATH=mock`) を使います。実際の BAAI/bge-m3 埋め込みを
+使う場合は、`ort` を有効にした API イメージをビルドし、対応するモデル設定へ変更
+してください。コンテナだけでなく永続 DB データも削除するには
+`docker compose down --volumes` を実行します。
+
 ## CLI コマンド一覧
 
 | コマンド | 説明 |

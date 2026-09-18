@@ -1,0 +1,33 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: deploy/api.Dockerfile
+    environment:
+      SKB_SERVER_HOST: 0.0.0.0
+      SKB_SERVER_PORT: "8080"
+      SKB_STORAGE_PATH: /var/lib/skb/db
+      SKB_EMBEDDING_ONNX_PATH: mock
+    ports:
+      - "8080:8080"
+    volumes:
+      - skb-data:/var/lib/skb
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8080/api/health"]
+      interval: 10s
+      timeout: 3s
+      start_period: 20s
+      retries: 6
+
+  frontend:
+    build:
+      context: .
+      dockerfile: deploy/frontend.Dockerfile
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "3000:80"
+
+volumes:
+  skb-data:
