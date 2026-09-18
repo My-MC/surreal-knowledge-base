@@ -30,6 +30,10 @@ export type SessionState = {
 
 const STORAGE_KEY = "skb-studio-session";
 
+export function createSessionId(randomUuid: (() => string) | undefined): string {
+  return randomUuid?.() ?? `session-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
 /** Patch the last message; a no-op when the transcript is empty. */
 function patchLast(
   state: SessionState,
@@ -48,7 +52,11 @@ export function createSessionStore() {
   return create<SessionState>()(
     persist(
       (set) => ({
-        id: crypto.randomUUID(),
+        id: createSessionId(
+          typeof globalThis.crypto?.randomUUID === "function"
+            ? () => globalThis.crypto.randomUUID()
+            : undefined,
+        ),
         messages: [],
         status: "idle",
         appendMessage: (message) => set((state) => ({ messages: [...state.messages, message] })),
