@@ -1,0 +1,12 @@
+.git
+.github
+.omo
+target
+web/node_modules
+web/**/node_modules
+web/test-results
+web/playwright-report
+spike
+*.log
+Dockerfile*
+compose*.yaml
