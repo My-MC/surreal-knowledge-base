@@ -786,6 +786,10 @@ named volume を `/var/lib/skb` にマウントし、`SKB_STORAGE_PATH=/var/lib/
 healthcheck 完了後に独立して起動する。各サービスは同一オリジンの `/api` を API
 コンテナへプロキシする。
 
+Studio は HTTP の LAN オリジンでも起動できる。安全なコンテキストでのみ提供される
+`crypto.randomUUID()` が使えない場合、クライアント専用の一時セッション ID は代替値を
+使い、React のマウントを妨げてはならない。
+
 - SurrealKv は `<db-path>/LOCK` によるクロスプロセス排他ロックを持つ。マルチプロセススパイクでは、同一 `storage.path` への同時オープンで 1 プロセスのみが成功し、敗者はオープン時点で即座に `E_DB`（"LOCK is already locked by another process"、終了コード 3）で失敗することが観測された。ブロックもリトライも破損も発生しない。この挙動は `crates/skb-server/tests/spike_multi_process.rs` の **観測スパイク** が記録する分類（ONE_PROCESS_FAILED / BOTH_SUCCEEDED_CONCURRENTLY のいずれも取り得る）であり、CI テストとしては表明されない。オープンがブロック・ハングした場合のみテストが失敗する。
 - このため **サーバープロセスが単一の DB 所有者** である。`skb-server` は起動時に `KnowledgeBase::open` を 1 回だけ呼び、プロセス生存中は保持し続ける。全 HTTP ハンドラはこの 1 インスタンスを共有し、サーバーはパスを再オープンしない。
 - **サーバー起動中は `skb` CLI / `skb-mcp` が同一 `storage.path` を開いてはならない**。オープンは即座に `E_DB` で失敗する。安全な読み取り専用の同時アクセスモードは存在しない。サーバー停止後は CLI/MCP がスタンドアロンで開いてよい。

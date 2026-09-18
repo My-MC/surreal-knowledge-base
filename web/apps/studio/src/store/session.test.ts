@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 import type { SearchHit } from "@skb/api-client";
-import { createSessionStore } from "./session";
+import { createSessionId, createSessionStore } from "./session";
 
 function hit(chunkIdx: number): SearchHit {
   return {
@@ -17,6 +17,15 @@ beforeEach(() => {
 });
 
 describe("session store actions", () => {
+  test("creates an ephemeral ID when randomUUID is unavailable", () => {
+    // Given: an insecure HTTP origin where Firefox does not expose randomUUID.
+    // When: the store needs an ephemeral session identifier.
+    const id = createSessionId(undefined);
+
+    // Then: startup can continue with a non-empty fallback identifier.
+    expect(id).toMatch(/^session-/);
+  });
+
   test("appendMessage appends user and assistant messages in order", () => {
     const store = createSessionStore();
     store.getState().appendMessage({ role: "user", content: "質問" });
