@@ -27,7 +27,7 @@ services:
       api:
         condition: service_healthy
     ports:
-      - "3000:80"
+      - "3000:8080"
 
   studio:
     build:
@@ -37,7 +37,7 @@ services:
       api:
         condition: service_healthy
     ports:
-      - "3001:80"
+      - "3001:8080"
 
   blog:
     build:
@@ -47,7 +47,7 @@ services:
       api:
         condition: service_healthy
     ports:
-      - "3002:80"
+      - "3002:8080"
 
 volumes:
   skb-data:
