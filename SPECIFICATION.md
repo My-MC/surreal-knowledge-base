@@ -782,8 +782,9 @@ SurrealDB は組込みモード（SurrealKV）で動作するため、DB ファ�
 Docker Compose デプロイではこの所有権を変えず、`api` サービスだけが `skb-data`
 named volume を `/var/lib/skb` にマウントし、`SKB_STORAGE_PATH=/var/lib/skb/db`
 を使用する。DB は独立したサービスではなく API コンテナに埋め込まれる。静的
-`frontend` サービスは API の healthcheck 完了後に起動し、同一オリジンの `/api`
-を API コンテナへプロキシする。
+`vault`、`studio`、`blog` サービスはそれぞれ個別 Dockerfile でビルドされ、API の
+healthcheck 完了後に独立して起動する。各サービスは同一オリジンの `/api` を API
+コンテナへプロキシする。
 
 - SurrealKv は `<db-path>/LOCK` によるクロスプロセス排他ロックを持つ。マルチプロセススパイクでは、同一 `storage.path` への同時オープンで 1 プロセスのみが成功し、敗者はオープン時点で即座に `E_DB`（"LOCK is already locked by another process"、終了コード 3）で失敗することが観測された。ブロックもリトライも破損も発生しない。この挙動は `crates/skb-server/tests/spike_multi_process.rs` の **観測スパイク** が記録する分類（ONE_PROCESS_FAILED / BOTH_SUCCEEDED_CONCURRENTLY のいずれも取り得る）であり、CI テストとしては表明されない。オープンがブロック・ハングした場合のみテストが失敗する。
 - このため **サーバープロセスが単一の DB 所有者** である。`skb-server` は起動時に `KnowledgeBase::open` を 1 回だけ呼び、プロセス生存中は保持し続ける。全 HTTP ハンドラはこの 1 インスタンスを共有し、サーバーはパスを再オープンしない。

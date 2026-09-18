@@ -206,18 +206,25 @@ bun --filter @skb/blog dev    # Public knowledge blog and authoring flow
 
 ### Docker Compose deployment
 
-Docker Compose runs the HTTP API and static web frontend without host-side Rust
-or Bun setup. The API continues to own its embedded SurrealKV database; the
-`skb-data` named volume persists it across container recreation.
+Docker Compose runs the HTTP API and each static web application without
+host-side Rust or Bun setup. Vault, Studio, and Blog have separate services and
+Dockerfiles, so each can be started independently. The API continues to own its
+embedded SurrealKV database; the `skb-data` named volume persists it across
+container recreation.
 
 ```bash
 docker compose up --build
 ```
 
-Open Vault at `http://127.0.0.1:3000`, Studio at
-`http://127.0.0.1:3000/studio/`, Blog at `http://127.0.0.1:3000/blog/`, and
-the API directly at `http://127.0.0.1:8080`. The frontend reverse-proxies
-same-origin `/api` requests to the API container.
+Open Vault at `http://127.0.0.1:3000`, Studio at `http://127.0.0.1:3001`, Blog
+at `http://127.0.0.1:3002`, and the API directly at `http://127.0.0.1:8080`.
+Each frontend reverse-proxies same-origin `/api` requests to the API container.
+
+```bash
+docker compose up vault
+docker compose up studio
+docker compose up blog
+```
 
 The default Compose image uses the mock embedder (`SKB_EMBEDDING_ONNX_PATH=mock`).
 For real BAAI/bge-m3 embeddings, build an `ort`-enabled API image and replace

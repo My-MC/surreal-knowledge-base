@@ -205,18 +205,24 @@ bun --filter @skb/blog dev    # 公開知識ブログと著者向け投稿フロ
 
 ### Docker Compose デプロイ
 
-Docker Compose では、ホスト側に Rust や Bun をセットアップせず HTTP API と静的
-Web フロントエンドを実行できます。API は引き続き組み込み SurrealKV を所有し、
-`skb-data` named volume によりコンテナの再作成後もデータを保持します。
+Docker Compose では、ホスト側に Rust や Bun をセットアップせず HTTP API と各静的
+Web アプリケーションを実行できます。Vault、Studio、Blog には個別のサービスと
+Dockerfile があり、それぞれを独立して起動できます。API は引き続き組み込み
+SurrealKV を所有し、`skb-data` named volume によりコンテナの再作成後もデータを保持します。
 
 ```bash
 docker compose up --build
 ```
 
-Vault は `http://127.0.0.1:3000`、Studio は
-`http://127.0.0.1:3000/studio/`、Blog は `http://127.0.0.1:3000/blog/`、
-API は `http://127.0.0.1:8080` で利用できます。フロントエンドは同一オリジンの
-`/api` リクエストを API コンテナへリバースプロキシします。
+Vault は `http://127.0.0.1:3000`、Studio は `http://127.0.0.1:3001`、Blog は
+`http://127.0.0.1:3002`、API は `http://127.0.0.1:8080` で利用できます。各
+フロントエンドは同一オリジンの `/api` リクエストを API コンテナへリバースプロキシします。
+
+```bash
+docker compose up vault
+docker compose up studio
+docker compose up blog
+```
 
 既定の Compose イメージは mock embedder
 (`SKB_EMBEDDING_ONNX_PATH=mock`) を使います。実際の BAAI/bge-m3 埋め込みを

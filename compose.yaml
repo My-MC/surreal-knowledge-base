@@ -19,15 +19,35 @@ services:
       start_period: 20s
       retries: 6
 
-  frontend:
+  vault:
     build:
       context: .
-      dockerfile: deploy/frontend.Dockerfile
+      dockerfile: deploy/vault.Dockerfile
     depends_on:
       api:
         condition: service_healthy
     ports:
       - "3000:80"
+
+  studio:
+    build:
+      context: .
+      dockerfile: deploy/studio.Dockerfile
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "3001:80"
+
+  blog:
+    build:
+      context: .
+      dockerfile: deploy/blog.Dockerfile
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "3002:80"
 
 volumes:
   skb-data:
